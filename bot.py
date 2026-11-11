@@ -142,9 +142,15 @@ SEED_PRODUCTS = [
 # 5 minutes so the free instance does not sleep.
 def start_health_server():
     # Render uses PORT, Botkeep uses SERVER_PORT — support both.
-    port = int(os.getenv("PORT") or os.getenv("SERVER_PORT") or 0)
-    if not port:
-        return
+    # Botkeep killed the bot 3 times after ~3-4 min with no logs; most likely
+    # cause is no HTTP listener (no PORT/SERVER_PORT injected -> port 0 ->
+    # health server never started -> platform marks it unhealthy).
+    # So ALWAYS bind something: env port first, else 8080 fallback.
+    raw = os.getenv("PORT") or os.getenv("SERVER_PORT") or ""
+    try:
+        port = int(raw) if raw else 8080
+    except ValueError:
+        port = 8080
     class H(BaseHTTPRequestHandler):
         def do_GET(self):
             self.send_response(200)
@@ -153,9 +159,16 @@ def start_health_server():
             self.wfile.write(b"OK - RetailShop bot running")
         def log_message(self, *a):
             pass
-    threading.Thread(target=ThreadingHTTPServer(("0.0.0.0", port), H).serve_forever,
-                     daemon=True).start()
-    log.info("Health server on port %d", port)
+    for try_port in (port, 8080, 8000):
+        try:
+            threading.Thread(target=ThreadingHTTPServer(("0.0.0.0", try_port), H).serve_forever,
+                             daemon=True).start()
+            log.info("Health server on port %d", try_port)
+            print(f"Health server on port {try_port}", flush=True)
+            return
+        except OSError as e:
+            log.warning("Health server bind failed on port %d: %s", try_port, e)
+    log.warning("Health server could not bind any port")
 
 def get_setting(key):
     c = db(); r = c.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone(); c.close()
@@ -577,8 +590,18 @@ def main():
     # proof messages: text TID/hash + photo screenshot — admin commands se pehle nahi, baad me
     app.add_handler(MessageHandler((filters.TEXT | filters.PHOTO) & ~filters.COMMAND, on_proof))
 
-    print("Bot chal raha hai... /start se test karo.")
-    app.run_polling()
+    print("Bot chal raha hai... /start se test karo.", flush=True)
+    # Keep the process alive: if polling ever raises, log it and restart
+    # polling instead of letting the whole process exit (Botkeep does not
+    # auto-restart a stopped server).
+    import time as _time
+    while True:
+        try:
+            app.run_polling()
+            log.warning("run_polling returned cleanly; restarting polling")
+        except Exception:
+            log.exception("run_polling crashed; restarting in 5s")
+        _time.sleep(5)
 
 if __name__ == "__main__":
     main()
