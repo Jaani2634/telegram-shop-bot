@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: retailshop-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_ID
+        value: 7965730503
+      - key: EASYPAISA_NUMBER
+        value: +923706462990
+      - key: EASYPAISA_NAME
+        value: Junaid Nazeer
+      - key: JAZZCASH_NUMBER
+        value: ""
+      - key: JAZZCASH_NAME
+        value: Junaid
+      - key: USDT_ADDRESS
+        value: ""
