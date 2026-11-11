@@ -24,6 +24,11 @@ import sqlite3
 import logging
 import requests
 import threading
+import asyncio
+import hashlib
+import hmac
+from types import SimpleNamespace
+from urllib.parse import parse_qs, urlparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime
 from dotenv import load_dotenv
@@ -48,6 +53,30 @@ WA_CHANNEL_URL = os.getenv("WA_CHANNEL_URL", "")
 USDT_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"  # USDT TRC20
 USDT_RATE = 280  # 1 USDT = 280 PKR (seed prices isi rate pe hain)
 BOT_USERNAME = "Shop_at_Retail_bot"
+
+# ---------- Zurvapay (auto-verify JazzCash / Easypaisa / Raast QR) ----------
+# zurvapay.com — hosted checkout + signed IPN. Keys kabhi code me nahi —
+# sirf env se. Khaali ho to Zurvapay option dikhega hi nahi (feature off).
+ZURVAPAY_PUBLIC_KEY = os.getenv("ZURVAPAY_PUBLIC_KEY", "")
+ZURVAPAY_SECRET_KEY = os.getenv("ZURVAPAY_SECRET_KEY", "")
+ZURVAPAY_BASE_URL = os.getenv("ZURVAPAY_BASE_URL", "https://zurvapay.com").rstrip("/")
+# Bot ki public URL (Botkeep/Render host), jaise https://node19.botkeep.cloud:61495.
+# IPN + success/cancel URLs isi se bante hain. ZURVAPAY_IPN_URL se IPN ka
+# URL seedha bhi set kar sakte ho.
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+ZURVAPAY_IPN_URL = os.getenv("ZURVAPAY_IPN_URL", "")
+# Optional status-check endpoint — Zurvapay kehta hai status API hai, lekin
+# uska URL public docs me nahi hai; dashboard docs se milte hi yahan set karo.
+ZURVAPAY_STATUS_URL = os.getenv("ZURVAPAY_STATUS_URL", "")
+# IPN signature scheme — 'auto' (default) tamam common schemes try karta hai.
+# Dashboard docs me jo scheme likhi ho, usay yahan pin kar do:
+# hmac_pipe_sha256 | hmac_pipe_sha512 | hmac_body_sha256 | hmac_body_sha512 |
+# hmac_sorted_sha256 | hmac_sorted_sha512 | sha256_concat | hmac_pipe_status_sha256
+ZURVAPAY_IPN_MODE = os.getenv("ZURVAPAY_IPN_MODE", "auto")
+
+# IPN HTTP thread se PTB loop tak pohanchne ke liye (main() me set hota hai).
+PTB_APP = None
+PTB_LOOP = None
 
 PROMO_BANNER = "🎁 Spend $6+ in one order, get Muse Ai 1B, Canva Pro On Mail FREE"
 DEFAULT_TERMS = ("This product can be unstable. Warranty covers first login only. "
@@ -280,10 +309,37 @@ def start_health_server():
         port = 8080
     class H(BaseHTTPRequestHandler):
         def do_GET(self):
+            if self.path.startswith("/zurvapay/success"):
+                body = b"Payment successful! Apne Telegram bot pe ja ke order check karein."
+            elif self.path.startswith("/zurvapay/cancel"):
+                body = b"Payment cancel ho gayi. Telegram bot se dobara try karein."
+            else:
+                body = b"OK - RetailShop bot running"
             self.send_response(200)
-            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.end_headers()
-            self.wfile.write(b"OK - RetailShop bot running")
+            self.wfile.write(body)
+        def do_POST(self):
+            # Zurvapay IPN — signed server-to-server callback. 200 = mil gaya
+            # (Zurvapay 8 dafa retry karta hai agar 200 na mile).
+            if self.path.startswith("/zurvapay/ipn"):
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                except ValueError:
+                    length = 0
+                raw = self.rfile.read(length) if length > 0 else b""
+                try:
+                    ok, msg = handle_zurvapay_ipn_http(raw, self.headers)
+                except Exception as e:
+                    log.exception("Zurvapay IPN handler crashed")
+                    ok, msg = False, f"handler error: {e}"
+                self.send_response(200 if ok else 400)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                self.wfile.write(msg.encode("utf-8", "ignore"))
+                return
+            self.send_response(404)
+            self.end_headers()
         def log_message(self, *a):
             pass
     for try_port in (port, 8080, 8000):
@@ -851,6 +907,298 @@ def verify_usdt(tx_hash: str, expected_address: str, expected_amount: float):
         log.exception("USDT verify error")
         return False, f"Verify API error: {e}. Admin manually check karega."
 
+# ---------- Zurvapay (auto-verify JazzCash / Easypaisa / Raast QR) ----------
+# Docs: zurvapay.com (homepage). Initiate endpoint + params wahan se liye
+# gaye hain. IPN ka EXACT payload/signature format public docs me NAHI hai —
+# "full documentation" merchant dashboard ke peeche hai (login chahiye).
+# Is liye verify_zurvapay_ipn 'auto' mode me tamam common HMAC schemes try
+# karta hai; dashboard docs me jo scheme likhi ho, usay ZURVAPAY_IPN_MODE
+# env se pin kar do. Signature ke baghair koi IPN deliver NAHI karega.
+
+ZURVA_SUCCESS_STATUSES = {"success", "successful", "completed", "paid", "ok", "1", "true", "approved"}
+
+def zurvapay_ipn_url():
+    """IPN callback URL — env override pehle, phir PUBLIC_BASE_URL."""
+    if ZURVAPAY_IPN_URL:
+        return ZURVAPAY_IPN_URL
+    if PUBLIC_BASE_URL:
+        return f"{PUBLIC_BASE_URL}/zurvapay/ipn"
+    return ""
+
+def _zurvapay_public_base():
+    if PUBLIC_BASE_URL:
+        return PUBLIC_BASE_URL
+    ipn = zurvapay_ipn_url()
+    if ipn:
+        u = urlparse(ipn)
+        return f"{u.scheme}://{u.netloc}"
+    return ""
+
+def zurvapay_enabled():
+    """Keys + IPN URL dono ho to hi Zurvapay option dikhao."""
+    return bool(ZURVAPAY_PUBLIC_KEY and ZURVAPAY_SECRET_KEY and zurvapay_ipn_url())
+
+def zurvapay_initiate(identifier, amount_pkr, details, customer_name="", customer_email=""):
+    """POST /payment/initiate (form-encoded, homepage sample ke mutabiq).
+    Returns (checkout_url, None) ya (None, error)."""
+    if not ZURVAPAY_PUBLIC_KEY:
+        return None, "ZURVAPAY_PUBLIC_KEY set nahi hai"
+    ipn = zurvapay_ipn_url()
+    if not ipn:
+        return None, "IPN URL nahi bani — PUBLIC_BASE_URL ya ZURVAPAY_IPN_URL set karein"
+    base = _zurvapay_public_base()
+    payload = {
+        "public_key": ZURVAPAY_PUBLIC_KEY,
+        "identifier": identifier,
+        "currency": "PKR",
+        "amount": int(amount_pkr),
+        "details": details,
+        "ipn_url": ipn,
+        "success_url": f"{base}/zurvapay/success",
+        "cancel_url": f"{base}/zurvapay/cancel",
+        "customer_name": customer_name or "RetailShop Customer",
+        "customer_email": customer_email or "customer@retailshop.local",
+    }
+    try:
+        r = requests.post(f"{ZURVAPAY_BASE_URL}/payment/initiate", data=payload, timeout=20)
+    except Exception as e:
+        log.exception("Zurvapay initiate error")
+        return None, f"Zurvapay se rabta nahi ho saka: {e}"
+    try:
+        d = r.json()
+    except Exception:
+        return None, f"Zurvapay ka jawab samajh nahi aaya (HTTP {r.status_code})"
+    if isinstance(d, dict) and d.get("success") == "ok" and d.get("url"):
+        return d["url"], None
+    err = ""
+    if isinstance(d, dict):
+        err = str(d.get("message") or d.get("error") or d)
+    return None, f"Zurvapay error: {err or 'unknown'}"
+
+def zurvapay_status_check(identifier):
+    """Optional status API — Zurvapay kehta hai status API hai, lekin endpoint
+    public docs me nahi hai. ZURVAPAY_STATUS_URL set ho to hi call hoti hai;
+    warna None (IPN hi source of truth hai)."""
+    if not ZURVAPAY_STATUS_URL or not ZURVAPAY_PUBLIC_KEY:
+        return None
+    try:
+        r = requests.post(ZURVAPAY_STATUS_URL,
+                          data={"public_key": ZURVAPAY_PUBLIC_KEY, "identifier": identifier},
+                          timeout=15)
+        return r.json()
+    except Exception:
+        log.exception("Zurvapay status check error")
+        return None
+
+def _zurva_ipn_fields(data):
+    """IPN dict se identifier/amount/status/signature nikalo — field names
+    alag-alag ho sakte hain, is liye aliases check karte hain."""
+    d = {str(k).lower(): v for k, v in (data or {}).items()}
+
+    def pick(*names):
+        for n in names:
+            if n in d and d[n] not in (None, ""):
+                return str(d[n])
+        return ""
+
+    return {
+        "identifier": pick("identifier", "order_id", "merchant_order_id", "reference", "ref", "orderid"),
+        "amount": pick("amount", "amount_pkr", "total", "price"),
+        "status": pick("status", "payment_status", "transaction_status", "txn_status").lower(),
+        "signature": pick("signature", "hash", "sign", "checksum"),
+        "txid": pick("transaction_id", "payment_id", "zurva_txn_id", "txn_id"),
+    }
+
+def _hmac_hex(secret, msg, algo="sha256"):
+    return hmac.new(secret.encode(), msg.encode(), getattr(hashlib, algo)).hexdigest()
+
+def verify_zurvapay_ipn(data, raw_body=b"", headers=None):
+    """Signed IPN verify karo. Returns (True, scheme_name) ya (False, reason).
+    'auto' mode tamam candidate schemes try karta hai — har candidate secret
+    se keyed HMAC hai, is liye baghair secret ke koi bhi forge nahi ho sakta.
+    ZURVAPAY_IPN_MODE se ek scheme pin ki ja sakti hai."""
+    secret = ZURVAPAY_SECRET_KEY
+    if not secret:
+        return False, "secret key set nahi hai"
+    f = _zurva_ipn_fields(data)
+    sig = f.get("signature", "")
+    if not sig and headers:
+        for h in ("X-Zurvapay-Signature", "X-Signature", "X-Zurva-Signature", "Signature"):
+            if headers.get(h):
+                sig = headers.get(h)
+                break
+    if not sig:
+        return False, "IPN me signature nahi mili"
+    sig = sig.strip().lower()
+    ident = f.get("identifier", "")
+    amount = f.get("amount", "")
+    status = f.get("status", "")
+    candidates = []  # (scheme_name, expected_hex)
+    if ident and amount:
+        candidates += [
+            ("hmac_pipe_sha256", _hmac_hex(secret, f"{ident}|{amount}")),
+            ("hmac_pipe_sha512", _hmac_hex(secret, f"{ident}|{amount}", "sha512")),
+            ("sha256_concat", hashlib.sha256(f"{secret}{ident}{amount}".encode()).hexdigest()),
+            ("sha256_concat2", hashlib.sha256(f"{ident}{amount}{secret}".encode()).hexdigest()),
+        ]
+        if status:
+            candidates += [
+                ("hmac_pipe_status_sha256", _hmac_hex(secret, f"{ident}|{amount}|{status}")),
+                ("hmac_pipe_status_sha512", _hmac_hex(secret, f"{ident}|{amount}|{status}", "sha512")),
+            ]
+    if raw_body:
+        try:
+            raw_txt = raw_body.decode("utf-8")
+        except Exception:
+            raw_txt = ""
+        if raw_txt:
+            candidates += [
+                ("hmac_body_sha256", _hmac_hex(secret, raw_txt)),
+                ("hmac_body_sha512", _hmac_hex(secret, raw_txt, "sha512")),
+            ]
+        candidates.append(("hmac_body_bytes_sha256",
+                           hmac.new(secret.encode(), raw_body, hashlib.sha256).hexdigest()))
+    try:
+        items = sorted((k, v) for k, v in data.items()
+                       if str(k).lower() not in ("signature", "hash", "sign", "checksum"))
+        canon = "&".join(f"{k}={v}" for k, v in items)
+        candidates += [
+            ("hmac_sorted_sha256", _hmac_hex(secret, canon)),
+            ("hmac_sorted_sha512", _hmac_hex(secret, canon, "sha512")),
+        ]
+    except Exception:
+        pass
+    mode = (ZURVAPAY_IPN_MODE or "auto").strip()
+    if mode != "auto":
+        candidates = [c for c in candidates if c[0] == mode]
+        if not candidates:
+            return False, f"unknown ZURVAPAY_IPN_MODE: {mode}"
+    for name, expected in candidates:
+        if hmac.compare_digest(expected.lower(), sig):
+            return True, name
+    return False, "signature match nahi hui (koi scheme nahi mili)"
+
+def _zurva_run_on_loop(coro, timeout=60):
+    """IPN HTTP thread se PTB loop pe coroutine chalao, result ka wait karo."""
+    if PTB_APP is None or PTB_LOOP is None or PTB_LOOP.is_closed():
+        raise RuntimeError("PTB loop available nahi (bot abhi start ho raha hai?)")
+    fut = asyncio.run_coroutine_threadsafe(coro, PTB_LOOP)
+    return fut.result(timeout=timeout)
+
+def _zurva_send(user_id, text):
+    """Buyer/admin ko Telegram message — loop na ho to sirf log karo."""
+    try:
+        _zurva_run_on_loop(PTB_APP.bot.send_message(user_id, text), timeout=30)
+    except Exception:
+        log.warning("Zurvapay notify fail (user %s): %s", user_id, text[:120])
+
+def _zurva_deliver_order(order_id):
+    """deliver_order (async) ko IPN thread se chalao. Returns True/False."""
+    ctx = SimpleNamespace(bot=PTB_APP.bot)
+    return bool(_zurva_run_on_loop(deliver_order(ctx, order_id), timeout=60))
+
+def _zurva_handle_order_ipn(code, f):
+    c = db(); o = c.execute("SELECT * FROM orders WHERE code=?", (code,)).fetchone(); c.close()
+    if not o:
+        return False, f"order {code} nahi mila"
+    try:
+        amt = float(str(f["amount"]).replace(",", ""))
+    except Exception:
+        return False, "amount parse nahi hui"
+    if abs(amt - (o["amount_pkr"] or 0)) > 0.5:
+        log.warning("Zurvapay IPN amount mismatch order %s: IPN %s vs order %s", code, amt, o["amount_pkr"])
+        return False, f"amount mismatch: IPN {amt} vs order {o['amount_pkr']}"
+    if o["status"] == "delivered":
+        return True, "already delivered"
+    if o["status"] != "pending":
+        return True, f"order pehle hi {o['status']} hai"
+    # Atomic claim — duplicate/retry IPN dobara deliver nahi karega.
+    c = db()
+    cur = c.execute("UPDATE orders SET status='zurva_processing', proof=? WHERE id=? AND status='pending'",
+                    (f"zurvapay:{f['txid'] or code}", o["id"]))
+    claimed = cur.rowcount; c.commit(); c.close()
+    if not claimed:
+        return True, "order pehle hi process ho rahi hai / ho chuki"
+    try:
+        ok = _zurva_deliver_order(o["id"])
+    except Exception as e:
+        log.exception("Zurvapay delivery error order %s", o["id"])
+        c = db(); c.execute("UPDATE orders SET status='pending' WHERE id=? AND status='zurva_processing'", (o["id"],)); c.commit(); c.close()
+        return False, f"delivery error (retry hoga): {e}"
+    if ok:
+        return True, "delivered"
+    # deliver_order ne status='out_of_stock' set kar diya + admin/buyer ko bataya.
+    return True, "delivery fail (stock khatam) — admin ko notify ho gaya"
+
+def _zurva_handle_deposit_ipn(ident, f):
+    try:
+        dep_id = int(ident.split("-", 1)[1])
+    except Exception:
+        return False, "deposit id parse nahi hua"
+    c = db(); d = c.execute("SELECT * FROM deposits WHERE id=?", (dep_id,)).fetchone(); c.close()
+    if not d:
+        return False, f"deposit {dep_id} nahi mili"
+    if d["status"] == "approved":
+        return True, "already credited"
+    if d["status"] != "pending":
+        return True, f"deposit pehle hi {d['status']} hai"
+    try:
+        amt = float(str(f["amount"]).replace(",", ""))
+    except Exception:
+        return False, "amount parse nahi hui"
+    if d["currency"] == "PKR" and abs(amt - float(d["amount"])) > 0.5:
+        log.warning("Zurvapay IPN amount mismatch deposit %s: IPN %s vs deposit %s", dep_id, amt, d["amount"])
+        return False, f"amount mismatch: IPN {amt} vs deposit {d['amount']}"
+    c = db()
+    cur = c.execute("UPDATE deposits SET status='approved' WHERE id=? AND status='pending'", (dep_id,))
+    claimed = cur.rowcount; c.commit(); c.close()
+    if not claimed:
+        return True, "deposit pehle hi process ho chuki"
+    add_wallet(d["user_id"], d["currency"], d["amount"])
+    _zurva_send(d["user_id"], f"✅ Deposit approved! {d['amount']} {d['currency']} aapke wallet me add ho gaye (Zurvapay).")
+    return True, "credited"
+
+def handle_zurvapay_ipn_http(raw_body, headers=None):
+    """HTTP thread se call hota hai. Returns (ok, message).
+    ok=True -> HTTP 200 (Zurvapay retry nahi karega); ok=False -> HTTP 400."""
+    if not ZURVAPAY_SECRET_KEY:
+        log.warning("Zurvapay IPN aaya lekin ZURVAPAY_SECRET_KEY set nahi hai")
+        return False, "secret key not configured"
+    ctype = ""
+    try:
+        ctype = (headers.get("Content-Type") or "").lower()
+    except Exception:
+        pass
+    data = {}
+    try:
+        if "json" in ctype:
+            data = json.loads(raw_body.decode("utf-8") or "{}")
+        else:
+            qs = parse_qs(raw_body.decode("utf-8", "ignore"))
+            data = {k: v[0] for k, v in qs.items() if v}
+            if not data:
+                data = json.loads(raw_body.decode("utf-8") or "{}")
+    except Exception as e:
+        return False, f"IPN parse error: {e}"
+    if not isinstance(data, dict):
+        return False, "IPN body dict nahi hai"
+    ok, info = verify_zurvapay_ipn(data, raw_body, headers)
+    if not ok:
+        safe = {k: v for k, v in data.items() if str(k).lower() not in ("signature", "hash", "sign", "checksum")}
+        log.warning("Zurvapay IPN signature FAIL (%s): %s", info, safe)
+        _zurva_send(ADMIN_ID, f"⚠️ Zurvapay IPN signature fail ({info}).\nFields: {safe}\nDashboard docs se sahi scheme check karo aur ZURVAPAY_IPN_MODE set karo.")
+        return False, f"bad signature: {info}"
+    f = _zurva_ipn_fields(data)
+    log.info("Zurvapay IPN verified (%s): identifier=%s amount=%s status=%s", info, f["identifier"], f["amount"], f["status"])
+    if f["status"] and f["status"] not in ZURVA_SUCCESS_STATUSES:
+        return True, f"ignored status {f['status']}"
+    ident = f["identifier"]
+    if not ident:
+        return False, "identifier nahi mila"
+    if ident.startswith("DEP-"):
+        return _zurva_handle_deposit_ipn(ident, f)
+    return _zurva_handle_order_ipn(ident, f)
+
 # ---------- Buy flow renders ----------
 
 def qty_kb(uid, pid):
@@ -906,6 +1254,8 @@ def summary_kb(uid, context):
         kb.append([InlineKeyboardButton("🎟️ Apply Coupon Code", callback_data="coupon_apply")])
     kb.append([InlineKeyboardButton("💚 Pay via PKR", callback_data="paypkr"),
                InlineKeyboardButton("🪙 Pay via USDT", callback_data="payusdt")])
+    if zurvapay_enabled():
+        kb.append([InlineKeyboardButton("⚡ Zurvapay — JazzCash/Easypaisa/Raast (Auto)", callback_data="pay_zurvapay")])
     cur = user_currency(uid)
     bal = get_wallet(uid, cur)
     need = total if cur == "PKR" else round(total / USDT_RATE, 2)
@@ -1089,6 +1439,27 @@ async def start_payment(q, context, method):
     dep = context.user_data.get("deposit")
     if dep:
         dep["method"] = method
+        if method == "zurvapay":
+            # Zurvapay sirf PKR karta hai.
+            if dep["currency"] != "PKR":
+                await q.edit_message_text("⚡ Zurvapay sirf PKR deposits ke liye hai. USDT ke liye USDT option use karein.")
+                return
+            c = db(); cur = c.execute(
+                "INSERT INTO deposits(user_id,username,currency,amount,payment_method,proof,status,created_at) VALUES(?,?,?,?,?,?, 'pending', ?)",
+                (uid, q.from_user.username or "", "PKR", dep["amount"], "zurvapay", "zurvapay", datetime.now().strftime("%Y-%m-%d %H:%M")))
+            dep_id = cur.lastrowid; c.commit(); c.close()
+            ident = f"DEP-{dep_id}"
+            url, err = zurvapay_initiate(ident, dep["amount"], f"RetailShop wallet deposit #{dep_id}",
+                                         q.from_user.first_name or "", "")
+            context.user_data.clear()
+            if err:
+                await q.edit_message_text(f"⚠️ Zurvapay payment start nahi ho saki: {err}\nDeposit #{dep_id} pending hai — dobara try karein ya admin se rabta karein.")
+                return
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("💳 Pay Now — JazzCash / Easypaisa / Raast QR", url=url)]])
+            await q.edit_message_text(
+                f"⚡ Zurvapay Deposit\n\nAmount: Rs {dep['amount']}\nDeposit #{dep_id}\n\nNeeche button se payment karein — JazzCash, Easypaisa ya Raast QR. Payment confirm hote hi wallet auto credit ho jayega.",
+                reply_markup=kb)
+            return
         if method in ("jazzcash", "easypaisa"):
             num = get_setting(f"{method}_number"); name = get_setting(f"{method}_name")
             label = "JazzCash" if method == "jazzcash" else "Easypaisa"
@@ -1108,6 +1479,27 @@ async def start_payment(q, context, method):
         await q.edit_message_text("Session expire ho gayi. /start se dobara karein."); return
     context.user_data["pay_method"] = method
     label = "Cart" if context.user_data.get("buy_mode") == "cart" else lines[0]["product"]["name"]
+    if method == "zurvapay":
+        # Order pehle banao (identifier = RS code), phir checkout URL do.
+        # Payment confirm hote hi Zurvapay IPN bhejega aur bot auto deliver karega.
+        code = context.user_data.get("buy_code") or gen_order_code()
+        coupon_code = context.user_data.get("buy_coupon_code") or ""
+        items = [{"pid": l["pid"], "qty": l["qty"]} for l in lines]
+        oid = create_order(uid, q.from_user.username or "", items, "zurvapay", f"Rs {total} via Zurvapay", "zurvapay", total, code, coupon_code, _disc)
+        if context.user_data.get("buy_mode") == "cart":
+            c = db(); c.execute("DELETE FROM carts WHERE user_id=?", (uid,)); c.commit(); c.close()
+        clear_buy_state(context)
+        context.user_data.pop("pay_method", None)
+        url, err = zurvapay_initiate(code, total, f"RetailShop order {code} — {label}",
+                                     q.from_user.first_name or "", "")
+        if err:
+            await q.edit_message_text(f"⚠️ Zurvapay payment start nahi ho saki: {err}\nOrder #{oid} ({code}) pending hai — dobara try karein ya admin se rabta karein.")
+            return
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("💳 Pay Now — JazzCash / Easypaisa / Raast QR", url=url)]])
+        await q.edit_message_text(
+            f"⚡ Zurvapay Payment\n\nProduct: {label}\nAmount: Rs {total}\nOrder #{oid} ({code})\n\nNeeche button se payment karein — JazzCash, Easypaisa ya Raast QR. Payment confirm hote hi account isi chat me auto deliver ho jayega.",
+            reply_markup=kb)
+        return
     if method in ("jazzcash", "easypaisa"):
         num = get_setting(f"{method}_number"); name = get_setting(f"{method}_name")
         mlabel = "JazzCash" if method == "jazzcash" else "Easypaisa"
@@ -1202,7 +1594,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "2️⃣ Quantity choose karein (bulk discount ho to kam price milegi).\n"
             "3️⃣ Terms & Conditions parh ke Agree karein.\n"
             "4️⃣ Order Summary check karein — coupon ho to Apply Coupon Code dabayein.\n"
-            "5️⃣ Payment karein: Easypaisa / JazzCash (TID ya screenshot bhejein) ya USDT TRC20 (TX hash bhejein). Wallet balance ho to Pay from Wallet bhi kar sakte hain.\n"
+            "5️⃣ Payment karein: Easypaisa / JazzCash (TID ya screenshot bhejein), USDT TRC20 (TX hash bhejein), ya Zurvapay se JazzCash/Easypaisa/Raast QR — auto verify, account khud aa jayega. Wallet balance ho to Pay from Wallet bhi kar sakte hain.\n"
+
             "6️⃣ Admin verify karte hi account isi chat me auto deliver ho jayega.\n\n"
             "💰 Wallet me Deposit karke bhi pay kar sakte hain.\n"
             "🎁 Pehli order pe FIRST-ORDER coupon se 7% off!",
@@ -1838,11 +2231,14 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["deposit"] = {"currency": cur, "amount": amount}
         context.user_data.pop("awaiting", None)
         if cur == "PKR":
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("💚 JazzCash", callback_data="pay_jazzcash")],
-                [InlineKeyboardButton("💚 Easypaisa", callback_data="pay_easypaisa")],
-                [InlineKeyboardButton("⬅ Back", callback_data="menu_deposit")],
-            ])
+            kb_rows = [
+                [InlineKeyboardButton("💚 JazzCash", callback_data="pay_jazzcash"),
+                 InlineKeyboardButton("💚 Easypaisa", callback_data="pay_easypaisa")],
+            ]
+            if zurvapay_enabled():
+                kb_rows.append([InlineKeyboardButton("⚡ Zurvapay (Auto) — JazzCash/Easypaisa/Raast", callback_data="pay_zurvapay")])
+            kb_rows.append([InlineKeyboardButton("⬅ Back", callback_data="menu_deposit")])
+            kb = InlineKeyboardMarkup(kb_rows)
             await update.message.reply_text(f"💰 Deposit Rs {amount} — payment method choose karein:", reply_markup=kb)
         else:
             kb = InlineKeyboardMarkup([
@@ -2249,6 +2645,7 @@ async def set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------- Main ----------
 
 def main():
+    global PTB_APP, PTB_LOOP
     init_db()
     start_health_server()
     if not BOT_TOKEN:
@@ -2257,6 +2654,7 @@ def main():
     if ADMIN_ID == 0:
         print("WARNING: ADMIN_ID set nahi hai — /admin kaam nahi karega. @userinfobot se apni ID le ke .env me dalo.")
     app = Application.builder().token(BOT_TOKEN).build()
+    PTB_APP = app  # IPN HTTP thread ko bot chahiye hota hai (delivery msgs ke liye)
 
     add_prod = ConversationHandler(
         entry_points=[CommandHandler("addproduct", addproduct_start)],
@@ -2323,6 +2721,7 @@ def main():
         try:
             _loop = _asyncio.new_event_loop()
             _asyncio.set_event_loop(_loop)
+            PTB_LOOP = _loop  # IPN thread isi loop pe deliver_order chalata hai
             app.run_polling()
             log.warning("run_polling returned cleanly; restarting polling")
         except (KeyboardInterrupt, SystemExit):
