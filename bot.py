@@ -111,6 +111,13 @@ def init_db():
     }
     for k, v in defaults.items():
         c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (k, v))
+    # Migrations for DBs created before these columns existed.
+    cols = [r[1] for r in c.execute("PRAGMA table_info(products)").fetchall()]
+    if "kind" not in cols:
+        c.execute("ALTER TABLE products ADD COLUMN kind TEXT DEFAULT 'account'")
+    cols = [r[1] for r in c.execute("PRAGMA table_info(accounts)").fetchall()]
+    if "extra" not in cols:
+        c.execute("ALTER TABLE accounts ADD COLUMN extra TEXT DEFAULT ''")
     # Auto-seed products on a fresh DB (e.g. Render free restarts wipe shop.db).
     # Stock is NOT seeded here — accounts must be added with /addstock.
     n = c.execute("SELECT COUNT(*) n FROM products").fetchone()["n"]
@@ -329,12 +336,35 @@ async def deliver_order(context: ContextTypes.DEFAULT_TYPE, order_id: int):
     c.execute("UPDATE accounts SET status='sold', sold_to=?, sold_at=?, order_id=? WHERE id=?", (order["user_id"], now, order_id, acc["id"]))
     c.execute("UPDATE orders SET status='delivered', account_id=? WHERE id=?", (acc["id"], order_id))
     c.commit(); c.close()
+    date_txt = datetime.now().strftime("%d/%m/%Y %I:%M %p PKT")
+    kind = (product["kind"] or "account") if "kind" in product.keys() else "account"
+    if kind == "mail":
+        # Mail-type delivery (Muse tokens etc.): buyer gets an email + mailbox
+        # URL, enters the mail on muse.ai, fetches the OTP from the mailbox
+        # site themselves. Stock format: code | email | mailbox_url
+        # (extra=code, login=email, password=mailbox URL).
+        extra = (acc["extra"] or "") if "extra" in acc.keys() else ""
+        acc_line = f"{extra} | {acc['login']} | {acc['password']}" if extra else f"{acc['login']} | {acc['password']}"
+        msg = (
+            f"✅ *Payment Verified*\n"
+            f"```\nProduct   :  {product['name']}\nOrder ID  :  PAY-{order_id}\n"
+            f"Paid      :  {order['amount_text']}\nDate      :  {date_txt}\n```\n\n"
+            f"*Account*\n{acc_line}\n\n"
+            f"──────────\n*Order Delivery Note*\n"
+            f"You have received mail and mailbox url.\n"
+            f"Copy the mail and paste it on muse.ai.\n\n"
+            f"Then go to mailbox site, get otp and paste on muse.ai to complete login.\n\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"ℹ️ OTP na mile ya koi issue ho to Support se rabta karein — code admin bhej dega."
+        )
+        await context.bot.send_message(order["user_id"], msg, parse_mode="Markdown")
+        return True
     msg = (
         f"✅ Payment confirmed! Aapka account mil gaya:\n\n"
         f"📦 Product: {product['name']}\n"
         f"👤 Login / Email: `{acc['login']}`\n"
         f"🔑 Password: `{acc['password']}`\n\n"
-        f"Order #{order_id}\n"
+        f"Order #{order_id} (PAY-{order_id})\n"
         f"Account ko save kar lein. Koi issue ho to admin se rabta karein."
     )
     await context.bot.send_message(order["user_id"], msg, parse_mode="Markdown")
@@ -630,7 +660,7 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = ["👑 Admin Panel\n", f"Pending orders: {pending}", ""]
     for p in prods:
         lines.append(f"#{p['id']} {p['name']} — Rs {p['price_pkr']} / ${p['price_usdt']} — Stock: {stock_count(p['id'])}")
-    lines.append("\nCommands:\n/addproduct — naya product\n/addstock — accounts add karo\n/removeproduct <id> — product delete\n/setprice <id> <pkr> <usdt> — price change (0 0 = FREE)\n/disableproduct <id> — list se chhupao\n/enableproduct <id> — wapas dikhao\n/clearstock <id> — stock khatam (Out of Stock)\n/orders — pending orders\n/setpayments — JazzCash/Easypaisa/USDT details\n/stock — saara stock dekho\n/set tg_channel @name — Telegram channel\n/set tg_group_url <link> — Telegram group link\n/set wa_channel_url <link> — WhatsApp channel")
+    lines.append("\nCommands:\n/addproduct — naya product\n/addstock — accounts add karo\n/removeproduct <id> — product delete\n/setprice <id> <pkr> <usdt> — price change (0 0 = FREE)\n/setkind <id> <mail|account> — delivery type (mail = email + mailbox URL)\n/disableproduct <id> — list se chhupao\n/enableproduct <id> — wapas dikhao\n/clearstock <id> — stock khatam (Out of Stock)\n/orders — pending orders\n/setpayments — JazzCash/Easypaisa/USDT details\n/stock — saara stock dekho\n/set tg_channel @name — Telegram channel\n/set tg_group_url <link> — Telegram group link\n/set wa_channel_url <link> — WhatsApp channel")
     await update.message.reply_text("\n".join(lines))
 
 async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -774,7 +804,9 @@ async def stock_choose(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Accounts bhejein — har line pe ek account:\n"
         "`email | password`\n"
-        "ya\n`username | password`\n\nExample:\ntest@gmail.com | Pass123\nuser2 | Abc456",
+        "ya\n`username | password`\n\n"
+        "Mail-type product (Muse token jaisa) ke liye:\n"
+        "`code | email | mailbox_url`\n\nExample:\ntest@gmail.com | Pass123\nuser2 | Abc456",
         parse_mode="Markdown")
     return STOCK_LINES
 
@@ -784,8 +816,14 @@ async def stock_lines(update: Update, context: ContextTypes.DEFAULT_TYPE):
     added = 0
     c = db()
     for line in lines:
+        extra = ""
         if "|" in line:
-            login, pwd = [x.strip() for x in line.split("|", 1)]
+            parts = [x.strip() for x in line.split("|")]
+            if len(parts) >= 3:
+                # Mail-type: code | email | mailbox_url
+                extra, login, pwd = parts[0], parts[1], "|".join(parts[2:])
+            else:
+                login, pwd = parts[0], parts[1] if len(parts) > 1 else ""
         elif "," in line:
             login, pwd = [x.strip() for x in line.split(",", 1)]
         else:
@@ -793,12 +831,29 @@ async def stock_lines(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if len(parts) < 2: continue
             login, pwd = parts[0], parts[1]
         if login and pwd:
-            c.execute("INSERT INTO accounts(product_id,login,password) VALUES(?,?,?)", (pid, login, pwd))
+            c.execute("INSERT INTO accounts(product_id,login,password,extra) VALUES(?,?,?,?)", (pid, login, pwd, extra))
             added += 1
     c.commit(); c.close()
     context.user_data.clear()
     await update.message.reply_text(f"✅ {added} accounts add ho gaye! Total stock ab: {stock_count(pid)}")
     return ConversationHandler.END
+
+async def setkind_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Product ki delivery type set karo: /setkind <id> <mail|account>.
+    mail = Muse token jaisa — buyer ko email + mailbox URL milta hai, OTP wo
+    khud mailbox site se leta hai. account = normal login + password."""
+    if not is_admin(update.effective_user.id): return
+    try:
+        pid = int(context.args[0]); kind = context.args[1].lower()
+    except (IndexError, ValueError):
+        await update.message.reply_text("Usage: /setkind <id> <mail|account>\nExample: /setkind 8 mail"); return
+    if kind not in ("mail", "account"):
+        await update.message.reply_text("Kind sirf 'mail' ya 'account' ho sakta hai."); return
+    c = db(); p = c.execute("SELECT * FROM products WHERE id=?", (pid,)).fetchone()
+    if not p:
+        c.close(); await update.message.reply_text("Ye ID nahi mili."); return
+    c.execute("UPDATE products SET kind=? WHERE id=?", (kind, pid)); c.commit(); c.close()
+    await update.message.reply_text(f"✅ {p['name']} ki delivery type ab '{kind}' hai.")
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
@@ -864,6 +919,7 @@ def main():
     app.add_handler(CommandHandler("setpayments", setpayments))
     app.add_handler(CommandHandler("set", set_cmd))
     app.add_handler(CommandHandler("removeproduct", removeproduct_cmd))
+    app.add_handler(CommandHandler("setkind", setkind_cmd))
     app.add_handler(CommandHandler("setprice", setprice_cmd))
     app.add_handler(CommandHandler("disableproduct", disableproduct_cmd))
     app.add_handler(CommandHandler("enableproduct", enableproduct_cmd))
