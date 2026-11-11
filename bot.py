@@ -35,6 +35,7 @@ DB_PATH = os.getenv("DB_PATH", "shop.db")
 # Channels: Telegram channel (username ya ID) + WhatsApp channel link.
 # Dono /set se bhi change ho sakte hain: /set tg_channel @name, /set wa_channel_url https://...
 TG_CHANNEL = os.getenv("TG_CHANNEL", "")
+TG_GROUP_URL = os.getenv("TG_GROUP_URL", "")
 WA_CHANNEL_URL = os.getenv("WA_CHANNEL_URL", "")
 
 USDT_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"  # USDT TRC20
@@ -104,6 +105,7 @@ def init_db():
         "easypaisa_name": os.getenv("EASYPAISA_NAME", "Junaid"),
         "usdt_address": os.getenv("USDT_ADDRESS", "TXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"),
         "tg_channel": TG_CHANNEL,
+        "tg_group_url": TG_GROUP_URL,
         "wa_channel_url": WA_CHANNEL_URL,
         "support_username": "",
     }
@@ -205,6 +207,11 @@ def tg_channel():
 def wa_channel_url():
     return (get_setting("wa_channel_url") or WA_CHANNEL_URL or "").strip()
 
+def tg_group_url():
+    """Telegram group ka invite link — sirf dikhane ke liye (verify nahi ho
+    sakta jab tak bot group me add na ho; us ke liye group ki numeric ID chahiye)."""
+    return (get_setting("tg_group_url") or TG_GROUP_URL or "").strip()
+
 def tg_chat_id():
     """get_chat_member ke liye chat id: @username ya numeric id."""
     ch = tg_channel()
@@ -276,6 +283,8 @@ async def show_gate_or_menu_message(update, context):
         link = tg_join_link()
         if link:
             kb.append([InlineKeyboardButton("📢 Join Telegram Channel", url=link)])
+        if tg_group_url():
+            kb.append([InlineKeyboardButton("👥 Join Telegram Group", url=tg_group_url())])
         if wa_channel_url():
             kb.append([InlineKeyboardButton("💬 Join WhatsApp Channel", url=wa_channel_url())])
         kb.append([InlineKeyboardButton("✅ Check Join Status", callback_data="check_join")])
@@ -411,6 +420,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         link = tg_join_link()
         if link:
             kb.append([InlineKeyboardButton("📢 Telegram Channel", url=link)])
+        if tg_group_url():
+            kb.append([InlineKeyboardButton("👥 Telegram Group", url=tg_group_url())])
         if wa_channel_url():
             kb.append([InlineKeyboardButton("💬 WhatsApp Channel", url=wa_channel_url())])
         kb.append([InlineKeyboardButton("⬅ Main Menu", callback_data="back_menu")])
@@ -619,7 +630,7 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = ["👑 Admin Panel\n", f"Pending orders: {pending}", ""]
     for p in prods:
         lines.append(f"#{p['id']} {p['name']} — Rs {p['price_pkr']} / ${p['price_usdt']} — Stock: {stock_count(p['id'])}")
-    lines.append("\nCommands:\n/addproduct — naya product\n/addstock — accounts add karo\n/removeproduct <id> — product delete\n/setprice <id> <pkr> <usdt> — price change (0 0 = FREE)\n/disableproduct <id> — list se chhupao\n/enableproduct <id> — wapas dikhao\n/clearstock <id> — stock khatam (Out of Stock)\n/orders — pending orders\n/setpayments — JazzCash/Easypaisa/USDT details\n/stock — saara stock dekho\n/set tg_channel @name — Telegram channel\n/set wa_channel_url <link> — WhatsApp channel")
+    lines.append("\nCommands:\n/addproduct — naya product\n/addstock — accounts add karo\n/removeproduct <id> — product delete\n/setprice <id> <pkr> <usdt> — price change (0 0 = FREE)\n/disableproduct <id> — list se chhupao\n/enableproduct <id> — wapas dikhao\n/clearstock <id> — stock khatam (Out of Stock)\n/orders — pending orders\n/setpayments — JazzCash/Easypaisa/USDT details\n/stock — saara stock dekho\n/set tg_channel @name — Telegram channel\n/set tg_group_url <link> — Telegram group link\n/set wa_channel_url <link> — WhatsApp channel")
     await update.message.reply_text("\n".join(lines))
 
 async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -806,11 +817,11 @@ async def setpayments(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id): return
     if len(context.args) < 2:
-        await update.message.reply_text("Usage: /set <key> <value>\nKeys: jazzcash_number, jazzcash_name, easypaisa_number, easypaisa_name, usdt_address, tg_channel, wa_channel_url, support_username"); return
+        await update.message.reply_text("Usage: /set <key> <value>\nKeys: jazzcash_number, jazzcash_name, easypaisa_number, easypaisa_name, usdt_address, tg_channel, tg_group_url, wa_channel_url, support_username"); return
     key, val = context.args[0], " ".join(context.args[1:])
     if key not in ("jazzcash_number", "jazzcash_name", "easypaisa_number", "easypaisa_name", "usdt_address",
-                   "tg_channel", "wa_channel_url", "support_username"):
-        await update.message.reply_text("Galat key. Keys: jazzcash_number, jazzcash_name, easypaisa_number, easypaisa_name, usdt_address, tg_channel, wa_channel_url, support_username"); return
+                   "tg_channel", "tg_group_url", "wa_channel_url", "support_username"):
+        await update.message.reply_text("Galat key. Keys: jazzcash_number, jazzcash_name, easypaisa_number, easypaisa_name, usdt_address, tg_channel, tg_group_url, wa_channel_url, support_username"); return
     if key == "tg_channel":
         val = val.strip()
     set_setting(key, val)
