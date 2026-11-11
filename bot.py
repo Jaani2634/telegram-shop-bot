@@ -141,7 +141,8 @@ SEED_PRODUCTS = [
 # This tiny health server also gives UptimeRobot something to ping every
 # 5 minutes so the free instance does not sleep.
 def start_health_server():
-    port = int(os.getenv("PORT", "0") or 0)
+    # Render uses PORT, Botkeep uses SERVER_PORT — support both.
+    port = int(os.getenv("PORT") or os.getenv("SERVER_PORT") or 0)
     if not port:
         return
     class H(BaseHTTPRequestHandler):
