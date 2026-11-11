@@ -2301,15 +2301,38 @@ def main():
     print("Bot chal raha hai... /start se test karo.", flush=True)
     # Keep the process alive: if polling ever raises, log it and restart
     # polling instead of letting the whole process exit (Botkeep does not
-    # auto-restart a stopped server).
+    # auto-restart a stopped server). BUT honour shutdown signals — when
+    # Botkeep asks the server to stop (SIGTERM), exit cleanly instead of
+    # restarting forever, otherwise the service gets stuck in "Stopping"
+    # (happened 2026-11-11: the restart loop blocked a graceful stop and
+    # the redeploy failed). Also use a fresh event loop per attempt: after
+    # a crash PTB's loop is closed, and reusing it raises
+    # "Event loop is closed" inside run_polling.
+    import asyncio as _asyncio
+    import signal as _signal
     import time as _time
-    while True:
+    _shutdown = {"stop": False}
+
+    def _ask_stop(signum, frame):
+        _shutdown["stop"] = True
+        log.warning("Shutdown signal %s received; stopping polling loop", signum)
+
+    _signal.signal(_signal.SIGTERM, _ask_stop)
+    _signal.signal(_signal.SIGINT, _ask_stop)
+    while not _shutdown["stop"]:
         try:
+            _loop = _asyncio.new_event_loop()
+            _asyncio.set_event_loop(_loop)
             app.run_polling()
             log.warning("run_polling returned cleanly; restarting polling")
+        except (KeyboardInterrupt, SystemExit):
+            break
         except Exception:
             log.exception("run_polling crashed; restarting in 5s")
+        if _shutdown["stop"]:
+            break
         _time.sleep(5)
+    log.warning("Polling loop stopped cleanly; exiting")
 
 if __name__ == "__main__":
     main()
