@@ -32,6 +32,10 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0)
 DB_PATH = os.getenv("DB_PATH", "shop.db")
+# Channels: Telegram channel (username ya ID) + WhatsApp channel link.
+# Dono /set se bhi change ho sakte hain: /set tg_channel @name, /set wa_channel_url https://...
+TG_CHANNEL = os.getenv("TG_CHANNEL", "")
+WA_CHANNEL_URL = os.getenv("WA_CHANNEL_URL", "")
 
 USDT_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"  # USDT TRC20
 
@@ -87,6 +91,11 @@ def init_db():
     CREATE TABLE IF NOT EXISTS settings(
         key TEXT PRIMARY KEY, value TEXT
     );
+    CREATE TABLE IF NOT EXISTS user_flags(
+        user_id INTEGER PRIMARY KEY,
+        wa_joined INTEGER DEFAULT 0,
+        checked_at TEXT
+    );
     """)
     defaults = {
         "jazzcash_number": os.getenv("JAZZCASH_NUMBER", "03XX-XXXXXXX"),
@@ -94,6 +103,9 @@ def init_db():
         "easypaisa_number": os.getenv("EASYPAISA_NUMBER", "03XX-XXXXXXX"),
         "easypaisa_name": os.getenv("EASYPAISA_NAME", "Junaid"),
         "usdt_address": os.getenv("USDT_ADDRESS", "TXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"),
+        "tg_channel": TG_CHANNEL,
+        "wa_channel_url": WA_CHANNEL_URL,
+        "support_username": "",
     }
     for k, v in defaults.items():
         c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (k, v))
@@ -184,6 +196,110 @@ def stock_count(product_id):
 def is_admin(uid):
     return ADMIN_ID != 0 and uid == ADMIN_ID
 
+# ---------- Channels ----------
+
+def tg_channel():
+    """Telegram channel (settings pehle, env fallback)."""
+    return (get_setting("tg_channel") or TG_CHANNEL or "").strip()
+
+def wa_channel_url():
+    return (get_setting("wa_channel_url") or WA_CHANNEL_URL or "").strip()
+
+def tg_chat_id():
+    """get_chat_member ke liye chat id: @username ya numeric id."""
+    ch = tg_channel()
+    if not ch:
+        return ""
+    if ch.startswith("@") or ch.lstrip("-").isdigit():
+        return ch
+    return "@" + ch
+
+def tg_join_link():
+    ch = tg_channel().lstrip("@")
+    if not ch or ch.lstrip("-").isdigit():
+        return ""
+    return f"https://t.me/{ch}"
+
+async def tg_is_member(bot, user_id):
+    """Returns True (joined), False (not joined), None (check nahi ho saka —
+    aam tor pe bot channel me admin nahi hai ya channel naam galat hai)."""
+    if not tg_channel():
+        return True, ""
+    try:
+        m = await bot.get_chat_member(tg_chat_id(), user_id)
+        return m.status in ("creator", "administrator", "member", "restricted"), ""
+    except Exception as e:
+        log.warning("get_chat_member failed for %s: %s", tg_chat_id(), e)
+        return None, str(e)
+
+def wa_joined_flag(user_id):
+    c = db(); r = c.execute("SELECT wa_joined FROM user_flags WHERE user_id=?", (user_id,)).fetchone(); c.close()
+    return bool(r and r["wa_joined"])
+
+def set_wa_joined(user_id):
+    c = db(); c.execute("INSERT OR REPLACE INTO user_flags(user_id, wa_joined, checked_at) VALUES(?,?,?)",
+                        (user_id, 1, datetime.now().strftime("%Y-%m-%d %H:%M"))); c.commit(); c.close()
+
+def products_kb():
+    c = db(); prods = c.execute("SELECT * FROM products WHERE active=1 ORDER BY id").fetchall(); c.close()
+    kb = []
+    for p in prods:
+        if p["price_pkr"] == 0 and p["price_usdt"] == 0:
+            price = "🆓 FREE"
+        else:
+            price = f"Rs {p['price_pkr']} / ${p['price_usdt']}"
+        n = stock_count(p["id"])
+        tag = f" (Stock: {n})" if n else " (Out of Stock)"
+        kb.append([InlineKeyboardButton(f"{p['name']} — {price}{tag}", callback_data=f"prod_{p['id']}")])
+    kb.append([InlineKeyboardButton("⬅ Main Menu", callback_data="back_menu")])
+    return kb
+
+async def show_menu_text():
+    return ("👋 Welcome to RetailShop!\n\n"
+            "Neeche se choose karein:")
+
+def menu_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🛍️ Products", callback_data="menu_products")],
+        [InlineKeyboardButton("📢 Our Channels", callback_data="menu_channels")],
+        [InlineKeyboardButton("📦 My Orders", callback_data="menu_orders")],
+        [InlineKeyboardButton("💬 Support", callback_data="menu_support")],
+    ])
+
+async def show_gate_or_menu_message(update, context):
+    """Join gate check karke ya gate dikhata hai ya main menu. Returns True
+    agar menu dikhaya, False agar gate dikhaya."""
+    user = update.effective_user
+    member, _err = await tg_is_member(context.bot, user.id)
+    if member is False:
+        kb = []
+        link = tg_join_link()
+        if link:
+            kb.append([InlineKeyboardButton("📢 Join Telegram Channel", url=link)])
+        if wa_channel_url():
+            kb.append([InlineKeyboardButton("💬 Join WhatsApp Channel", url=wa_channel_url())])
+        kb.append([InlineKeyboardButton("✅ Check Join Status", callback_data="check_join")])
+        await update.message.reply_text(
+            "🔒 Pehle hamara Telegram channel join karein, phir products dikhenge.\n\n"
+            "Channel join karein, phir neeche **Check Join Status** dabayein.",
+            reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+        return False
+    if member is None:
+        await update.message.reply_text(
+            "⚠️ Channel check nahi ho saka. Admin ne bot ko Telegram channel me admin nahi banaya hoga. "
+            "Thodi der me dobara /start karein.")
+        return False
+    if wa_channel_url() and not wa_joined_flag(user.id):
+        kb = [[InlineKeyboardButton("💬 Join WhatsApp Channel", url=wa_channel_url())],
+              [InlineKeyboardButton("✅ Maine Join Kar Liya", callback_data="wa_joined")]]
+        await update.message.reply_text(
+            "💬 Hamara WhatsApp channel bhi join kar lein — wahan naye products aur offers aate hain.\n\n"
+            "Join karke neeche **Maine Join Kar Liya** dabayein.",
+            reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+        return False
+    await update.message.reply_text(await show_menu_text(), reply_markup=menu_kb())
+    return True
+
 # ---------- Auto Delivery ----------
 
 async def deliver_order(context: ContextTypes.DEFAULT_TYPE, order_id: int):
@@ -270,43 +386,125 @@ def verify_usdt(tx_hash: str, expected_address: str, expected_amount: float):
 # ---------- Buyer ----------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    c = db(); prods = c.execute("SELECT * FROM products WHERE active=1 ORDER BY id").fetchall(); c.close()
-    if not prods:
-        await update.message.reply_text("👋 Welcome! Abhi koi product available nahi hai. Thodi der me check karein.")
-        return
-    kb = []
-    for p in prods:
-        kb.append([InlineKeyboardButton(f"{p['name']} — Rs {p['price_pkr']} / ${p['price_usdt']}  (Stock: {stock_count(p['id'])})", callback_data=f"prod_{p['id']}")])
-    await update.message.reply_text("🛍️ Products — koi ek choose karein:", reply_markup=InlineKeyboardMarkup(kb))
+    await show_gate_or_menu_message(update, context)
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     data = q.data
+
+    # ---------- Main menu ----------
+    if data == "back_menu":
+        await q.edit_message_text(await show_menu_text(), reply_markup=menu_kb())
+        return
+
+    if data == "menu_products":
+        kb = products_kb()
+        if len(kb) <= 1:
+            await q.edit_message_text("👋 Abhi koi product available nahi hai. Thodi der me check karein.",
+                                      reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Main Menu", callback_data="back_menu")]]))
+            return
+        await q.edit_message_text("🛍️ Products — koi ek choose karein:", reply_markup=InlineKeyboardMarkup(kb))
+        return
+
+    if data == "menu_channels":
+        kb = []
+        link = tg_join_link()
+        if link:
+            kb.append([InlineKeyboardButton("📢 Telegram Channel", url=link)])
+        if wa_channel_url():
+            kb.append([InlineKeyboardButton("💬 WhatsApp Channel", url=wa_channel_url())])
+        kb.append([InlineKeyboardButton("⬅ Main Menu", callback_data="back_menu")])
+        await q.edit_message_text(
+            "📢 Hamare Channels\n\nTelegram channel join karna zaroori hai — bot khud check karta hai.\n"
+            "WhatsApp channel pe naye products aur offers milte hain.",
+            reply_markup=InlineKeyboardMarkup(kb))
+        return
+
+    if data == "menu_orders":
+        c = db(); rows = c.execute("SELECT * FROM orders WHERE user_id=? ORDER BY id DESC LIMIT 10", (q.from_user.id,)).fetchall(); c.close()
+        if not rows:
+            txt = "📦 Aapki koi order nahi hai."
+        else:
+            lines = ["📦 My Orders\n"]
+            for o in rows:
+                c = db(); p = c.execute("SELECT name FROM products WHERE id=?", (o["product_id"],)).fetchone(); c.close()
+                lines.append(f"#{o['id']} {p['name'] if p else '?'} — {o['status']} ({o['amount_text']})")
+            txt = "\n".join(lines)
+        await q.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("⬅ Main Menu", callback_data="back_menu")]]))
+        return
+
+    if data == "menu_support":
+        sup = get_setting("support_username")
+        txt = "💬 Support\n\nKoi issue ho — payment, account kaam na kare, ya order na mile — to admin se rabta karein."
+        kb = []
+        if sup:
+            kb.append([InlineKeyboardButton("💬 Message Admin", url=f"https://t.me/{sup.lstrip('@')}")])
+        kb.append([InlineKeyboardButton("⬅ Main Menu", callback_data="back_menu")])
+        await q.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(kb))
+        return
+
+    # ---------- Channel gate ----------
+    if data == "check_join":
+        member, _err = await tg_is_member(context.bot, q.from_user.id)
+        if member is True:
+            if wa_channel_url() and not wa_joined_flag(q.from_user.id):
+                kb = [[InlineKeyboardButton("💬 Join WhatsApp Channel", url=wa_channel_url())],
+                      [InlineKeyboardButton("✅ Maine Join Kar Liya", callback_data="wa_joined")]]
+                await q.edit_message_text(
+                    "✅ Telegram channel joined! Ab WhatsApp channel bhi join kar lein.",
+                    reply_markup=InlineKeyboardMarkup(kb))
+                return
+            await q.edit_message_text("✅ Channel joined! " + await show_menu_text(), reply_markup=menu_kb())
+            return
+        if member is None:
+            await q.answer("Check nahi ho saka — bot channel me admin nahi hai.", show_alert=True)
+            return
+        await q.answer("Abhi join nahi hua — pehle channel join karein, phir dobara check karein.", show_alert=True)
+        return
+
+    if data == "wa_joined":
+        # NOTE: WhatsApp channel join ko Telegram bot verify NAHI kar sakta —
+        # WhatsApp ka koi public API nahi hai. Ye button user ke bharose pe hai.
+        set_wa_joined(q.from_user.id)
+        await q.edit_message_text("✅ Shukriya! " + await show_menu_text(), reply_markup=menu_kb())
+        return
 
     if data.startswith("prod_"):
         pid = int(data.split("_")[1])
         c = db(); p = c.execute("SELECT * FROM products WHERE id=?", (pid,)).fetchone(); c.close()
         if not p:
             await q.edit_message_text("Product nahi mila."); return
+        is_free = p["price_pkr"] == 0 and p["price_usdt"] == 0
+        price_txt = "🆓 FREE" if is_free else f"💰 Price: Rs {p['price_pkr']}  |  ${p['price_usdt']} USDT"
+        buy_label = "🎁 Get Free" if is_free else "🛒 Buy Now"
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🛒 Buy Now", callback_data=f"buy_{pid}")],
+            [InlineKeyboardButton(buy_label, callback_data=f"buy_{pid}")],
             [InlineKeyboardButton("⬅ Back", callback_data="back_list")]
         ])
         await q.edit_message_text(
-            f"📦 {p['name']}\n\n{p['description']}\n\n💰 Price: Rs {p['price_pkr']}  |  ${p['price_usdt']} USDT\n📦 Stock: {stock_count(pid)}",
+            f"📦 {p['name']}\n\n{p['description']}\n\n{price_txt}\n📦 Stock: {stock_count(pid)}",
             reply_markup=kb)
         return
 
     if data == "back_list":
-        c = db(); prods = c.execute("SELECT * FROM products WHERE active=1 ORDER BY id").fetchall(); c.close()
-        kb = [[InlineKeyboardButton(f"{p['name']} — Rs {p['price_pkr']} / ${p['price_usdt']} (Stock: {stock_count(p['id'])})", callback_data=f"prod_{p['id']}")] for p in prods]
-        await q.edit_message_text("🛍️ Products — koi ek choose karein:", reply_markup=InlineKeyboardMarkup(kb))
+        await q.edit_message_text("🛍️ Products — koi ek choose karein:", reply_markup=InlineKeyboardMarkup(products_kb()))
         return
 
     if data.startswith("buy_"):
         pid = int(data.split("_")[1])
         if stock_count(pid) == 0:
             await q.edit_message_text("❌ Is product ka stock khatam hai. Dusra product choose karein.")
+            return
+        c = db(); _p = c.execute("SELECT * FROM products WHERE id=?", (pid,)).fetchone(); c.close()
+        if _p and _p["price_pkr"] == 0 and _p["price_usdt"] == 0:
+            # FREE product — no payment, instant delivery
+            c = db(); cur = c.execute(
+                "INSERT INTO orders(user_id,username,product_id,payment_method,amount_text,proof,status,created_at) VALUES(?,?,?,?,?,?, 'pending', ?)",
+                (q.from_user.id, q.from_user.username or "", pid, "free", "FREE", "free", datetime.now().strftime("%Y-%m-%d %H:%M")))
+            oid = cur.lastrowid; c.commit(); c.close()
+            await q.edit_message_text(f"🎁 FREE product! Order #{oid} — account abhi bhej raha hun...")
+            await deliver_order(context, oid)
             return
         context.user_data["buy_pid"] = pid
         kb = InlineKeyboardMarkup([
@@ -421,7 +619,7 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = ["👑 Admin Panel\n", f"Pending orders: {pending}", ""]
     for p in prods:
         lines.append(f"#{p['id']} {p['name']} — Rs {p['price_pkr']} / ${p['price_usdt']} — Stock: {stock_count(p['id'])}")
-    lines.append("\nCommands:\n/addproduct — naya product\n/addstock — accounts add karo\n/orders — pending orders\n/setpayments — JazzCash/Easypaisa/USDT details\n/stock — saara stock dekho")
+    lines.append("\nCommands:\n/addproduct — naya product\n/addstock — accounts add karo\n/removeproduct <id> — product delete\n/setprice <id> <pkr> <usdt> — price change (0 0 = FREE)\n/disableproduct <id> — list se chhupao\n/enableproduct <id> — wapas dikhao\n/clearstock <id> — stock khatam (Out of Stock)\n/orders — pending orders\n/setpayments — JazzCash/Easypaisa/USDT details\n/stock — saara stock dekho\n/set tg_channel @name — Telegram channel\n/set wa_channel_url <link> — WhatsApp channel")
     await update.message.reply_text("\n".join(lines))
 
 async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -439,8 +637,71 @@ async def stock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     c = db(); prods = c.execute("SELECT * FROM products ORDER BY id").fetchall(); c.close()
     msg = []
     for p in prods:
-        msg.append(f"#{p['id']} {p['name']}: {stock_count(p['id'])} available")
+        state = "✅ active" if p["active"] else "🚫 hidden"
+        msg.append(f"#{p['id']} {p['name']}: {stock_count(p['id'])} available — {state}")
     await update.message.reply_text("\n".join(msg) or "Koi product nahi.")
+
+# ---------- Admin: product management ----------
+# /removeproduct <id> — product + uska bacha hua (unsold) stock delete
+# /setprice <id> <pkr> <usdt> — price change; 0 0 = FREE (bina payment delivery)
+# /disableproduct <id> — list se chhupao (out of stock jaisa, delete nahi)
+# /enableproduct <id> — wapas dikhao
+# /clearstock <id> — saare available accounts delete (product Out of Stock ho jata hai)
+
+def _pid_arg(context):
+    try:
+        return int(context.args[0])
+    except (IndexError, ValueError):
+        return None
+
+async def removeproduct_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id): return
+    pid = _pid_arg(context)
+    if not pid:
+        await update.message.reply_text("Usage: /removeproduct <id>  (ID /admin ya /stock se dekho)"); return
+    c = db(); p = c.execute("SELECT * FROM products WHERE id=?", (pid,)).fetchone()
+    if not p:
+        c.close(); await update.message.reply_text("Ye ID nahi mili."); return
+    c.execute("DELETE FROM accounts WHERE product_id=? AND status='available'", (pid,))
+    c.execute("DELETE FROM products WHERE id=?", (pid,)); c.commit(); c.close()
+    await update.message.reply_text(f"🗑️ Product #{pid} ({p['name']}) delete ho gaya. Sold accounts ka record orders me mehfooz hai.")
+
+async def setprice_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id): return
+    try:
+        pid = int(context.args[0]); pkr = int(context.args[1]); usdt = float(context.args[2])
+    except (IndexError, ValueError):
+        await update.message.reply_text("Usage: /setprice <id> <pkr> <usdt>\nExample: /setprice 5 500 1.79\nFREE karne ke liye: /setprice 5 0 0"); return
+    c = db(); p = c.execute("SELECT * FROM products WHERE id=?", (pid,)).fetchone()
+    if not p:
+        c.close(); await update.message.reply_text("Ye ID nahi mili."); return
+    c.execute("UPDATE products SET price_pkr=?, price_usdt=? WHERE id=?", (pkr, usdt, pid)); c.commit(); c.close()
+    tag = " — ab ye 🆓 FREE hai, buyer ko bina payment account milega." if pkr == 0 and usdt == 0 else ""
+    await update.message.reply_text(f"✅ {p['name']} ki price ab Rs {pkr} / ${usdt}.{tag}")
+
+async def disableproduct_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id): return
+    pid = _pid_arg(context)
+    if not pid:
+        await update.message.reply_text("Usage: /disableproduct <id>"); return
+    c = db(); c.execute("UPDATE products SET active=0 WHERE id=?", (pid,)); c.commit(); c.close()
+    await update.message.reply_text(f"🚫 Product #{pid} list se chhupa diya (delete nahi hua). Wapas lane ke liye /enableproduct {pid}")
+
+async def enableproduct_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id): return
+    pid = _pid_arg(context)
+    if not pid:
+        await update.message.reply_text("Usage: /enableproduct <id>"); return
+    c = db(); c.execute("UPDATE products SET active=1 WHERE id=?", (pid,)); c.commit(); c.close()
+    await update.message.reply_text(f"✅ Product #{pid} wapas list me dikhne laga.")
+
+async def clearstock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id): return
+    pid = _pid_arg(context)
+    if not pid:
+        await update.message.reply_text("Usage: /clearstock <id>"); return
+    c = db(); c.execute("DELETE FROM accounts WHERE product_id=? AND status='available'", (pid,)); c.commit(); c.close()
+    await update.message.reply_text(f"🧹 Product #{pid} ka saara available stock clear — ab ye Out of Stock dikhega. /addstock se dobara add karo.")
 
 # Add product conversation
 async def addproduct_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -545,12 +806,18 @@ async def setpayments(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id): return
     if len(context.args) < 2:
-        await update.message.reply_text("Usage: /set jazzcash_number 03001234567"); return
+        await update.message.reply_text("Usage: /set <key> <value>\nKeys: jazzcash_number, jazzcash_name, easypaisa_number, easypaisa_name, usdt_address, tg_channel, wa_channel_url, support_username"); return
     key, val = context.args[0], " ".join(context.args[1:])
-    if key not in ("jazzcash_number", "jazzcash_name", "easypaisa_number", "easypaisa_name", "usdt_address"):
-        await update.message.reply_text("Galat key. Keys: jazzcash_number, jazzcash_name, easypaisa_number, easypaisa_name, usdt_address"); return
+    if key not in ("jazzcash_number", "jazzcash_name", "easypaisa_number", "easypaisa_name", "usdt_address",
+                   "tg_channel", "wa_channel_url", "support_username"):
+        await update.message.reply_text("Galat key. Keys: jazzcash_number, jazzcash_name, easypaisa_number, easypaisa_name, usdt_address, tg_channel, wa_channel_url, support_username"); return
+    if key == "tg_channel":
+        val = val.strip()
     set_setting(key, val)
-    await update.message.reply_text(f"✅ {key} = {val}")
+    extra = ""
+    if key == "tg_channel":
+        extra = "\n⚠️ Bot ko is channel me ADMIN banana zaroori hai, warna join check nahi hoga."
+    await update.message.reply_text(f"✅ {key} = {val}{extra}")
 
 # ---------- Main ----------
 
@@ -579,11 +846,17 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)])
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("menu", start))
     app.add_handler(CommandHandler("admin", admin_panel))
     app.add_handler(CommandHandler("orders", orders_cmd))
     app.add_handler(CommandHandler("stock", stock_cmd))
     app.add_handler(CommandHandler("setpayments", setpayments))
     app.add_handler(CommandHandler("set", set_cmd))
+    app.add_handler(CommandHandler("removeproduct", removeproduct_cmd))
+    app.add_handler(CommandHandler("setprice", setprice_cmd))
+    app.add_handler(CommandHandler("disableproduct", disableproduct_cmd))
+    app.add_handler(CommandHandler("enableproduct", enableproduct_cmd))
+    app.add_handler(CommandHandler("clearstock", clearstock_cmd))
     app.add_handler(add_prod)
     app.add_handler(add_stock)
     app.add_handler(CallbackQueryHandler(on_callback))
