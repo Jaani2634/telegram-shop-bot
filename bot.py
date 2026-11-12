@@ -73,6 +73,10 @@ ZURVAPAY_STATUS_URL = os.getenv("ZURVAPAY_STATUS_URL", "")
 # hmac_pipe_sha256 | hmac_pipe_sha512 | hmac_body_sha256 | hmac_body_sha512 |
 # hmac_sorted_sha256 | hmac_sorted_sha512 | sha256_concat | hmac_pipe_status_sha256
 ZURVAPAY_IPN_MODE = os.getenv("ZURVAPAY_IPN_MODE", "auto")
+# bot_id — LAZMI (2026-11-12 live test se sabit): Zurvapay approval sirf
+# registered Telegram bot ke liye valid hai; initiate call me bot_id bhejna
+# zaroori hai warna "domain_not_allowed" error aata hai. Default BOT_USERNAME.
+ZURVAPAY_BOT_ID = os.getenv("ZURVAPAY_BOT_ID", BOT_USERNAME)
 
 # IPN HTTP thread se PTB loop tak pohanchne ke liye (main() me set hota hai).
 PTB_APP = None
@@ -949,6 +953,7 @@ def zurvapay_initiate(identifier, amount_pkr, details, customer_name="", custome
     base = _zurvapay_public_base()
     payload = {
         "public_key": ZURVAPAY_PUBLIC_KEY,
+        "bot_id": ZURVAPAY_BOT_ID,
         "identifier": identifier,
         "currency": "PKR",
         "amount": int(amount_pkr),
