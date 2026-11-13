@@ -47,6 +47,10 @@ const WA_BOT_NUMBER = (process.env.WA_BOT_NUMBER || "").replace(/\D/g, "");
 // (Pairing code har 5s rotate ho raha tha kyunki socket band ho jata tha;
 // QR mode se pata chalega ke socket bina code request ke tikta hai ya nahi.)
 const WA_SKIP_PAIRING_CODE = process.env.WA_SKIP_PAIRING_CODE === "1";
+// WA_DISABLED=1: WhatsApp se bilkul connect mat karo (cooldown / block se
+// bachne ke liye). Bot process alive rehta hai, Telegram bot chalta rehta
+// hai, sirf WA attempts band hote hain. Hatane ke liye env se delete karo.
+const WA_DISABLED = process.env.WA_DISABLED === "1";
 
 let dbPath = process.env.DB_PATH || path.join(ROOT, "shop.db");
 let _db = null;
@@ -1079,6 +1083,13 @@ async function main() {
   }
   if (!WA_BOT_NUMBER) {
     log("WA_BOT_NUMBER set nahi hai — pairing ke liye env me WA_BOT_NUMBER (digits only, spare number) set karke restart karein. Bot crash nahi karega, wait karega.");
+  }
+  if (WA_DISABLED) {
+    // Cooldown: WhatsApp se koi attempt nahi — process alive rakho taake
+    // start.sh restart na kare, lekin socket start mat karo.
+    log("WA bot DISABLED (WA_DISABLED=1) — WhatsApp se connect nahi kar raha. Cooldown chal raha hai; enable karne ke liye env var hatakar restart karein.");
+    setInterval(() => {}, 3600000);
+    return;
   }
   await startSock();
 }
