@@ -265,6 +265,17 @@ def init_db():
     # Categories assign karo (sirf jahan abhi khaali hai — admin ki change overwrite nahi hogi).
     for pid, cat in CATEGORY_MAP.items():
         c.execute("UPDATE products SET category=? WHERE id=? AND (category IS NULL OR category='')", (cat, pid))
+    # Product guides bharo (sirf jahan description/terms khaali hain —
+    # admin ki /setdesc ya /setterms wali change overwrite nahi hogi).
+    for row in c.execute("SELECT id, name, description, terms FROM products").fetchall():
+        g = PRODUCT_GUIDES.get(row["name"])
+        if not g:
+            continue
+        short_desc, terms = g
+        if (not (row["description"] or "").strip()) and short_desc:
+            c.execute("UPDATE products SET description=? WHERE id=?", (short_desc, row["id"]))
+        if (not (row["terms"] or "").strip()) and terms:
+            c.execute("UPDATE products SET terms=? WHERE id=?", (terms, row["id"]))
     c.commit(); c.close()
 
 # Products from Junaid's screenshots (11 Nov 2026). USDT at 280 PKR.
@@ -296,6 +307,119 @@ SEED_PRODUCTS = [
     ("Hostinger Unlimited Plan 12 Months (FW)", "", 5550, 19.82),
     ("Muse Ai Token On Client Account", "", 50, 0.18),
 ]
+
+# Har product ki delivery instructions (How to Use + warranty) — SubPk.Store
+# WhatsApp bot ke style me: buyer ko account ke sath ye instructions milti
+# hain (delivery message me, aur checkout par Terms me bhi).
+# 4 products ki text seller ki apni hai (video se li gayi); baaki 22 usi
+# style me likhi gayi hain — Junaid /setterms se kisi bhi product ki badal
+# sakta hai. (name -> (short description, terms))
+PRODUCT_GUIDES = {
+    "Amazon Prime 6 Months": (
+        "Limited Deal - was PKR 850",
+        "How to Use: You will receive Mail | Password. Login on primevideo.com or the Amazon app with the same mail and password. Use only the given profile — do not change the mail or password, or the account may stop working. Check it right after login — first login warranty only. If there is any issue, contact Support immediately.",
+    ),
+    "Udemy Personal Plan 1M": (
+        "Limited Deal - was PKR 669",
+        "28,000+ Top-rated Courses, Unlimited Access. Practice Activities and Tests Included. Certificate In Your Name. Download Every Certificate as a PDF Before Your Plan Expires. Check Certificate: https://www.udemy.com/certificate/UC-YOUR-CERTIFICATE-NUMBER/ — Update Name and Account Details With Your Own Information. 2 Days Warranty. Warranty will be void if you change the mail.",
+    ),
+    "Capcut Pro 1 Month": (
+        "Premium Service",
+        "CapCut Pro Team – 1 Month private account. Features: Ready-made private account, Full Pro Team access, Instant delivery after payment. Warranty Rules: Warranty only covers account going back non-Pro. Warranty not accepted if account hits max-attempts issues. How to Use: You will receive: Mail | Capcut Password | Mail Password. Copy exactly and login at CapCut. Login on max 2 devices (1 mobile + 1 PC). Do not logout and login repeatedly.",
+    ),
+    "HMA Vpn Monthly": (
+        "Premium Service",
+        "How to Use: You will receive Mail | Password. Download the HMA VPN app and login with the same mail and password. Use on 1 device only. Do not change the password. Check it right after login — first login warranty only. If there is any issue, contact Support.",
+    ),
+    "Microsoft 365 Plus 1 Year": (
+        "Premium Service",
+        "How to Use: You will receive Mail | Password. Login on office.com with the same mail and activate Office apps on your device. Do not change the mail or password. Check it right after login — first login warranty only. If there is any issue, contact Support.",
+    ),
+    "Muse Ai 1B Credits": (
+        "Premium Service",
+        "How to Use: You will receive Mail and mailbox URL. Put the mail on muse.ai, then get the OTP from the mailbox site and paste it on muse.ai to complete login. Use on only 1 device, and every time you open muse.ai use it with USA IP. Credits will be 1 Billion. First Login Warranty Only (login within 30 mins of purchase). Accounts are NON WARRANTY — take the risk if you buy it!",
+    ),
+    "Windows 10/11 Pro": (
+        "Premium Service",
+        "How to Use: You will receive a Windows activation key. Go to Windows Settings, then Activation, enter the key and activate. The key works on 1 PC. Activate it as soon as you receive it. If there is any issue, contact Support.",
+    ),
+    "Muse Ai 31B Token (NW)": (
+        "Premium Service",
+        "Muse AI – 31 Billion Tokens Account. First Login Warranty Only (Login Within 30 Mins Of Purchase). How to Use: You will receive Mail and mailbox url. Put mail on muse.ai and then get otp from mailbox url. Note: Credits Can Be 30 or 31 Billion. Note: All accounts will be used different domains. All accounts will be add a USA phone numbers! Anyway, the accounts are NON WARRANTY, take the risk if you buy it! To avoid any issues use it on only 1 Device. And every time you open muse ai use it with usa ip.",
+    ),
+    "Capcut Pro 7D 500 credits": (
+        "CapCut Pro — 7 days, 500 credits",
+        "How to Use: You will receive Mail | Password. Login on the CapCut app with the same mail and password — you get 500 credits for 7 days. Use on 1 device only, do not change the password. Check it right after login. If there is any issue, contact Support.",
+    ),
+    "500$ API CLAUDE 30D (FW)": (
+        "Claude API — $500 credits, 30 days",
+        "How to Use: You will receive Mail | Password (or API key/link). Login on the Claude console and use the $500 API credits — valid for 30 days. Use on 1 device/IP only, do not share the credentials. Check it right after login — first login warranty only. If there is any issue, contact Support.",
+    ),
+    "100$ API Claude 30D (FW)": (
+        "Claude API — $100 credits, 30 days",
+        "How to Use: You will receive Mail | Password (or API key/link). Login on the Claude console and use the $100 API credits — valid for 30 days. Use on 1 device/IP only, do not share the credentials. Check it right after login — first login warranty only. If there is any issue, contact Support.",
+    ),
+    "Adobe Express 12M": (
+        "Adobe Express Premium — 12 months",
+        "How to Use: You will receive Mail | Password. Login on adobe.com with the same mail and use Express Premium — valid for 12 months. Do not change the password. Use on 1 device. Check it right after login. If there is any issue, contact Support.",
+    ),
+    "Gemini Plus 6m Links (No Card Required)": (
+        "Gemini Plus — 6 months, redeem link, no card needed",
+        "GEMINI PLUS – 6 MONTHS. Simple Redeem-Link Activation. No Credit Card Required. Add Up to 5 Accounts. Gemini Pro and Flash Models. Gemini Omni 1.1 Flash. Anti Gravity Access. Nano Banana 2. 400 GB Google Storage. 250 Google Flow Points. 12-Hour Link Warranty. Instant Delivery. No Warranty After Activation — Only Activation Warranty. Note: We sell official Gemini Plus Plan. You activate it by yourself on your own mail. After activation, plus features are all from Google, not from our side. If you think you haven't got any feature then contact Google. Anti-gravity and Flow ai etc. — everything is from Google.",
+    ),
+    "MUSE AI 1B TOKEN (W2D)": (
+        "Muse AI — 1 Billion tokens account",
+        "How to Use: You will receive Mail and mailbox URL. Put the mail on muse.ai, then get the OTP from the mailbox site and paste it on muse.ai to complete login. Use on only 1 device, and every time you open muse.ai use it with USA IP. Credits will be 1 Billion (W2D). First Login Warranty Only (login within 30 mins of purchase). Accounts are NON WARRANTY.",
+    ),
+    "Outlook IMAP": (
+        "Outlook mail account (IMAP)",
+        "How to Use: You will receive Mail | Password. Login with IMAP in Outlook or any mail app. This is a mail account only. Check it right after login. If there is any issue, contact Support immediately.",
+    ),
+    "Hotmail Mail Accounts": (
+        "Hotmail mail account",
+        "How to Use: You will receive Mail | Password. Login on outlook.com / Hotmail with the same mail and password. This is a mail account only. Check it right after login. If there is any issue, contact Support immediately.",
+    ),
+    "Owl Proxy 200 Mb": (
+        "Owl Proxy — 200 MB data",
+        "How to Use: You will receive proxy details (host, port, username, password). Put them in your app or browser proxy settings to use it. You get 200 MB data. Do not share the details. If there is any issue, contact Support.",
+    ),
+    "iLovePdf Premium 1 Yr": (
+        "iLovePDF Premium — 1 year",
+        "How to Use: You will receive Mail | Password. Login on ilovepdf.com with the same mail and use Premium tools — valid for 1 year. Do not change the password. Check it right after login. If there is any issue, contact Support.",
+    ),
+    "Chatgpt Plus 1M (25DW)": (
+        "ChatGPT Plus — 1 month",
+        "How to Use: You will receive Mail | Password. Login on chatgpt.com with the same mail and use Plus features — valid for 1 month. Use on 1 device only, do not change the password. Check it right after login. If there is any issue, contact Support.",
+    ),
+    "Coursera Plus 7 Days Trial": (
+        "Coursera Plus — 7 days trial",
+        "How to Use: You will receive Mail | Password. Login on coursera.org with the same mail — you get a 7-day trial. Finish your work before the trial ends. Do not change the password. Check it right after login. If there is any issue, contact Support.",
+    ),
+    "Bolt .new Pro 1 Month": (
+        "Bolt.new Pro — 1 month",
+        "How to Use: You will receive Mail | Password. Login on bolt.new with the same mail and use Pro features — valid for 1 month. Use on 1 device, do not change the password. Check it right after login. If there is any issue, contact Support.",
+    ),
+    "3 in 1 VIP Group": (
+        "3 in 1 VIP group access",
+        "How to Use: After payment you will receive a VIP group invite link. Join the group with the link. Read and follow the group rules. Do not share the link. If there is any issue, contact Support.",
+    ),
+    "Canva Edu 3 Years Invite On Client Mail": (
+        "Invite on client mail",
+        "How to Use: Give your mail ID — the Canva Edu invite (3 years) will be sent to your mail. Accept the invite and use Canva Edu. Accept the invite as soon as you receive it. If there is any issue, contact Support.",
+    ),
+    "CrunchyRoll 1 Year Mega Fan Profile (FW)": (
+        "Crunchyroll Mega Fan — 1 year",
+        "How to Use: You will receive Mail | Password. Login on crunchyroll.com with the same mail and use the Mega Fan profile — valid for 1 year. Use only the given profile — do not change the mail or password. Check it right after login. If there is any issue, contact Support.",
+    ),
+    "Hostinger Unlimited Plan 12 Months (FW)": (
+        "Hostinger Unlimited — 12 months",
+        "How to Use: You will receive Mail | Password. Login on hostinger.com with the same mail — you get the Unlimited plan for 12 months. Manage your website/hosting on the same account. Do not change the password. Check it right after login. If there is any issue, contact Support.",
+    ),
+    "Muse Ai Token On Client Account": (
+        "Muse AI token — added to your own account",
+        "How to Use: Give your own Muse account details — the token will be added to your own account. After that, login on muse.ai with your own account and check it. Use on only 1 device, and every time you open muse.ai use it with USA IP. Check it right after login. If there is any issue, contact Support.",
+    ),
+}
 
 # Render free Web Service must bind to $PORT, otherwise deploy fails.
 # This tiny health server also gives UptimeRobot something to ping every
@@ -702,9 +826,12 @@ async def render_product_detail(q, context, pid):
     buy_label = "🎁 Get Free" if is_free else "🛒 Buy Now"
     bulk = bulk_text(p, uid)
     desc = p["description"] or "No description."
+    terms = (p["terms"] or "").strip() if "terms" in p.keys() else ""
     text = (f"📦 {p['name']}\n\n{desc}\n\n"
             f"💰 Price: {price_text(p, uid)}\n"
             f"📦 {stock_tag(p)}\n{rating_line}\n")
+    if terms:
+        text += f"\n📖 How to Use:\n{terms}\n"
     if bulk:
         text += bulk + "\n"
     kb = InlineKeyboardMarkup([
@@ -753,6 +880,29 @@ async def show_gate_or_menu_message(update, context):
     return True
 
 # ---------- Auto Delivery ----------
+
+def _md_escape(text):
+    """Telegram legacy Markdown ke liye escape — delivery message me
+    instructions daalte waqt formatting na toote."""
+    return (text.replace("\\", "\\\\").replace("`", "\\`").replace("*", "\\*")
+                .replace("_", "\\_").replace("[", "\\[").replace("]", "\\]"))
+
+def delivery_instructions(product):
+    """Product ki How-to-Use instructions (terms, warna description) —
+    delivery message me lagane ke liye. Khali ho to ''."""
+    terms = ""
+    try:
+        terms = (product["terms"] or "").strip() if "terms" in product.keys() else ""
+    except Exception:
+        terms = ""
+    if not terms:
+        try:
+            terms = (product["description"] or "").strip() if "description" in product.keys() else ""
+        except Exception:
+            terms = ""
+    if not terms:
+        return ""
+    return "\n\n📖 *How to Use*\n" + _md_escape(terms)
 
 async def deliver_order(context: ContextTypes.DEFAULT_TYPE, order_id: int):
     """Accounts assign karo (items_json lines ke hisaab se, qty ke mutabiq),
@@ -823,6 +973,7 @@ async def deliver_order(context: ContextTypes.DEFAULT_TYPE, order_id: int):
                 f"Then go to mailbox site, get otp and paste on muse.ai to complete login.\n\n"
                 f"━━━━━━━━━━━━━━\n"
                 f"ℹ️ OTP na mile ya koi issue ho to Support se rabta karein — code admin bhej dega."
+                + delivery_instructions(product)
             )
             await context.bot.send_message(order["user_id"], msg, parse_mode="Markdown")
         elif len(accs) == 1 and len(plan) == 1:
@@ -834,6 +985,7 @@ async def deliver_order(context: ContextTypes.DEFAULT_TYPE, order_id: int):
                 f"🔑 Password: `{acc['password']}`\n\n"
                 f"Order #{order_id} (PAY-{order_id})\n"
                 f"Account ko save kar lein. Koi issue ho to admin se rabta karein."
+                + delivery_instructions(product)
             )
             await context.bot.send_message(order["user_id"], msg, parse_mode="Markdown")
         else:
@@ -845,6 +997,7 @@ async def deliver_order(context: ContextTypes.DEFAULT_TYPE, order_id: int):
                 f"📦 Product: {product['name']}\n\n" + "\n".join(lines) +
                 f"\n\nOrder #{order_id} (PAY-{order_id})\n"
                 f"Accounts ko save kar lein. Koi issue ho to admin se rabta karein."
+                + delivery_instructions(product)
             )
             await context.bot.send_message(order["user_id"], msg, parse_mode="Markdown")
     return True
