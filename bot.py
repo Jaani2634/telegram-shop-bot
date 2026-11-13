@@ -997,7 +997,10 @@ def zurvapay_status_check(identifier):
 
 def _zurva_ipn_fields(data):
     """IPN dict se identifier/amount/status/signature nikalo — field names
-    alag-alag ho sakte hain, is liye aliases check karte hain."""
+    alag-alag ho sakte hain, is liye aliases check karte hain.
+    Zurvapay ka asal IPN (13 Nov 2026, RS-467791) nested form fields bhejta
+    hai: amount `data[amount]` me ('20.00000000') aur signature
+    `status_signature` field me aati hai — ye dono aliases zaroori hain."""
     d = {str(k).lower(): v for k, v in (data or {}).items()}
 
     def pick(*names):
@@ -1006,12 +1009,20 @@ def _zurva_ipn_fields(data):
                 return str(d[n])
         return ""
 
+    sigs = []
+    for n in ("status_signature", "signature", "hash", "sign", "checksum",
+              "data[signature]", "data[status_signature]"):
+        if n in d and d[n] not in (None, ""):
+            v = str(d[n]).strip().lower()
+            if v and v not in sigs:
+                sigs.append(v)
     return {
         "identifier": pick("identifier", "order_id", "merchant_order_id", "reference", "ref", "orderid"),
-        "amount": pick("amount", "amount_pkr", "total", "price"),
+        "amount": pick("amount", "amount_pkr", "total", "price", "data[amount]", "data[total]"),
         "status": pick("status", "payment_status", "transaction_status", "txn_status").lower(),
-        "signature": pick("signature", "hash", "sign", "checksum"),
-        "txid": pick("transaction_id", "payment_id", "zurva_txn_id", "txn_id"),
+        "signature": sigs[0] if sigs else "",
+        "signatures": sigs,
+        "txid": pick("transaction_id", "payment_id", "zurva_txn_id", "txn_id", "data[payment_trx]", "payment_trx"),
     }
 
 def _hmac_hex(secret, msg, algo="sha256"):
@@ -1021,23 +1032,41 @@ def verify_zurvapay_ipn(data, raw_body=b"", headers=None):
     """Signed IPN verify karo. Returns (True, scheme_name) ya (False, reason).
     'auto' mode tamam candidate schemes try karta hai — har candidate secret
     se keyed HMAC hai, is liye baghair secret ke koi bhi forge nahi ho sakta.
-    ZURVAPAY_IPN_MODE se ek scheme pin ki ja sakti hai."""
+    ZURVAPAY_IPN_MODE se ek scheme pin ki ja sakti hai.
+    13 Nov 2026 ka asal IPN (RS-467791) se seekha: signature `status_signature`
+    field me aati hai aur amount `data[amount]` ('20.00000000') me — is liye
+    tamam signature values aur amount formats try karte hain."""
     secret = ZURVAPAY_SECRET_KEY
     if not secret:
         return False, "secret key set nahi hai"
     f = _zurva_ipn_fields(data)
-    sig = f.get("signature", "")
-    if not sig and headers:
+    sigs = list(f.get("signatures") or [])
+    if f.get("signature") and f["signature"] not in sigs:
+        sigs.append(f["signature"])
+    if headers:
         for h in ("X-Zurvapay-Signature", "X-Signature", "X-Zurva-Signature", "Signature"):
             if headers.get(h):
-                sig = headers.get(h)
-                break
-    if not sig:
+                v = str(headers.get(h)).strip().lower()
+                if v and v not in sigs:
+                    sigs.append(v)
+    if not sigs:
         return False, "IPN me signature nahi mili"
-    sig = sig.strip().lower()
     ident = f.get("identifier", "")
     amount = f.get("amount", "")
     status = f.get("status", "")
+    txid = f.get("txid", "")
+    # Amount ke formats: IPN '20.00000000' bhejta hai; scheme '20' ya '20.00' bhi ho sakti hai.
+    amounts = []
+    for a in (amount,):
+        if a and a not in amounts:
+            amounts.append(a)
+        try:
+            v = float(str(a))
+            for norm in (str(int(v)) if v == int(v) else str(v), f"{v:.2f}"):
+                if norm not in amounts:
+                    amounts.append(norm)
+        except Exception:
+            pass
     candidates = []  # (scheme_name, expected_hex)
     if ident and amount:
         candidates += [
@@ -1050,6 +1079,37 @@ def verify_zurvapay_ipn(data, raw_body=b"", headers=None):
             candidates += [
                 ("hmac_pipe_status_sha256", _hmac_hex(secret, f"{ident}|{amount}|{status}")),
                 ("hmac_pipe_status_sha512", _hmac_hex(secret, f"{ident}|{amount}|{status}", "sha512")),
+            ]
+    # Naye candidates — status/trx wale aur normalized amount wale (13 Nov IPN ke baad add hue).
+    msgs = []
+    for a in amounts:
+        if ident and a:
+            msgs += [f"{ident}|{a}", f"{ident}{a}"]
+            if status:
+                msgs += [f"{ident}|{a}|{status}", f"{status}|{ident}|{a}",
+                         f"{ident}{a}{status}", f"{status}{ident}{a}"]
+            if txid:
+                msgs += [f"{ident}|{a}|{txid}"]
+        if status and txid and a:
+            msgs += [f"{status}|{txid}|{a}"]
+    if ident and status:
+        msgs += [f"{ident}|{status}", f"{status}|{ident}"]
+    if status:
+        msgs += [status]
+    if txid:
+        msgs += [txid]
+    seen = set()
+    for m in msgs:
+        if m and m not in seen:
+            seen.add(m)
+            candidates.append((f"hmac_msg:{m}", _hmac_hex(secret, m)))
+    for a in amounts:
+        if ident and a and status:
+            candidates += [
+                ("sha256_sec_status", hashlib.sha256(f"{secret}{status}{ident}{a}".encode()).hexdigest()),
+                ("sha256_sec_ident", hashlib.sha256(f"{secret}{ident}{a}{status}".encode()).hexdigest()),
+                ("sha256_status_sec", hashlib.sha256(f"{status}{ident}{a}{secret}".encode()).hexdigest()),
+                ("sha256_ident_sec", hashlib.sha256(f"{ident}{a}{secret}".encode()).hexdigest()),
             ]
     if raw_body:
         try:
@@ -1073,14 +1133,27 @@ def verify_zurvapay_ipn(data, raw_body=b"", headers=None):
         ]
     except Exception:
         pass
+    try:
+        # Sorted canon — signature jaisi keys ko substring se bhi nikalo
+        # (status_signature bhi signature hi hai, canon me nahi honi chahiye).
+        items = sorted((k, v) for k, v in data.items()
+                       if not any(s in str(k).lower() for s in ("signature", "sign", "hash", "checksum")))
+        canon = "&".join(f"{k}={v}" for k, v in items)
+        candidates += [
+            ("hmac_sorted_nosig_sha256", _hmac_hex(secret, canon)),
+            ("hmac_sorted_nosig_sha512", _hmac_hex(secret, canon, "sha512")),
+        ]
+    except Exception:
+        pass
     mode = (ZURVAPAY_IPN_MODE or "auto").strip()
     if mode != "auto":
-        candidates = [c for c in candidates if c[0] == mode]
+        candidates = [c for c in candidates if c[0] == mode or c[0].split(":")[0] == mode]
         if not candidates:
             return False, f"unknown ZURVAPAY_IPN_MODE: {mode}"
     for name, expected in candidates:
-        if hmac.compare_digest(expected.lower(), sig):
-            return True, name
+        for sig in sigs:
+            if hmac.compare_digest(expected.lower(), sig):
+                return True, name
     return False, "signature match nahi hui (koi scheme nahi mili)"
 
 def _zurva_run_on_loop(coro, timeout=60):
