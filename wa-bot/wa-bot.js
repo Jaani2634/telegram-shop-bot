@@ -28,6 +28,7 @@
 const path = require("path");
 const fs = require("fs");
 const crypto = require("crypto");
+const http = require("http");
 
 const ROOT = path.resolve(__dirname, "..");
 const AUTH_DIR = path.join(__dirname, "auth");
@@ -1071,7 +1072,23 @@ async function startSock() {
 
 // ---------- Main ----------
 
+// Chhota HTTP health server — Render (aur kisi bhi web host) ko healthy
+// dikhane ke liye. Bot ko port ki zaroorat nahi, lekin Render Web Service
+// tabhi healthy manta hai jab app $PORT pe sunti ho. Sirf / pe 200 OK.
+function startHealthServer() {
+  const port = parseInt(process.env.PORT || "10000", 10);
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    res.end("ok");
+  });
+  server.listen(port, () => log(`Health server sun raha hai (port ${port})`));
+  return server;
+}
+
 async function main() {
+  // Health server hamesha start karo (WA_DISABLED ho ya na ho) taake host
+  // ko port milta rahe.
+  startHealthServer();
   fs.mkdirSync(AUTH_DIR, { recursive: true });
   fs.mkdirSync(MEDIA_DIR, { recursive: true });
   const db = getDb();
