@@ -13,10 +13,16 @@ if ! command -v node >/dev/null 2>&1; then
     else
         echo "Node nahi mila — Node 22 LTS download kar raha hun..."
         mkdir -p "$HOME/.local"
-        curl -fsSL -o /tmp/node.tar.xz https://nodejs.org/dist/v22.14.0/node-v22.14.0-linux-x64.tar.xz
-        tar -xJf /tmp/node.tar.xz -C "$HOME/.local"
+        # .tar.xz + 'tar -xJf' needs the xz binary, jo is container me NAHI
+        # hai — is liye .tar.gz lo (gzip har jagah hota hai). Agar tar -xzf
+        # bhi fail ho to Python ke built-in tarfile se extract karo.
+        curl -fsSL -o /tmp/node.tar.gz https://nodejs.org/dist/v22.14.0/node-v22.14.0-linux-x64.tar.gz
+        if ! tar -xzf /tmp/node.tar.gz -C "$HOME/.local" 2>/dev/null; then
+            echo "tar -xzf fail — Python tarfile se extract kar raha hun..."
+            python3 -c "import tarfile; tarfile.open('/tmp/node.tar.gz', 'r:gz').extractall('$HOME/.local')"
+        fi
         mv "$HOME/.local/node-v22.14.0-linux-x64" "$HOME/.local/node"
-        rm -f /tmp/node.tar.xz
+        rm -f /tmp/node.tar.gz
         export PATH="$HOME/.local/node/bin:$PATH"
     fi
 fi
