@@ -4,6 +4,21 @@
 set -u
 cd "$(dirname "$0")"
 
+# Botkeep env vars sirf .env file se aate hain (panel ka .env) — Node process
+# ko wo nazar nahi aate (wa-bot.js process.env parhta hai, dotenv nahi).
+# Is liye .env ko environment me export karo, taake DONO bots (Python +
+# Node) ko ADMIN_ID, ZURVAPAY keys, PUBLIC_BASE_URL, WA_BOT_NUMBER milein.
+# (Python bot .env khud bhi load karta hai — ye duplicate harmless hai.)
+if [ -f .env ]; then
+    set -a
+    # shellcheck disable=SC1091
+    . ./.env
+    set +a
+    echo ".env loaded (WA_BOT_NUMBER set: ${WA_BOT_NUMBER:+yes})"
+else
+    echo "WARNING: .env file nahi mili — env vars missing ho sakte hain"
+fi
+
 # --- Node.js (WhatsApp bot ke liye) ---
 # Botkeep Python image me Node nahi hota; pehli dafa download karke
 # $HOME/.local/node me rakho (service disk persist karta hai).
