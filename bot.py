@@ -109,6 +109,13 @@ STOCK_CHOOSE, STOCK_LINES = range(4, 6)
 def db():
     c = sqlite3.connect(DB_PATH)
     c.row_factory = sqlite3.Row
+    # Do processes (Telegram bot + WhatsApp bot) ek hi DB likhte hain —
+    # WAL + busy_timeout se "database is locked" nahi aata.
+    try:
+        c.execute("PRAGMA journal_mode=WAL")
+        c.execute("PRAGMA busy_timeout=10000")
+    except Exception:
+        pass
     return c
 
 def _add_col(c, table, col, ddl):
@@ -222,6 +229,15 @@ def init_db():
         created TEXT,
         PRIMARY KEY (referrer_id, referred_id)
     );
+    CREATE TABLE IF NOT EXISTS outbox(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        channel TEXT NOT NULL,
+        recipient TEXT NOT NULL,
+        text TEXT NOT NULL,
+        status TEXT DEFAULT 'pending',
+        created_at TEXT,
+        sent_at TEXT
+    );
     CREATE TABLE IF NOT EXISTS support_msgs(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER NOT NULL,
@@ -252,7 +268,8 @@ def init_db():
     _add_col(c, "accounts", "extra", "TEXT DEFAULT ''")
     for col, ddl in (("code", "TEXT DEFAULT ''"), ("items_json", "TEXT DEFAULT ''"),
                      ("qty", "INTEGER DEFAULT 1"), ("discount_pkr", "INTEGER DEFAULT 0"),
-                     ("coupon_code", "TEXT DEFAULT ''"), ("amount_pkr", "INTEGER DEFAULT 0")):
+                     ("coupon_code", "TEXT DEFAULT ''"), ("amount_pkr", "INTEGER DEFAULT 0"),
+                     ("channel", "TEXT DEFAULT 'telegram'")):
         _add_col(c, "orders", col, ddl)
     # Auto-seed products on a fresh DB (e.g. Render free restarts wipe shop.db).
     # Stock is NOT seeded here — accounts must be added with /addstock.
@@ -607,19 +624,77 @@ def gen_order_code():
     c.close()
     return f"RS-{random.randint(100000, 999999)}"
 
-def create_order(uid, username, items, payment_method, amount_text, proof, amount_pkr, code, coupon_code, discount_pkr):
-    """items: list of {pid, qty}. Returns order id."""
+def create_order(uid, username, items, payment_method, amount_text, proof, amount_pkr, code, coupon_code, discount_pkr, channel="telegram"):
+    """items: list of {pid, qty}. Returns order id.
+    channel: 'telegram' ya 'whatsapp'. WhatsApp orders me uid = buyer ka
+    phone number (integer, digits only) hota hai."""
     c = db()
     first_pid = items[0]["pid"] if items else 0
     total_qty = sum(i["qty"] for i in items)
     cur = c.execute(
-        "INSERT INTO orders(user_id,username,product_id,payment_method,amount_text,proof,status,created_at,code,items_json,qty,discount_pkr,coupon_code,amount_pkr) "
-        "VALUES(?,?,?,?,?,?, 'pending', ?,?,?,?,?,?,?)",
+        "INSERT INTO orders(user_id,username,product_id,payment_method,amount_text,proof,status,created_at,code,items_json,qty,discount_pkr,coupon_code,amount_pkr,channel) "
+        "VALUES(?,?,?,?,?,?, 'pending', ?,?,?,?,?,?,?,?)",
         (uid, username, first_pid, payment_method, amount_text, proof,
          datetime.now().strftime("%Y-%m-%d %H:%M"), code, json.dumps(items), total_qty,
-         discount_pkr, coupon_code or "", amount_pkr))
+         discount_pkr, coupon_code or "", amount_pkr, channel))
     oid = cur.lastrowid; c.commit(); c.close()
     return oid
+
+# ---------- Outbox (Telegram bot <-> WhatsApp bot message bus) ----------
+# Dono processes ek hi shop.db share karte hain. Python bot WhatsApp buyer
+# ko seedha message nahi bhej sakta — wo outbox me daalta hai, Node (Baileys)
+# poll karke bhejta hai. Ulta: WA bot admin ko Telegram pe notify karne ke
+# liye outbox (channel='telegram') me daalta hai, Python ka poller bhejta hai.
+
+def queue_outbox(channel, recipient, text):
+    """Outbox me message daalo. Returns row id."""
+    c = db()
+    cur = c.execute("INSERT INTO outbox(channel,recipient,text,status,created_at) VALUES(?,?,?, 'pending', ?)",
+                    (channel, str(recipient), text, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    oid = cur.lastrowid; c.commit(); c.close()
+    return oid
+
+def _outbox_send_telegram(row):
+    """Ek outbox row (channel='telegram') Telegram pe bhejo. Returns True/False."""
+    try:
+        _zurva_run_on_loop(PTB_APP.bot.send_message(int(row["recipient"]), row["text"]), timeout=30)
+        return True
+    except Exception as e:
+        log.warning("Outbox telegram send fail (row %s): %s", row["id"], e)
+        return False
+
+def _outbox_poller_loop():
+    """Background thread: pending 'telegram' outbox rows bhejte raho.
+    PTB loop ready hone ka intezar karta hai; kabhi crash nahi hota."""
+    import time as _time
+    while True:
+        try:
+            _time.sleep(10)
+            if PTB_APP is None or PTB_LOOP is None or PTB_LOOP.is_closed():
+                continue
+            c = db()
+            rows = c.execute("SELECT * FROM outbox WHERE channel='telegram' AND status='pending' ORDER BY id LIMIT 20").fetchall()
+            c.close()
+            for row in rows:
+                c = db()
+                cur = c.execute("UPDATE outbox SET status='sending' WHERE id=? AND status='pending'", (row["id"],))
+                claimed = cur.rowcount; c.commit(); c.close()
+                if not claimed:
+                    continue
+                ok = _outbox_send_telegram(row)
+                c = db()
+                if ok:
+                    c.execute("UPDATE outbox SET status='sent', sent_at=? WHERE id=?",
+                              (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), row["id"]))
+                else:
+                    c.execute("UPDATE outbox SET status='pending' WHERE id=?", (row["id"],))
+                c.commit(); c.close()
+        except Exception:
+            log.exception("Outbox poller error (retry in 10s)")
+
+def start_outbox_poller():
+    threading.Thread(target=_outbox_poller_loop, daemon=True).start()
+    log.info("Outbox poller started (telegram rows)")
 
 def order_status_label(status):
     return {"pending": "⏳ PAID — admin review",
@@ -904,6 +979,75 @@ def delivery_instructions(product):
         return ""
     return "\n\n📖 *How to Use*\n" + _md_escape(terms)
 
+def wa_delivery_text(product, accs, order, date_txt):
+    """WhatsApp buyer ke liye PLAIN-TEXT delivery message (koi Markdown nahi).
+    Telegram wale message jaisa hi, sirf formatting nahi."""
+    order_id = order["id"]
+    try:
+        terms = (product["terms"] or "").strip() if "terms" in product.keys() else ""
+    except Exception:
+        terms = ""
+    if not terms:
+        try:
+            terms = (product["description"] or "").strip() if "description" in product.keys() else ""
+        except Exception:
+            terms = ""
+    howto = f"\n\nHow to Use:\n{terms}" if terms else ""
+    kind = (product["kind"] or "account") if "kind" in product.keys() else "account"
+    if kind == "mail":
+        lines = []
+        for acc in accs:
+            extra = (acc["extra"] or "") if "extra" in acc.keys() else ""
+            lines.append(f"{extra} | {acc['login']} | {acc['password']}" if extra else f"{acc['login']} | {acc['password']}")
+        return (
+            f"✅ Payment Verified\n"
+            f"Product: {product['name']}\nOrder ID: PAY-{order_id}\n"
+            f"Paid: {order['amount_text']}\nDate: {date_txt}\n\n"
+            f"Account\n" + "\n".join(lines) + "\n\n"
+            f"Order Delivery Note\n"
+            f"You have received mail and mailbox url.\n"
+            f"Copy the mail and paste it on muse.ai.\n\n"
+            f"Then go to mailbox site, get otp and paste on muse.ai to complete login.\n\n"
+            f"OTP na mile ya koi issue ho to Support se rabta karein — code admin bhej dega."
+            + howto
+        )
+    if len(accs) == 1:
+        acc = accs[0]
+        return (
+            f"✅ Payment confirmed! Aapka account mil gaya:\n\n"
+            f"Product: {product['name']}\n"
+            f"Login / Email: {acc['login']}\n"
+            f"Password: {acc['password']}\n\n"
+            f"Order #{order_id} (PAY-{order_id})\n"
+            f"Account ko save kar lein. Koi issue ho to admin se rabta karein."
+            + howto
+        )
+    lines = []
+    for i, acc in enumerate(accs, 1):
+        lines.append(f"{i}. Login: {acc['login']}\n   Password: {acc['password']}")
+    return (
+        f"✅ Payment confirmed! Aapke {len(accs)} accounts mil gaye:\n\n"
+        f"Product: {product['name']}\n\n" + "\n".join(lines) +
+        f"\n\nOrder #{order_id} (PAY-{order_id})\n"
+        f"Accounts ko save kar lein. Koi issue ho to admin se rabta karein."
+        + howto
+    )
+
+async def send_to_buyer(context, order, text, parse_mode=None):
+    """Buyer ko message bhejo — channel ke hisaab se route karo.
+    Telegram: seedha send. WhatsApp: outbox me daalo (Node bot bhejega)."""
+    channel = ""
+    try:
+        channel = (order["channel"] or "telegram") if "channel" in order.keys() else "telegram"
+    except Exception:
+        channel = "telegram"
+    if channel == "whatsapp":
+        jid = f"{order['user_id']}@s.whatsapp.net"
+        queue_outbox("whatsapp", jid, text)
+        return True
+    await context.bot.send_message(order["user_id"], text, parse_mode=parse_mode)
+    return True
+
 async def deliver_order(context: ContextTypes.DEFAULT_TYPE, order_id: int):
     """Accounts assign karo (items_json lines ke hisaab se, qty ke mutabiq),
     sold mark karo, buyer ko credentials bhejo. Coupon use + referral verify
@@ -929,7 +1073,7 @@ async def deliver_order(context: ContextTypes.DEFAULT_TYPE, order_id: int):
             c.execute("UPDATE orders SET status='out_of_stock' WHERE id=?", (order_id,))
             c.commit(); c.close()
             await context.bot.send_message(ADMIN_ID, f"⚠️ Order #{order_id} ke liye stock khatam! Product: {product['name']}. Stock add karo, phir manually deliver karna hoga.")
-            await context.bot.send_message(order["user_id"], f"Sorry, {product['name']} ka stock khatam ho gaya. Admin se rabta karein, refund / replacement milega.")
+            await send_to_buyer(context, order, f"Sorry, {product['name']} ka stock khatam ho gaya. Admin se rabta karein, refund / replacement milega.")
             return False
         plan.append((product, accs))
     if not plan:
@@ -951,7 +1095,17 @@ async def deliver_order(context: ContextTypes.DEFAULT_TYPE, order_id: int):
         # Pehli successful order -> referral verified (gate pass karke hi order hui thi)
         c = db(); c.execute("UPDATE referrals SET verified=1 WHERE referred_id=?", (order["user_id"],)); c.commit(); c.close()
     date_txt = datetime.now().strftime("%d/%m/%Y %I:%M %p PKT")
+    channel = ""
+    try:
+        channel = (order["channel"] or "telegram") if "channel" in order.keys() else "telegram"
+    except Exception:
+        channel = "telegram"
     for product, accs in plan:
+        if channel == "whatsapp":
+            # WhatsApp buyer: plain-text delivery outbox me — Node (Baileys) bhejega.
+            queue_outbox("whatsapp", f"{order['user_id']}@s.whatsapp.net",
+                         wa_delivery_text(product, accs, order, date_txt))
+            continue
         kind = (product["kind"] or "account") if "kind" in product.keys() else "account"
         if kind == "mail":
             # Mail-type delivery (Muse tokens etc.): buyer gets an email + mailbox
@@ -2886,6 +3040,7 @@ def main():
         print("WARNING: ADMIN_ID set nahi hai — /admin kaam nahi karega. @userinfobot se apni ID le ke .env me dalo.")
     app = Application.builder().token(BOT_TOKEN).build()
     PTB_APP = app  # IPN HTTP thread ko bot chahiye hota hai (delivery msgs ke liye)
+    start_outbox_poller()  # WhatsApp bot ki taraf se Telegram admin notify + WA delivery queue
 
     add_prod = ConversationHandler(
         entry_points=[CommandHandler("addproduct", addproduct_start)],
