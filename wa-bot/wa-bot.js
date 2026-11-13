@@ -27,13 +27,33 @@
 
 const path = require("path");
 const fs = require("fs");
+const os = require("os");
 const crypto = require("crypto");
 const http = require("http");
 
 const ROOT = path.resolve(__dirname, "..");
-const AUTH_DIR = path.join(__dirname, "auth");
-const MEDIA_DIR = path.join(__dirname, "media");
-const PAIRING_FILE = path.join(__dirname, "pairing-code.txt");
+// Data dir: auth + media + pairing-code.txt yahan rehte hain.
+// Default: script dir (Botkeep — wahan /app writable hai).
+// WA_DATA_DIR env se override kar sakte ho.
+// Agar script dir read-only ho (SnapDeploy: /app pe EACCES milta hai),
+// to automatically /tmp/wa-bot pe gir jata hai — test ke liye theek hai
+// (restart pe auth dobara pair karna hoga kyunki /tmp ephemeral hai;
+// permanent host pe volume ya writable dir use karo).
+function pickDataDir() {
+  const preferred = (process.env.WA_DATA_DIR || "").trim() || __dirname;
+  try {
+    fs.accessSync(preferred, fs.constants.W_OK);
+    return preferred;
+  } catch (e) {
+    const fallback = path.join(os.tmpdir(), "wa-bot");
+    console.log(`[wa-bot] ${preferred} writable nahi (${e.code || e.message}) — data dir ${fallback} use kar raha hun.`);
+    return fallback;
+  }
+}
+const DATA_DIR = pickDataDir();
+const AUTH_DIR = path.join(DATA_DIR, "auth");
+const MEDIA_DIR = path.join(DATA_DIR, "media");
+const PAIRING_FILE = path.join(DATA_DIR, "pairing-code.txt");
 
 const ADMIN_ID = (process.env.ADMIN_ID || "").trim();
 const ZURVAPAY_PUBLIC_KEY = (process.env.ZURVAPAY_PUBLIC_KEY || "").trim();
