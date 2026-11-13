@@ -980,7 +980,10 @@ async function startSock() {
     auth: state,
     logger: pino({ level: "silent" }),
     printQRInTerminal: false,
-    browser: ["RetailShop WA Bot", "Chrome", "1.0"],
+    // Browser identifier: WhatsApp server client ko is se pehchanta hai.
+    // "RetailShop WA Bot" jaisa custom naam server reject kar sakta hai
+    // (401) — is liye standard WhatsApp Web client jaisa naam bhejo.
+    browser: ["Ubuntu", "Chrome", "20.0.04"],
     // Connection jaldi toot jata hai — keep-alive zyada baar bhejo.
     keepAliveIntervalMs: 10000,
   });
