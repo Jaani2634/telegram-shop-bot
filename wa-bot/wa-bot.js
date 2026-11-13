@@ -43,6 +43,10 @@ const ZURVAPAY_IPN_URL = (process.env.ZURVAPAY_IPN_URL || "").trim();
 // Spare number, digits only. Code me kabhi hardcode nahi — sirf env se.
 // Unset ho to bot crash nahi karta, clear message log karke wait karta hai.
 const WA_BOT_NUMBER = (process.env.WA_BOT_NUMBER || "").replace(/\D/g, "");
+// WA_SKIP_PAIRING_CODE=1: pairing code request mat karo, QR mode me raho.
+// (Pairing code har 5s rotate ho raha tha kyunki socket band ho jata tha;
+// QR mode se pata chalega ke socket bina code request ke tikta hai ya nahi.)
+const WA_SKIP_PAIRING_CODE = process.env.WA_SKIP_PAIRING_CODE === "1";
 
 let dbPath = process.env.DB_PATH || path.join(ROOT, "shop.db");
 let _db = null;
@@ -977,12 +981,16 @@ async function startSock() {
     logger: pino({ level: "silent" }),
     printQRInTerminal: false,
     browser: ["RetailShop WA Bot", "Chrome", "1.0"],
+    // Connection jaldi toot jata hai — keep-alive zyada baar bhejo.
+    keepAliveIntervalMs: 10000,
   });
   sock.ev.on("creds.update", saveCreds);
 
   // Pehli pairing: auth nahi hai to pairing code (ya QR fallback).
   if (!state.creds.registered) {
-    if (WA_BOT_NUMBER) {
+    if (WA_SKIP_PAIRING_CODE) {
+      log("QR mode (WA_SKIP_PAIRING_CODE=1): pairing code request nahi kar raha — QR scan se pair karein. Socket kitni der tikta hai, yehi test hai.");
+    } else if (WA_BOT_NUMBER) {
       try {
         const code = await sock.requestPairingCode(WA_BOT_NUMBER);
         fs.writeFileSync(PAIRING_FILE, String(code), "utf8");
@@ -1004,15 +1012,24 @@ async function startSock() {
     }
     if (connection === "close") {
       const code = disconnectStatusCode(lastDisconnect);
+      const isPaired = !!state.creds.registered;
+      // Unpaired socket: jaldi restart karne se WhatsApp rate-limit karta
+      // hai aur code har 5s rotate hota hai. Is liye unpaired ho to 30s
+      // ruko; paired ho to 5s me dobara connect karo (fast recovery).
+      const delay = isPaired ? 5000 : 30000;
       if (code === 401 || code === DisconnectReason.loggedOut) {
-        log("Logged out (401) — auth delete karke dobara pairing hogi.");
-        try {
-          fs.rmSync(AUTH_DIR, { recursive: true, force: true });
-        } catch (e) { /* ignore */ }
-        setTimeout(() => startSock().catch((e) => log("Restart fail:", e.message)), 3000);
+        if (isPaired) {
+          log("Logged out (401) — auth delete karke dobara pairing hogi.");
+          try {
+            fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+          } catch (e) { /* ignore */ }
+        } else {
+          log(`Logged out (401) jabke abhi pair nahi hua — auth delete nahi kar raha, ${delay / 1000}s me dobara try hoga (rate-limit se bachne ke liye).`);
+        }
+        setTimeout(() => startSock().catch((e) => log("Restart fail:", e.message)), delay);
       } else {
-        log(`Connection band (code ${code}) — 5s me dobara connect ho raha hai...`);
-        setTimeout(() => startSock().catch((e) => log("Restart fail:", e.message)), 5000);
+        log(`Connection band (code ${code}) — ${delay / 1000}s me dobara connect ho raha hai...`);
+        setTimeout(() => startSock().catch((e) => log("Restart fail:", e.message)), delay);
       }
     } else if (connection === "open") {
       log("WhatsApp connected.");

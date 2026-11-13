@@ -120,6 +120,12 @@ share ONE SQLite database.
   Fallback: QR via `qrcode-terminal` if pairing code fails.
 - Reconnect on `connection.update` close (unless 401 logged-out ->
   delete auth + request a new pairing code).
+- **Pairing stability (2026-11-13):** codes rotated every ~5s because the
+  socket dropped (428/401) right after each code — typing could never keep
+  up. Fix: unpaired restarts wait 30s (paired: 5s), auth is NOT deleted on
+  401 while unpaired, `keepAliveIntervalMs: 10000`. `WA_SKIP_PAIRING_CODE=1`
+  skips the code request (QR mode) to test whether the socket holds without
+  a code request — if it holds, pairing-code mode will hold too.
 - `sock.sendMessage(jid, {text})`. Receive via `messages.upsert`.
   Screenshots: `downloadMediaMessage` -> save to `wa-bot/media/`.
 
