@@ -38,7 +38,7 @@ import hmac
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from datetime import datetime
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
@@ -249,15 +249,6 @@ def init_db():
         qty INTEGER DEFAULT 1,
         PRIMARY KEY (user_id, product_id)
     );
-    CREATE TABLE IF NOT EXISTS reviews(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        product_id INTEGER NOT NULL,
-        user_name TEXT,
-        rating INTEGER NOT NULL,
-        text TEXT,
-        verified INTEGER DEFAULT 0,
-        source TEXT DEFAULT 'user'
-    );
     CREATE TABLE IF NOT EXISTS wallets(
         user_id INTEGER NOT NULL,
         currency TEXT NOT NULL,
@@ -310,6 +301,20 @@ def init_db():
         user_id INTEGER PRIMARY KEY,
         lang TEXT DEFAULT 'ur'
     );
+    CREATE TABLE IF NOT EXISTS web_users(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        email TEXT UNIQUE NOT NULL,
+        name TEXT NOT NULL,
+        password_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS web_sessions(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        token_hash TEXT UNIQUE NOT NULL,
+        expires_at TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    );
     """)
     defaults = {
         "jazzcash_number": os.getenv("JAZZCASH_NUMBER", "03XX-XXXXXXX"),
@@ -341,6 +346,18 @@ def init_db():
                      ("web_contact", "TEXT DEFAULT ''"),
                      ("success_base", "TEXT DEFAULT ''")):
         _add_col(c, "orders", col, ddl)
+    # Reviews: purani DB me reviews table purane schema (user_name, verified,
+    # source) se bani hoti hai — web reviews ko `name` + `created_at` chahiye.
+    # Bina migration ke INSERT/SELECT "no such column" se fail hota hai
+    # (live DB pe yahi hoga jab naya code pehli dafa chalega).
+    _add_col(c, "reviews", "name", "TEXT NOT NULL DEFAULT ''")
+    _add_col(c, "reviews", "created_at", "INTEGER NOT NULL DEFAULT 0")
+    # Purani Telegram reviews (user_name) ka naam naye `name` column me bhar do.
+    try:
+        c.execute("UPDATE reviews SET name = user_name WHERE (name IS NULL OR name = '') "
+                  "AND user_name IS NOT NULL AND user_name <> ''")
+    except Exception:
+        pass
     # Auto-seed products on a fresh DB (e.g. Render free restarts wipe shop.db).
     # Stock is NOT seeded here — accounts must be added with /addstock.
     n = c.execute("SELECT COUNT(*) n FROM products").fetchone()["n"]
@@ -547,6 +564,24 @@ def start_health_server():
                 self.end_headers()
                 self.wfile.write(body)
                 return
+            if self.path.startswith("/api/auth/me") or self.path.startswith("/api/auth/orders"):
+                # Web account: apni profile / apne orders (Bearer session token).
+                try:
+                    parsed = urlparse(self.path)
+                    if parsed.path.startswith("/api/auth/me"):
+                        status, out = handle_auth_me(self.headers)
+                    else:
+                        status, out = handle_auth_orders(self.headers)
+                except Exception as e:
+                    log.exception("Auth handler crashed")
+                    status, out = 500, {"ok": False, "error": f"handler error: {e}"}
+                body = json.dumps(out, ensure_ascii=False).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             if self.path.startswith("/api/order/"):
                 # Website order status (Worker se, X-Web-Secret + delivery token).
                 try:
@@ -608,7 +643,7 @@ def start_health_server():
                 self.end_headers()
                 self.wfile.write(msg.encode("utf-8", "ignore"))
                 return
-            if self.path.startswith("/api/web-checkout") or self.path.startswith("/api/ahm7-retry") or self.path.startswith("/api/review"):
+            if self.path.startswith("/api/web-checkout") or self.path.startswith("/api/ahm7-retry") or self.path.startswith("/api/review") or self.path.startswith("/api/auth/signup") or self.path.startswith("/api/auth/login") or self.path.startswith("/api/auth/logout") or self.path.startswith("/api/auth/delete"):
                 # Site checkout / review (Cloudflare Worker se) — JSON in, JSON out.
                 try:
                     length = int(self.headers.get("Content-Length") or 0)
@@ -624,9 +659,27 @@ def start_health_server():
                 try:
                     if self.path.startswith("/api/web-checkout"):
                         status, out = handle_web_checkout(data, self.headers)
+                    elif self.path.startswith("/api/review/delete"):
+                        status, out = handle_delete_review(data, self.headers)
                     elif self.path.startswith("/api/review"):
-                        ip = self.client_address[0] if self.client_address else ""
+                        # Worker CF-Connecting-IP forward karta hai (X-Forwarded-For);
+                        # warna saari site reviews ko bot ek hi IP samajhta hai aur
+                        # 5/hour rate limit sab pe lag jata hai. Header sirf
+                        # X-Web-Secret wali requests pe mana jata hai.
+                        ip = (self.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+                        if not ip:
+                            ip = self.client_address[0] if self.client_address else ""
                         status, out = handle_submit_review(data, self.headers, ip)
+                    elif self.path.startswith("/api/auth/signup"):
+                        ip = self.client_address[0] if self.client_address else ""
+                        status, out = handle_auth_signup(data, self.headers, ip)
+                    elif self.path.startswith("/api/auth/login"):
+                        ip = self.client_address[0] if self.client_address else ""
+                        status, out = handle_auth_login(data, self.headers, ip)
+                    elif self.path.startswith("/api/auth/logout"):
+                        status, out = handle_auth_logout(self.headers)
+                    elif self.path.startswith("/api/auth/delete"):
+                        status, out = handle_auth_delete(self.headers)
                     else:
                         status, out = handle_ahm7_retry(data, self.headers)
                 except Exception as e:
@@ -2362,12 +2415,34 @@ def handle_submit_review(data, headers=None, client_ip=""):
         return 404, {"ok": False, "error": "product nahi mila"}
     now = int(time.time())
     c = db()
-    c.execute("INSERT INTO reviews(product_id, name, rating, text, created_at) VALUES(?,?,?,?,?)",
+    cur = c.execute("INSERT INTO reviews(product_id, name, rating, text, created_at) VALUES(?,?,?,?,?)",
               (product_id, name, rating, text, now))
+    rid = cur.lastrowid
     c.commit(); c.close()
     log.info("Review added: product %s, rating %s", product_id, rating)
-    return 200, {"ok": True, "review": {"product_id": product_id, "name": name,
+    return 200, {"ok": True, "review": {"id": rid, "product_id": product_id, "name": name,
                                          "rating": rating, "text": text, "created_at": now}}
+
+
+def handle_delete_review(data, headers=None):
+    """POST /api/review/delete (Worker se, X-Web-Secret). Test reviews
+    hatane ke liye — site par koi delete button nahi hai. Returns
+    (http_status, dict)."""
+    if not _web_auth(headers or {}):
+        return 401, {"ok": False, "error": "unauthorized"}
+    data = data or {}
+    try:
+        rid = int(data.get("id"))
+    except Exception:
+        return 400, {"ok": False, "error": "review id ghalat hai"}
+    c = db()
+    cur = c.execute("DELETE FROM reviews WHERE id=?", (rid,))
+    n = cur.rowcount
+    c.commit(); c.close()
+    if not n:
+        return 404, {"ok": False, "error": "review nahi mili"}
+    log.info("Review deleted: id %s", rid)
+    return 200, {"ok": True, "deleted": n}
 
 
 def _sold_count(c, product_id):
@@ -2474,6 +2549,251 @@ def handle_order_status(code, token, headers=None, client_ip=""):
     out["status"] = "processing"
     out["message"] = "Payment confirm ho rahi hai — order process ho raha hai."
     return 200, out
+
+# ---------- Web accounts (site signup/login — REAL accounts) ----------
+# Site (Worker) -> bot server. Signup/login ko X-Web-Secret chahiye (Worker
+# se aate hain); me/logout/delete/orders ko Bearer session token chahiye
+# (customer ka apna token, Authorization header me — Worker forward karta
+# hai). Password kabhi plain-text store/log nahi hota: hashlib.scrypt
+# (per-user random salt, n=16384, r=8, p=1, dklen=32), stored
+# "salt_hex$hash_hex". Session token sirf SHA-256 digest store hota hai;
+# token khud sirf signup/login response me ek dafa milta hai.
+_EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
+_AUTH_SESSION_DAYS = 30
+_AUTH_GENERIC_ERROR = "email ya password ghalat hai"
+
+# Bot-side rate limits (in-memory, _ORDER_STATUS_RL jaisa pattern):
+# signup 10/hour per IP, login 20/hour per (IP + email).
+_AUTH_SIGNUP_RL = {}
+_AUTH_LOGIN_RL = {}
+_AUTH_RL_LOCK = threading.Lock()
+
+def _auth_rate_limited(store, key, window_s, limit):
+    now = time.time()
+    key = key or "unknown"
+    with _AUTH_RL_LOCK:
+        if len(store) > 2000:
+            store.clear()
+        start, count = store.get(key, (now, 0))
+        if now - start >= window_s:
+            start, count = now, 0
+        count += 1
+        store[key] = (start, count)
+        return count > limit
+
+def _hash_password(password):
+    """scrypt hash banao. Returns 'salt_hex$hash_hex'."""
+    salt = secrets.token_bytes(16)
+    dk = hashlib.scrypt(password.encode("utf-8"), salt=salt,
+                        n=16384, r=8, p=1, dklen=32)
+    return salt.hex() + "$" + dk.hex()
+
+def _verify_password(password, stored):
+    """Constant-time scrypt verify. Stored format ghalat ho to False."""
+    try:
+        salt_hex, hash_hex = (stored or "").split("$", 1)
+        salt = bytes.fromhex(salt_hex)
+        want = bytes.fromhex(hash_hex)
+    except Exception:
+        return False
+    try:
+        got = hashlib.scrypt(password.encode("utf-8"), salt=salt,
+                             n=16384, r=8, p=1, dklen=32)
+    except Exception:
+        return False
+    return hmac.compare_digest(got, want)
+
+def _now_str():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+def _create_web_session(user_id):
+    """Naya session banao (30 din). Returns plaintext token (sirf caller
+    ko wapas dena hai — DB me sirf SHA-256 digest jata hai)."""
+    token = secrets.token_hex(16)  # 32 hex chars
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    now = _now_str()
+    expires = (datetime.now() + timedelta(days=_AUTH_SESSION_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
+    c = db()
+    c.execute("INSERT INTO web_sessions(user_id, token_hash, expires_at, created_at) "
+              "VALUES(?,?,?,?)", (user_id, token_hash, expires, now))
+    c.commit(); c.close()
+    return token
+
+def _bearer_token(headers):
+    """Authorization: Bearer <token> se token nikalo, warna None."""
+    try:
+        auth = (headers.get("Authorization") or "").strip()
+    except Exception:
+        return None
+    if not auth or auth.split(None, 1)[0].lower() != "bearer":
+        return None
+    parts = auth.split(None, 1)
+    return parts[1].strip() if len(parts) == 2 and parts[1].strip() else None
+
+def _auth_session_user(headers):
+    """Bearer token se logged-in web user nikalo.
+    Returns (user_row_dict, None) ya (None, (status, error_dict)).
+    Expired session mile to usay delete kar do."""
+    token = _bearer_token(headers or {})
+    if not token:
+        return None, (401, {"ok": False, "error": "unauthorized"})
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    c = db()
+    s = c.execute("SELECT * FROM web_sessions WHERE token_hash=?", (token_hash,)).fetchone()
+    if not s:
+        c.close()
+        return None, (401, {"ok": False, "error": "unauthorized"})
+    if (s["expires_at"] or "") <= _now_str():
+        c.execute("DELETE FROM web_sessions WHERE id=?", (s["id"],))
+        c.commit(); c.close()
+        return None, (401, {"ok": False, "error": "unauthorized"})
+    u = c.execute("SELECT * FROM web_users WHERE id=?", (s["user_id"],)).fetchone()
+    c.close()
+    if not u:
+        return None, (401, {"ok": False, "error": "unauthorized"})
+    return u, None
+
+def _public_web_user(u):
+    return {"name": u["name"], "email": u["email"]}
+
+def handle_auth_signup(data, headers=None, client_ip=""):
+    """POST /api/auth/signup (Worker se, X-Web-Secret). Returns (status, dict).
+    Naya web account + session banao. Token sirf is response me milta hai."""
+    if not _web_auth(headers or {}):
+        return 401, {"ok": False, "error": "unauthorized"}
+    if _auth_rate_limited(_AUTH_SIGNUP_RL, client_ip, 3600, 10):
+        return 429, {"ok": False, "error": "too many signups — thodi der me dobara try karein"}
+    data = data or {}
+    name = str(data.get("name") or "").strip()
+    email = str(data.get("email") or "").strip().lower()
+    password = str(data.get("password") or "")
+    if not name or len(name) > 60:
+        return 400, {"ok": False, "error": "naam 1 se 60 characters tak ho"}
+    if not email or not _EMAIL_RE.match(email):
+        return 400, {"ok": False, "error": "email ghalat hai"}
+    if len(password) < 8:
+        return 400, {"ok": False, "error": "password kam se kam 8 characters ka ho"}
+    c = db()
+    exists = c.execute("SELECT id FROM web_users WHERE email=?", (email,)).fetchone()
+    if exists:
+        c.close()
+        log.info("Auth signup: email=%s result=duplicate", email)
+        return 409, {"ok": False, "error": "is email se account pehle se hai"}
+    cur = c.execute("INSERT INTO web_users(email, name, password_hash, created_at) "
+                    "VALUES(?,?,?,?)", (email, name, _hash_password(password), _now_str()))
+    uid = cur.lastrowid
+    c.commit(); c.close()
+    token = _create_web_session(uid)
+    log.info("Auth signup: email=%s result=ok", email)
+    return 200, {"ok": True, "token": token,
+                 "user": {"name": name, "email": email}}
+
+def handle_auth_login(data, headers=None, client_ip=""):
+    """POST /api/auth/login (Worker se, X-Web-Secret). Returns (status, dict).
+    Ghalat email ya ghalat password — dono pe ek hi generic 401 (ye nahi
+    batate ke email exist karta hai ya nahi)."""
+    if not _web_auth(headers or {}):
+        return 401, {"ok": False, "error": "unauthorized"}
+    data = data or {}
+    email = str(data.get("email") or "").strip().lower()
+    password = str(data.get("password") or "")
+    if _auth_rate_limited(_AUTH_LOGIN_RL, f"{client_ip}|{email}", 3600, 20):
+        return 429, {"ok": False, "error": "too many logins — thodi der me dobara try karein"}
+    if not email or not password:
+        return 400, {"ok": False, "error": "email aur password chahiye"}
+    c = db()
+    u = c.execute("SELECT * FROM web_users WHERE email=?", (email,)).fetchone()
+    c.close()
+    if not u or not _verify_password(password, u["password_hash"]):
+        log.info("Auth login: email=%s result=fail", email)
+        return 401, {"ok": False, "error": _AUTH_GENERIC_ERROR}
+    token = _create_web_session(u["id"])
+    log.info("Auth login: email=%s result=ok", email)
+    return 200, {"ok": True, "token": token, "user": _public_web_user(u)}
+
+def handle_auth_me(headers=None):
+    """GET /api/auth/me — Bearer session token. X-Web-Secret NAHI chahiye."""
+    u, err = _auth_session_user(headers or {})
+    if err:
+        return err
+    return 200, {"ok": True, "user": _public_web_user(u)}
+
+def handle_auth_logout(headers=None):
+    """POST /api/auth/logout — Bearer token wala session delete karo.
+    Token pehle se invalid ho to bhi 200 (validity leak nahi karni)."""
+    token = _bearer_token(headers or {})
+    if token:
+        token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        c = db()
+        c.execute("DELETE FROM web_sessions WHERE token_hash=?", (token_hash,))
+        c.commit(); c.close()
+        log.info("Auth logout: result=ok")
+    return 200, {"ok": True}
+
+def handle_auth_delete(headers=None):
+    """POST /api/auth/delete — Bearer token: user + uske tamam sessions
+    delete karo (test accounts hatane ke liye)."""
+    u, err = _auth_session_user(headers or {})
+    if err:
+        return err
+    c = db()
+    c.execute("DELETE FROM web_sessions WHERE user_id=?", (u["id"],))
+    c.execute("DELETE FROM web_users WHERE id=?", (u["id"],))
+    c.commit(); c.close()
+    log.info("Auth delete: email=%s result=ok", u["email"])
+    return 200, {"ok": True}
+
+def handle_auth_orders(headers=None):
+    """GET /api/auth/orders — Bearer token. Sirf is user ke apne web orders
+    (channel='web' AND web_contact = user email), newest first. Dusre user
+    ke orders kabhi nahi milte. order_url me code + delivery token hota hai
+    (owner apna order page khol sakta hai)."""
+    u, err = _auth_session_user(headers or {})
+    if err:
+        return err
+    email = u["email"]
+    c = db()
+    rows = c.execute(
+        "SELECT * FROM orders WHERE channel='web' AND web_contact=? "
+        "ORDER BY id DESC", (email,)).fetchall()
+    orders = []
+    for o in rows:
+        try:
+            p = c.execute("SELECT name FROM products WHERE id=?", (o["product_id"],)).fetchone()
+        except Exception:
+            p = None
+        pname = p["name"] if p else ""
+        try:
+            lines = json.loads(o["items_json"] or "[]")
+            n = len(lines) if isinstance(lines, list) else 0
+        except Exception:
+            n = 0
+        if n > 1 and pname:
+            pname = f"{pname} (+{n - 1} more)"
+        try:
+            base = (o["success_base"] or "").strip().rstrip("/")
+        except Exception:
+            base = ""
+        if base not in ("https://retailshop.pages.dev", "https://retail-shop.online"):
+            base = "https://retailshop.pages.dev"
+        try:
+            token = o["delivery_token"] or ""
+        except Exception:
+            token = ""
+        try:
+            created = o["created_at"] or ""
+        except Exception:
+            created = ""
+        orders.append({
+            "code": o["code"],
+            "product": pname,
+            "amount_pkr": o["amount_pkr"],
+            "status": o["status"],
+            "created": created,
+            "order_url": f"{base}/order.html?code={o['code']}&token={token}" if token else "",
+        })
+    c.close()
+    return 200, {"ok": True, "orders": orders}
 
 def ahm7_place_order(product_id, customer_ref, quantity=1):
     """AHM7 POST /v1/orders (currency pkr, Idempotency-Key = customer_ref —

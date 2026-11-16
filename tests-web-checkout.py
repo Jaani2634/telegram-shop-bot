@@ -316,7 +316,7 @@ bot.ahm7_place_order = real_place
 
 # ---------- 14. reviews (real, no fakes) ----------
 s, out = bot.handle_submit_review({"product_id": gem_pid, "name": "Ali", "rating": 5, "text": "Bohat acha, instant delivery!"}, H, "5.5.5.5")
-check("review: happy path 200", s == 200 and out.get("ok") is True, f"got {s} {out}")
+check("review: happy path 200 + id returned", s == 200 and out.get("ok") is True and isinstance((out.get("review") or {}).get("id"), int), f"got {s} {out}")
 s, out = bot.handle_submit_review({"product_id": gem_pid, "name": "Ali", "rating": 5, "text": "x"}, {"X-Web-Secret": "wrong"}, "5.5.5.5")
 check("review: wrong secret -> 401", s == 401, f"got {s} {out}")
 s, out = bot.handle_submit_review({"product_id": gem_pid, "name": "Ali", "rating": 6, "text": "x"}, H, "5.5.5.6")
@@ -339,6 +339,47 @@ for i in range(5):
     bot.handle_submit_review({"product_id": gem_pid, "name": "R", "rating": 4, "text": f"ok {i}"}, H, "6.6.6.6")
 s, out = bot.handle_submit_review({"product_id": gem_pid, "name": "R", "rating": 4, "text": "one more"}, H, "6.6.6.6")
 check("review: 6th in an hour -> 429", s == 429, f"got {s} {out}")
+# delete: test review hatana (live test review ke liye)
+s, out = bot.handle_submit_review({"product_id": gem_pid, "name": "Del", "rating": 5, "text": "delete me"}, H, "8.8.8.8")
+_rid = (out.get("review") or {}).get("id")
+check("review delete: submit returns id", s == 200 and isinstance(_rid, int), f"got {s} {out}")
+s, out = bot.handle_delete_review({"id": _rid}, {"X-Web-Secret": "wrong"})
+check("review delete: wrong secret -> 401", s == 401, f"got {s} {out}")
+s, out = bot.handle_delete_review({"id": 999999}, H)
+check("review delete: unknown id -> 404", s == 404, f"got {s} {out}")
+s, out = bot.handle_delete_review({"id": "abc"}, H)
+check("review delete: bad id -> 400", s == 400, f"got {s} {out}")
+s, out = bot.handle_delete_review({"id": _rid}, H)
+check("review delete: happy path 200", s == 200 and out.get("deleted") == 1, f"got {s} {out}")
+s, out = bot.handle_get_reviews(gem_pid)
+check("review delete: review gone from GET", s == 200 and all(r.get("text") != "delete me" for r in out.get("reviews", [])), f"got {s} {out}")
+
+# ---------- 14b. reviews migration (purani live DB, purana schema) ----------
+import sqlite3 as _sq
+_old_db = "/tmp/test-shop-old.db"
+for _f in (_old_db, _old_db + "-wal", _old_db + "-shm"):
+    if os.path.exists(_f):
+        os.remove(_f)
+_c = _sq.connect(_old_db)
+_c.execute("CREATE TABLE products(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, description TEXT DEFAULT '', price_pkr INTEGER NOT NULL, price_usdt REAL NOT NULL, active INTEGER DEFAULT 1, kind TEXT DEFAULT 'account', category TEXT DEFAULT '', bulk TEXT DEFAULT '', terms TEXT DEFAULT '', unlimited INTEGER DEFAULT 0)")
+_c.execute("INSERT INTO products(name,description,price_pkr,price_usdt) VALUES('Old Prod','',100,1.0)")
+_c.execute("CREATE TABLE reviews(id INTEGER PRIMARY KEY AUTOINCREMENT, product_id INTEGER NOT NULL, user_name TEXT, rating INTEGER NOT NULL, text TEXT, verified INTEGER DEFAULT 0, source TEXT DEFAULT 'user')")
+_c.execute("INSERT INTO reviews(product_id,user_name,rating,text,verified,source) VALUES(1,'Old User',5,'purani telegram review',1,'user')")
+_c.commit(); _c.close()
+_main_db = bot.DB_PATH
+bot.DB_PATH = _old_db
+bot.init_db()
+_c = bot.db()
+_cols = [r[1] for r in _c.execute("PRAGMA table_info(reviews)").fetchall()]
+check("migration: old reviews table gains name + created_at", "name" in _cols and "created_at" in _cols, f"cols={_cols}")
+_r = _c.execute("SELECT name FROM reviews WHERE user_name='Old User'").fetchone()
+check("migration: old review name backfilled from user_name", _r and _r["name"] == "Old User", f"got {dict(_r) if _r else None}")
+_c.close()
+s, out = bot.handle_submit_review({"product_id": 1, "name": "Mig", "rating": 4, "text": "migration ke baad review"}, H, "7.7.7.7")
+check("migration: submit works on migrated old DB", s == 200 and out.get("ok") is True, f"got {s} {out}")
+s, out = bot.handle_get_reviews(1)
+check("migration: GET returns old + new review", s == 200 and len(out.get("reviews", [])) == 2, f"got {s} {out}")
+bot.DB_PATH = _main_db
 
 # ---------- 12. HTTP layer (real health server) ----------
 bot.zurvapay_initiate = real_initiate
