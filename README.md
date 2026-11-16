@@ -82,6 +82,27 @@ Khaali keys = Zurvapay option dikhega hi nahi, baaki flows (manual, USDT, wallet
 
 **⚠️ IPN signature — zaroori note:** Zurvapay ki public site pe IPN payload/signature ka exact format nahi hai — full API docs merchant dashboard ke peeche hain. `ZURVAPAY_IPN_MODE=auto` (default) tamam common HMAC schemes try karta hai (HMAC-SHA256/512 over `identifier|amount`, raw body, ya sorted params — sab secret se keyed, is liye baghair secret ke forge nahi ho sakta). Live keys milte hi dashboard docs se sahi scheme check karo aur `ZURVAPAY_IPN_MODE` se pin kar do. Agar koi scheme match na kare to bot IPN reject karke admin ko Telegram pe fields bhej deta hai (taake scheme update ki ja sake) — baghair signature ke koi delivery nahi hoti. Status-check API ka endpoint bhi public docs me nahi hai; `ZURVAPAY_STATUS_URL` set ho to hi use hoti hai.
 
+## Website se direct purchase + AHM7 reseller flow
+
+RetailShop AHM7 ka reseller hai — website (Cloudflare Pages) se direct khareedari:
+
+1. Customer site pe product chunta hai, Telegram @username deta hai → site Cloudflare Worker `retailshop-api` ko `POST /api/checkout` bhejti hai → Worker bot server ko `POST /api/web-checkout` forward karta hai (header `X-Web-Secret`).
+2. Bot server username ko Telegram chat id me resolve karta hai (buyer ne bot `/start` kiya ho to hi), order banata hai (channel=`web`, amount = server-side site price — client ki bheji price pe bharosa nahi) aur Zurvapay initiate karke checkout URL wapas bhejta hai. Customer wahan JazzCash / Easypaisa / Raast se pay karta hai. USDT site pe nahi — sirf bot se.
+3. Payment confirm hote hi Zurvapay IPN bhejta hai → bot **apne stock se NAHI**, AHM7 se auto-buy karta hai (`POST https://api.ahm7.tech/v1/orders`, currency `pkr`, Idempotency-Key = RetailShop order code) aur AHM7 ki credentials buyer ko Telegram DM me bhej deta hai. Commission = site price − AHM7 cost.
+4. **Margin guard:** AHM7 cost >= site price ho to auto-buy NAHI hota — order `ahm7_pending` me chala jata hai (manual review). Mapping `ahm7-mapping.json` me hai (26 products, 21 mapped, 8 site prices pe profitable).
+5. **Failure handling:** AHM7 wallet 0 ho (402 `insufficient_balance`), key na ho, ya koi aur error ho → order `ahm7_pending` me safe rehta hai, admin ko Telegram pe notify hota hai, buyer ko "payment mil gayi, process ho raha hai" milta hai. Paid order kabhi lose nahi hota. Wallet top-up ke baad `POST /api/ahm7-retry {"order_code": "RS-XXXXXX"}` (X-Web-Secret ke saath) se dobara fulfill karo — dobara buy nahi hota agar pehle buy ho chuka ho (saved credentials dobara bheje jate hain).
+
+**Env vars (Botkeep .env me dalo):**
+
+```bash
+WEB_API_SECRET=<openssl rand -hex 32>   # Worker secret se SAME hona chahiye
+AHM7_API_KEY=<ahm7 reseller key>        # api.ahm7.tech key
+# Optional:
+AHM7_BASE_URL=https://api.ahm7.tech/v1  # default
+```
+
+**Note:** Telegram bot ke andar ki orders (channel=`telegram`) abhi bhi purane `deliver_order` path se apne stock se deliver hoti hain. AHM7 fulfillment sirf web orders pe hai — Telegram orders ko AHM7 pe shift karna ho to `_zurva_handle_order_ipn` me channel check hatana hoga (wallet top-up ke baad).
+
 ## 24/7 chalane ke liye (free options)
 
 Bot tab tak chalega jab tak `python bot.py` chal raha hai. Band kar diya to bot offline.

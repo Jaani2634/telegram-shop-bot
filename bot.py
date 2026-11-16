@@ -25,6 +25,7 @@ import io
 import csv
 import json
 import random
+import re
 import sqlite3
 import logging
 import requests
@@ -82,6 +83,18 @@ ZURVAPAY_IPN_MODE = os.getenv("ZURVAPAY_IPN_MODE", "auto")
 # registered Telegram bot ke liye valid hai; initiate call me bot_id bhejna
 # zaroori hai warna "domain_not_allowed" error aata hai. Default BOT_USERNAME.
 ZURVAPAY_BOT_ID = os.getenv("ZURVAPAY_BOT_ID", BOT_USERNAME)
+
+# ---------- Web checkout (site -> Cloudflare Worker -> bot server) + AHM7 reseller ----------
+# Site se direct purchase: Worker POST /api/checkout bhejta hai, bot server
+# POST /api/web-checkout pe order banata hai + Zurvapay initiate karta hai.
+# Shared secret — kabhi code me nahi, sirf env se (Botkeep .env me set karo).
+WEB_API_SECRET = os.getenv("WEB_API_SECRET", "")
+# AHM7 reseller API — payment confirm hone ke baad bot server yahan se auto-buy
+# karta hai aur credentials buyer ko Telegram DM me bhejta hai. Key sirf env se.
+# Wallet me balance hona lazmi hai, warna buy 402 dega aur order paid-pending
+# reh jayega (kabhi lose nahi hota — retry / manual handling se deliver hoga).
+AHM7_API_KEY = os.getenv("AHM7_API_KEY", "")
+AHM7_BASE_URL = os.getenv("AHM7_BASE_URL", "https://api.ahm7.tech/v1").rstrip("/")
 
 # IPN HTTP thread se PTB loop tak pohanchne ke liye (main() me set hota hai).
 PTB_APP = None
@@ -310,7 +323,10 @@ def init_db():
     for col, ddl in (("code", "TEXT DEFAULT ''"), ("items_json", "TEXT DEFAULT ''"),
                      ("qty", "INTEGER DEFAULT 1"), ("discount_pkr", "INTEGER DEFAULT 0"),
                      ("coupon_code", "TEXT DEFAULT ''"), ("amount_pkr", "INTEGER DEFAULT 0"),
-                     ("channel", "TEXT DEFAULT 'telegram'")):
+                     ("channel", "TEXT DEFAULT 'telegram'"),
+                     ("ahm7_order_id", "TEXT DEFAULT ''"),
+                     ("ahm7_credentials", "TEXT DEFAULT ''"),
+                     ("ahm7_note", "TEXT DEFAULT ''")):
         _add_col(c, "orders", col, ddl)
     # Auto-seed products on a fresh DB (e.g. Render free restarts wipe shop.db).
     # Stock is NOT seeded here — accounts must be added with /addstock.
@@ -530,6 +546,34 @@ def start_health_server():
                 self.send_header("Content-Type", "text/plain")
                 self.end_headers()
                 self.wfile.write(msg.encode("utf-8", "ignore"))
+                return
+            if self.path.startswith("/api/web-checkout") or self.path.startswith("/api/ahm7-retry"):
+                # Site checkout (Cloudflare Worker se) — JSON in, JSON out.
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                except ValueError:
+                    length = 0
+                raw = self.rfile.read(length) if length > 0 else b""
+                try:
+                    data = json.loads(raw.decode("utf-8") or "{}")
+                    if not isinstance(data, dict):
+                        data = {}
+                except Exception:
+                    data = {}
+                try:
+                    if self.path.startswith("/api/web-checkout"):
+                        status, out = handle_web_checkout(data, self.headers)
+                    else:
+                        status, out = handle_ahm7_retry(data, self.headers)
+                except Exception as e:
+                    log.exception("Web API handler crashed")
+                    status, out = 500, {"ok": False, "error": f"handler error: {e}"}
+                body = json.dumps(out, ensure_ascii=False).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
                 return
             self.send_response(404)
             self.end_headers()
@@ -1097,8 +1141,10 @@ def gen_order_code():
 
 def create_order(uid, username, items, payment_method, amount_text, proof, amount_pkr, code, coupon_code, discount_pkr, channel="telegram"):
     """items: list of {pid, qty}. Returns order id.
-    channel: 'telegram' ya 'whatsapp'. WhatsApp orders me uid = buyer ka
-    phone number (integer, digits only) hota hai."""
+    channel: 'telegram' ya 'whatsapp' ya 'web' (site checkout).
+    WhatsApp orders me uid = buyer ka phone number (integer, digits only)
+    hota hai. Web orders me uid = buyer ka Telegram chat id hota hai
+    (username se resolve karke), delivery Telegram DM se hoti hai."""
     c = db()
     first_pid = items[0]["pid"] if items else 0
     total_qty = sum(i["qty"] for i in items)
@@ -2006,6 +2052,18 @@ def _zurva_handle_order_ipn(code, f):
     if not claimed:
         return True, "order pehle hi process ho rahi hai / ho chuki"
     try:
+        try:
+            ch = (o["channel"] or "telegram") if "channel" in o.keys() else "telegram"
+        except Exception:
+            ch = "telegram"
+        if ch == "web":
+            # Web order — apne stock se NAHI, AHM7 reseller se fulfill karo.
+            ok, fmsg = fulfill_web_order(o["id"])
+            if ok:
+                return True, "delivered via AHM7"
+            # Paid-pending: payment mil gayi, fulfillment baad me (manual/retry).
+            # IPN handle ho gaya — Zurvapay ko retry nahi karwana.
+            return True, f"paid-pending: {fmsg}"
         ok = _zurva_deliver_order(o["id"])
     except Exception as e:
         log.exception("Zurvapay delivery error order %s", o["id"])
@@ -2084,6 +2142,280 @@ def handle_zurvapay_ipn_http(raw_body, headers=None):
     if ident.startswith("DEP-"):
         return _zurva_handle_deposit_ipn(ident, f)
     return _zurva_handle_order_ipn(ident, f)
+
+# ---------- Web checkout (site) + AHM7 reseller fulfillment ----------
+# RetailShop AHM7 ka reseller hai: customer RetailShop ko pay karta hai,
+# hum commission rakhte hain, AHM7 se asal cost pe auto-buy karte hain aur
+# AHM7 ki credentials buyer ko Telegram DM me bhejte hain. Apne stock se
+# web orders deliver NAHI hote — sirf Telegram bot ke andar ki orders
+# (channel='telegram') purane deliver_order path se chalti hain.
+
+_AHM7_MAPPING = None
+
+def load_ahm7_mapping():
+    """ahm7-mapping.json (bot.py ke saath wali directory) load karo.
+    Key: site product name. Value: ahm7_product_id, cost_pkr, site_price_pkr.
+    Mapping na mile to {} — web checkout phir har product pe error dega."""
+    global _AHM7_MAPPING
+    if _AHM7_MAPPING is None:
+        try:
+            path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ahm7-mapping.json")
+            with open(path, encoding="utf-8") as f:
+                _AHM7_MAPPING = json.load(f).get("products", {}) or {}
+        except Exception as e:
+            log.warning("ahm7-mapping.json load fail: %s", e)
+            _AHM7_MAPPING = {}
+    return _AHM7_MAPPING
+
+def _web_auth(headers):
+    """X-Web-Secret check (constant-time). Returns True ya False.
+    Secret set hi nahi hai to har request reject (fail-closed)."""
+    if not WEB_API_SECRET:
+        return False
+    try:
+        given = (headers.get("X-Web-Secret") or "").strip()
+    except Exception:
+        given = ""
+    return bool(given) and hmac.compare_digest(given, WEB_API_SECRET)
+
+def _resolve_telegram_chat_id(username):
+    """@username -> numeric Telegram chat id (bot.get_chat).
+    Buyer ne bot /start kiya ho to hi resolve hota hai — warna exception."""
+    uname = username.strip().lstrip("@")
+    chat = _zurva_run_on_loop(PTB_APP.bot.get_chat(f"@{uname}"), timeout=30)
+    return int(chat.id)
+
+def ahm7_place_order(product_id, customer_ref):
+    """AHM7 POST /v1/orders (currency pkr, Idempotency-Key = RetailShop order
+    code — retry kabhi double-buy nahi karta). Returns (order_dict, None)
+    ya (None, error_string). API-level failures kabhi raise nahi karte."""
+    if not AHM7_API_KEY:
+        return None, "AHM7_API_KEY set nahi hai (Botkeep env me add karein)"
+    try:
+        r = requests.post(
+            f"{AHM7_BASE_URL}/orders",
+            json={"productId": product_id, "quantity": 1, "currency": "pkr",
+                  "customerRef": customer_ref},
+            headers={"X-Api-Key": AHM7_API_KEY, "Idempotency-Key": customer_ref,
+                     "Content-Type": "application/json"},
+            timeout=30)
+    except Exception as e:
+        log.exception("AHM7 order error")
+        return None, f"AHM7 se rabta nahi ho saka: {e}"
+    try:
+        d = r.json()
+    except Exception:
+        return None, f"AHM7 ka jawab samajh nahi aaya (HTTP {r.status_code})"
+    if r.status_code == 201 and isinstance(d, dict) and d.get("ok") and isinstance(d.get("order"), dict):
+        return d["order"], None
+    msg = ""
+    if isinstance(d, dict):
+        msg = str(d.get("message") or d.get("error") or d)
+        if "needed" in d:
+            msg += f" (needed: {d.get('needed')}, balances: {d.get('balances')})"
+    return None, f"AHM7 error HTTP {r.status_code}: {msg[:300] or 'unknown'}"
+
+def _ahm7_credential_lines(credentials):
+    """AHM7 credentials array ko buyer ko dikhane wali lines me badlo.
+    Har credential string ya {login/email, password} dict ho sakta hai."""
+    lines = []
+    for cred in credentials or []:
+        if isinstance(cred, str):
+            if cred.strip():
+                lines.append(cred.strip())
+        elif isinstance(cred, dict):
+            login = cred.get("login") or cred.get("email") or cred.get("username") or cred.get("account") or ""
+            pw = cred.get("password") or cred.get("pass") or ""
+            extra = cred.get("extra") or ""
+            if login and pw:
+                lines.append(f"{login} | {pw}" + (f" | {extra}" if extra else ""))
+            elif login:
+                lines.append(str(login))
+            else:
+                lines.append(json.dumps(cred, ensure_ascii=False))
+        else:
+            lines.append(str(cred))
+    return lines
+
+def _ahm7_mark_pending(order_id, note):
+    """Paid order ko manual/retry queue me daalo — kabhi lose nahi karna."""
+    c = db()
+    c.execute("UPDATE orders SET status='ahm7_pending', ahm7_note=? WHERE id=?",
+              (str(note)[:500], order_id))
+    c.commit(); c.close()
+
+def _ahm7_deliver_dm(order, creds, order_obj=None):
+    """AHM7 credentials buyer ko Telegram DM me bhejo. Returns True/False."""
+    lines = _ahm7_credential_lines(creds)
+    if not lines:
+        log.warning("AHM7 DM fail order %s: credentials khaali hain", order["id"])
+        return False
+    try:
+        pname = ""
+        c = db(); p = c.execute("SELECT name FROM products WHERE id=?", (order["product_id"],)).fetchone(); c.close()
+        if p:
+            pname = p["name"]
+    except Exception:
+        pname = ""
+    msg = (
+        f"✅ Payment confirmed! Aapka account mil gaya:\n\n"
+        f"📦 Product: {pname or order['product_id']}\n\n"
+        + "\n".join(lines) +
+        f"\n\nOrder {order['code']}\nAccount ko save kar lein. Koi issue ho to admin se rabta karein."
+    )
+    try:
+        instr = ""
+        if isinstance(order_obj, dict):
+            prod = order_obj.get("product") or {}
+            if isinstance(prod, dict):
+                instr = str(prod.get("instructions") or "").strip()
+        if instr:
+            msg += f"\n\n📋 Instructions:\n{instr[:1000]}"
+    except Exception:
+        pass
+    try:
+        _zurva_run_on_loop(PTB_APP.bot.send_message(order["user_id"], msg), timeout=30)
+        return True
+    except Exception as e:
+        log.warning("AHM7 DM fail order %s: %s", order["id"], e)
+        return False
+
+def fulfill_web_order(order_id):
+    """Paid web order -> AHM7 auto-buy -> credentials Telegram DM se.
+    Returns (True, msg) jab delivered, (False, reason) jab paid-pending
+    (manual review / wallet top-up ke baad retry). Business failures kabhi
+    raise nahi karte — order hamesha 'ahm7_pending' me safe rehta hai."""
+    c = db()
+    o = c.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
+    c.close()
+    if not o:
+        return False, "order nahi mila"
+    if o["status"] == "delivered":
+        return True, "already delivered"
+    if o["status"] not in ("zurva_processing", "ahm7_pending"):
+        return False, f"order status {o['status']} hai — fulfillment nahi ho sakti"
+    c = db()
+    prod = c.execute("SELECT * FROM products WHERE id=?", (o["product_id"],)).fetchone()
+    c.close()
+    if not prod:
+        note = f"product nahi mila (id={o['product_id']}) — manual handling"
+        _ahm7_mark_pending(order_id, note)
+        _zurva_send(ADMIN_ID, f"⚠️ Web order {o['code']} paid-pending: {note}.")
+        return False, note
+    mapping = load_ahm7_mapping().get(prod["name"])
+    if not mapping or not mapping.get("ahm7_product_id"):
+        note = f"AHM7 mapping nahi hai ({prod['name']}) — manual handling"
+        _ahm7_mark_pending(order_id, note)
+        _zurva_send(ADMIN_ID, f"⚠️ Web order {o['code']} paid-pending: {note}. Manual deliver karein.")
+        _zurva_send(o["user_id"], f"✅ Payment mil gayi! Aapka order {o['code']} ({prod['name']}) process ho raha hai — account jald hi isi chat me milega.")
+        return False, note
+    cost = mapping.get("cost_pkr")
+    site_price = o["amount_pkr"] or 0
+    if cost is None or cost >= site_price:
+        note = f"margin guard: AHM7 cost Rs {cost} >= site price Rs {site_price} — auto-buy nahi hua"
+        _ahm7_mark_pending(order_id, note)
+        _zurva_send(ADMIN_ID, f"⚠️ Web order {o['code']} paid-pending: {note}. Price barhao ya manual deliver karein.")
+        _zurva_send(o["user_id"], f"✅ Payment mil gayi! Aapka order {o['code']} ({prod['name']}) process ho raha hai — account jald hi isi chat me milega.")
+        return False, note
+    # Pehle se buy ho chuka (retry) — dobara buy NAHI, saved credentials dobara bhejo.
+    try:
+        stored_id = o["ahm7_order_id"] or ""
+        stored_creds = o["ahm7_credentials"] or ""
+    except Exception:
+        stored_id, stored_creds = "", ""
+    if stored_id and stored_creds:
+        try:
+            creds = json.loads(stored_creds)
+        except Exception:
+            creds = []
+        if _ahm7_deliver_dm(o, creds):
+            c = db(); c.execute("UPDATE orders SET status='delivered' WHERE id=?", (order_id,)); c.commit(); c.close()
+            return True, "credentials dobara bhej diye (dobara buy nahi hua)"
+        return False, "delivery fail — credentials saved hain, retry karein"
+    order_obj, err = ahm7_place_order(mapping["ahm7_product_id"], o["code"])
+    if err:
+        note = f"AHM7 buy fail: {err}"
+        _ahm7_mark_pending(order_id, note)
+        _zurva_send(ADMIN_ID, f"⚠️ Web order {o['code']} paid-pending: {note}. Wallet top-up / retry karein.")
+        _zurva_send(o["user_id"], f"✅ Payment mil gayi! Aapka order {o['code']} ({prod['name']}) process ho raha hai — account jald hi isi chat me milega.")
+        return False, note
+    creds = order_obj.get("credentials") or []
+    c = db()
+    c.execute("UPDATE orders SET ahm7_order_id=?, ahm7_credentials=?, ahm7_note=? WHERE id=?",
+              (str(order_obj.get("orderId") or ""), json.dumps(creds, ensure_ascii=False),
+               f"AHM7 {order_obj.get('orderId')} total {order_obj.get('totalCharged')} {order_obj.get('currency')}",
+               order_id))
+    c.commit(); c.close()
+    if _ahm7_deliver_dm(o, creds, order_obj):
+        c = db(); c.execute("UPDATE orders SET status='delivered' WHERE id=?", (order_id,)); c.commit(); c.close()
+        return True, f"delivered via AHM7 {order_obj.get('orderId')}"
+    _ahm7_mark_pending(order_id, "AHM7 buy OK, DM delivery fail — credentials saved")
+    _zurva_send(ADMIN_ID, f"⚠️ Web order {o['code']}: AHM7 buy ho gaya ({order_obj.get('orderId')}) lekin buyer ko DM nahi gaya. Retry karein.")
+    return False, "delivery fail — credentials saved, retry karein"
+
+def handle_web_checkout(data, headers=None):
+    """POST /api/web-checkout (Worker se aata hai). Returns (http_status, dict).
+    Order banata hai (channel='web') + Zurvapay initiate karta hai.
+    Amount hamesha server-side mapping ki site price hoti hai — client jo
+    bhejta hai us pe bharosa nahi (tamper-proof)."""
+    if not _web_auth(headers or {}):
+        return 401, {"ok": False, "error": "unauthorized (WEB_API_SECRET ghalat ya set nahi)"}
+    data = data or {}
+    try:
+        product_id = int(data.get("product_id"))
+    except Exception:
+        return 400, {"ok": False, "error": "product_id ghalat hai"}
+    telegram = str(data.get("telegram") or "").strip()
+    if not re.match(r"^@?[A-Za-z0-9_]{5,32}$", telegram):
+        return 400, {"ok": False, "error": "Telegram username ghalat hai — @username likhein (5-32 chars)"}
+    c = db(); prod = c.execute("SELECT * FROM products WHERE id=?", (product_id,)).fetchone(); c.close()
+    if not prod:
+        return 404, {"ok": False, "error": "product nahi mila"}
+    mapping = load_ahm7_mapping().get(prod["name"])
+    if not mapping:
+        return 400, {"ok": False, "error": "ye product web checkout pe available nahi hai"}
+    site_price = mapping.get("site_price_pkr") or 0
+    if site_price <= 0:
+        return 400, {"ok": False, "error": "product ki price set nahi hai"}
+    try:
+        chat_id = _resolve_telegram_chat_id(telegram)
+    except Exception as e:
+        log.info("web-checkout username resolve fail %s: %s", telegram, e)
+        return 400, {"ok": False, "error": "Telegram username nahi mila — pehle @Shop_at_Retail_bot pe /start karein, phir dobara try karein", "code": "tg_not_started"}
+    username = telegram.lstrip("@")
+    code = gen_order_code()
+    create_order(chat_id, username, [{"pid": product_id, "qty": 1}], "zurvapay",
+                 f"Rs {site_price} via Zurvapay (web)", "zurvapay", site_price, code, "", 0,
+                 channel="web")
+    url, err = zurvapay_initiate(code, site_price, f"RetailShop order {code} — {prod['name']}",
+                                 username, "")
+    if err:
+        return 502, {"ok": False, "error": f"Payment start nahi ho saki: {err}", "order_code": code}
+    return 200, {"ok": True, "checkout_url": url, "order_code": code}
+
+def handle_ahm7_retry(data, headers=None):
+    """POST /api/ahm7-retry — paid-pending web order dobara fulfill karo
+    (wallet top-up ke baad). Returns (http_status, dict)."""
+    if not _web_auth(headers or {}):
+        return 401, {"ok": False, "error": "unauthorized (WEB_API_SECRET ghalat ya set nahi)"}
+    code = str((data or {}).get("order_code") or "").strip()
+    if not code:
+        return 400, {"ok": False, "error": "order_code chahiye"}
+    c = db(); o = c.execute("SELECT * FROM orders WHERE code=?", (code,)).fetchone(); c.close()
+    if not o:
+        return 404, {"ok": False, "error": "order nahi mila"}
+    try:
+        ch = (o["channel"] or "telegram") if "channel" in o.keys() else "telegram"
+    except Exception:
+        ch = "telegram"
+    if ch != "web":
+        return 400, {"ok": False, "error": "ye web order nahi hai"}
+    if o["status"] not in ("ahm7_pending", "zurva_processing"):
+        return 400, {"ok": False, "error": f"order status {o['status']} hai — retry sirf paid-pending orders pe hota hai"}
+    ok, msg = fulfill_web_order(o["id"])
+    c = db(); o2 = c.execute("SELECT status FROM orders WHERE id=?", (o["id"],)).fetchone(); c.close()
+    return 200, {"ok": ok, "message": msg, "order_code": code,
+                 "status": o2["status"] if o2 else o["status"]}
 
 # ---------- Buy flow renders ----------
 

@@ -1,0 +1,216 @@
+{
+  "generated": "2026-11-16",
+  "currency": "pkr",
+  "source": "ahm7-products.json (38 products, discountedPrices.pkr = reseller cost) + price-sync-report.txt matching",
+  "note": "site_price_pkr is the ORIGINAL site price (index.html). cost_pkr is the AHM7 reseller cost. margin = site - cost. Auto-buy only when margin > 0. confidence 'review' = name match is fuzzy, verify with AHM7 before enabling.",
+  "products": {
+    "Amazon Prime 6 Months": {
+      "ahm7_product_id": "6ad26662f22317997032fe0c",
+      "ahm7_name": "Amazon Prime 6 Month",
+      "cost_pkr": 668,
+      "site_price_pkr": 699,
+      "margin_pkr": 31,
+      "confidence": "exact"
+    },
+    "Udemy Personal Plan 1M": {
+      "ahm7_product_id": "6ae9f7c8ba4b7946a881eb8c",
+      "ahm7_name": "Udemy Personal Plan 1M",
+      "cost_pkr": 562,
+      "site_price_pkr": 559,
+      "margin_pkr": -3,
+      "confidence": "exact"
+    },
+    "Capcut Pro 1 Month": {
+      "ahm7_product_id": "6ad26ca69f4e80069439a4c4",
+      "ahm7_name": "Capcut Pro 1M",
+      "cost_pkr": 521,
+      "site_price_pkr": 526,
+      "margin_pkr": 5,
+      "confidence": "exact"
+    },
+    "HMA Vpn Monthly": {
+      "ahm7_product_id": "6abf69fb8e3ac31b73cf9cf5",
+      "ahm7_name": "HMA VPN",
+      "cost_pkr": 183,
+      "site_price_pkr": 186,
+      "margin_pkr": 3,
+      "confidence": "exact"
+    },
+    "Microsoft 365 Plus 1 Year": {
+      "ahm7_product_id": "6ac0e5a448610fbf8e9db2fa",
+      "ahm7_name": "Microsoft 365",
+      "cost_pkr": 481,
+      "site_price_pkr": 501,
+      "margin_pkr": 20,
+      "confidence": "exact"
+    },
+    "Muse Ai 1B Credits": {
+      "ahm7_product_id": "6abe528c40c4d6879a2e354d",
+      "ahm7_name": "Muse Ai 1B",
+      "cost_pkr": 73,
+      "site_price_pkr": 71,
+      "margin_pkr": -2,
+      "confidence": "exact"
+    },
+    "Windows 10/11 Pro": {
+      "ahm7_product_id": "6ad266c8f22317997032fe4c",
+      "ahm7_name": "Windows 10/11 Pro",
+      "cost_pkr": 267,
+      "site_price_pkr": 276,
+      "margin_pkr": 9,
+      "confidence": "exact"
+    },
+    "Muse Ai 31B Token (NW)": {
+      "ahm7_product_id": "6aec8467273602fc1e44c160",
+      "ahm7_name": "Muse Ai 31B",
+      "cost_pkr": 534,
+      "site_price_pkr": 369,
+      "margin_pkr": -165,
+      "confidence": "exact"
+    },
+    "Capcut Pro 7D 500 credits": {
+      "ahm7_product_id": "6ad84d972ca827119533b834",
+      "ahm7_name": "capcut Pro 7D",
+      "cost_pkr": 114,
+      "site_price_pkr": 114,
+      "margin_pkr": 0,
+      "confidence": "exact"
+    },
+    "500$ API CLAUDE 30D (FW)": {
+      "ahm7_product_id": "6ac121e07be6bbf5dc0c6c0f",
+      "ahm7_name": "500$ API Claude 30D (FW)",
+      "cost_pkr": 2670,
+      "site_price_pkr": 2499,
+      "margin_pkr": -171,
+      "confidence": "exact"
+    },
+    "100$ API Claude 30D (FW)": {
+      "ahm7_product_id": "6ac121317be6bbf5dc0c6be7",
+      "ahm7_name": "100$ API Claude 30D (FW)",
+      "cost_pkr": 761,
+      "site_price_pkr": 749,
+      "margin_pkr": -12,
+      "confidence": "exact"
+    },
+    "Adobe Express 12M": {
+      "ahm7_product_id": "6ae7e66acffadaff244e73a6",
+      "ahm7_name": "Adobe Express 12 Month",
+      "cost_pkr": 161,
+      "site_price_pkr": 169,
+      "margin_pkr": 8,
+      "confidence": "exact"
+    },
+    "Gemini Plus 6m Links (No Card Required)": {
+      "ahm7_product_id": "6aee3b684626629cadafd5d5",
+      "ahm7_name": "GEMINI PLUS 6 Months",
+      "cost_pkr": 266,
+      "site_price_pkr": 379,
+      "margin_pkr": 113,
+      "confidence": "exact"
+    },
+    "MUSE AI 1B TOKEN (W2D)": {
+      "ahm7_product_id": "6aef64c5fa59c4dd624a1712",
+      "ahm7_name": "Muse Ai 1B stable",
+      "cost_pkr": 161,
+      "site_price_pkr": 139,
+      "margin_pkr": -22,
+      "confidence": "review"
+    },
+    "Outlook IMAP": {
+      "ahm7_product_id": "6ad674549b38f66c1094209c",
+      "ahm7_name": "Outlook Mail Trust Private",
+      "cost_pkr": 38,
+      "site_price_pkr": 35,
+      "margin_pkr": -3,
+      "confidence": "exact"
+    },
+    "Hotmail Mail Accounts": {
+      "ahm7_product_id": null,
+      "ahm7_name": null,
+      "cost_pkr": null,
+      "site_price_pkr": 35,
+      "margin_pkr": null,
+      "confidence": "no-match"
+    },
+    "Owl Proxy 200 Mb": {
+      "ahm7_product_id": "6acc8ad64d2ded2f2ae0f472",
+      "ahm7_name": "OWL Proxy 200mb",
+      "cost_pkr": 59,
+      "site_price_pkr": 49,
+      "margin_pkr": -10,
+      "confidence": "exact"
+    },
+    "iLovePdf Premium 1 Yr": {
+      "ahm7_product_id": "6aec0abd92102c1dfb8a5829",
+      "ahm7_name": "iLovePdf Premium 1 Yr",
+      "cost_pkr": 452,
+      "site_price_pkr": 419,
+      "margin_pkr": -33,
+      "confidence": "exact"
+    },
+    "Chatgpt Plus 1M (25DW)": {
+      "ahm7_product_id": null,
+      "ahm7_name": null,
+      "cost_pkr": null,
+      "site_price_pkr": 2549,
+      "margin_pkr": null,
+      "confidence": "no-match"
+    },
+    "Coursera Plus 7 Days Trial": {
+      "ahm7_product_id": null,
+      "ahm7_name": null,
+      "cost_pkr": null,
+      "site_price_pkr": 211,
+      "margin_pkr": null,
+      "confidence": "no-match"
+    },
+    "Bolt .new Pro 1 Month": {
+      "ahm7_product_id": "6af5ffdd34b4e79f50455f30",
+      "ahm7_name": "Bolt.new Pro Plan 1 Month",
+      "cost_pkr": 903,
+      "site_price_pkr": 399,
+      "margin_pkr": -504,
+      "confidence": "exact"
+    },
+    "3 in 1 VIP Group": {
+      "ahm7_product_id": "6abd3de8249cf79a77763619",
+      "ahm7_name": "3 in 1 VIP GROUP",
+      "cost_pkr": 7600,
+      "site_price_pkr": 12999,
+      "margin_pkr": 5399,
+      "confidence": "exact"
+    },
+    "Canva Edu 3 Years Invite On Client Mail": {
+      "ahm7_product_id": "6abe557140c4d6879a2e374a",
+      "ahm7_name": "Canva Pro On Mail",
+      "cost_pkr": 285,
+      "site_price_pkr": 250,
+      "margin_pkr": -35,
+      "confidence": "review"
+    },
+    "CrunchyRoll 1 Year Mega Fan Profile (FW)": {
+      "ahm7_product_id": null,
+      "ahm7_name": null,
+      "cost_pkr": null,
+      "site_price_pkr": 599,
+      "margin_pkr": null,
+      "confidence": "no-match"
+    },
+    "Hostinger Unlimited Plan 12 Months (FW)": {
+      "ahm7_product_id": null,
+      "ahm7_name": null,
+      "cost_pkr": null,
+      "site_price_pkr": 5550,
+      "margin_pkr": null,
+      "confidence": "no-match"
+    },
+    "Muse Ai Token On Client Account": {
+      "ahm7_product_id": "6aec88c2273602fc1e44f628",
+      "ahm7_name": "Muse Credits on Your account",
+      "cost_pkr": 81,
+      "site_price_pkr": 50,
+      "margin_pkr": -31,
+      "confidence": "exact"
+    }
+  }
+}
