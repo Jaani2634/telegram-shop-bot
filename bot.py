@@ -220,6 +220,14 @@ def init_db():
         coupon_code TEXT DEFAULT '',
         amount_pkr INTEGER DEFAULT 0
     );
+    CREATE TABLE IF NOT EXISTS reviews(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_id INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        rating INTEGER NOT NULL,
+        text TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS settings(
         key TEXT PRIMARY KEY, value TEXT
     );
@@ -330,7 +338,8 @@ def init_db():
                      ("ahm7_credentials", "TEXT DEFAULT ''"),
                      ("ahm7_note", "TEXT DEFAULT ''"),
                      ("delivery_token", "TEXT DEFAULT ''"),
-                     ("web_contact", "TEXT DEFAULT ''")):
+                     ("web_contact", "TEXT DEFAULT ''"),
+                     ("success_base", "TEXT DEFAULT ''")):
         _add_col(c, "orders", col, ddl)
     # Auto-seed products on a fresh DB (e.g. Render free restarts wipe shop.db).
     # Stock is NOT seeded here — accounts must be added with /addstock.
@@ -522,6 +531,22 @@ def start_health_server():
         port = 8080
     class H(BaseHTTPRequestHandler):
         def do_GET(self):
+            if self.path.startswith("/api/reviews/"):
+                # Public read — product reviews + real sold count.
+                try:
+                    parsed = urlparse(self.path)
+                    pid = parsed.path[len("/api/reviews/"):].strip("/")
+                    status, out = handle_get_reviews(pid)
+                except Exception as e:
+                    log.exception("Reviews handler crashed")
+                    status, out = 500, {"ok": False, "error": f"handler error: {e}"}
+                body = json.dumps(out, ensure_ascii=False).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             if self.path.startswith("/api/order/"):
                 # Website order status (Worker se, X-Web-Secret + delivery token).
                 try:
@@ -541,12 +566,25 @@ def start_health_server():
                 self.end_headers()
                 self.wfile.write(body)
                 return
-            if self.path.startswith("/zurvapay/success"):
-                body = b"Payment successful! Apne Telegram bot pe ja ke order check karein."
-            elif self.path.startswith("/zurvapay/cancel"):
-                body = b"Payment cancel ho gayi. Telegram bot se dobara try karein."
-            else:
-                body = b"OK - RetailShop bot running"
+            if self.path.startswith("/zurvapay/success") or self.path.startswith("/zurvapay/cancel"):
+                # Zurvapay ke baad customer yahan aata hai (approved domain) —
+                # site ke order page pe 302 redirect (code + token DB se).
+                try:
+                    parsed = urlparse(self.path)
+                    qs = parse_qs(parsed.query)
+                    code = (qs.get("code") or [""])[0]
+                    kind = "success" if parsed.path.startswith("/zurvapay/success") else "cancel"
+                    target = zurvapay_redirect_target(kind, code)
+                    log.info("Zurvapay %s: code=%s, redirecting to order page", kind, code)
+                except Exception:
+                    log.exception("Zurvapay redirect handler crashed")
+                    target = "https://retailshop.pages.dev/"
+                self.send_response(302)
+                self.send_header("Location", target)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            body = b"OK - RetailShop bot running"
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.end_headers()
@@ -570,8 +608,8 @@ def start_health_server():
                 self.end_headers()
                 self.wfile.write(msg.encode("utf-8", "ignore"))
                 return
-            if self.path.startswith("/api/web-checkout") or self.path.startswith("/api/ahm7-retry"):
-                # Site checkout (Cloudflare Worker se) — JSON in, JSON out.
+            if self.path.startswith("/api/web-checkout") or self.path.startswith("/api/ahm7-retry") or self.path.startswith("/api/review"):
+                # Site checkout / review (Cloudflare Worker se) — JSON in, JSON out.
                 try:
                     length = int(self.headers.get("Content-Length") or 0)
                 except ValueError:
@@ -586,6 +624,9 @@ def start_health_server():
                 try:
                     if self.path.startswith("/api/web-checkout"):
                         status, out = handle_web_checkout(data, self.headers)
+                    elif self.path.startswith("/api/review"):
+                        ip = self.client_address[0] if self.client_address else ""
+                        status, out = handle_submit_review(data, self.headers, ip)
                     else:
                         status, out = handle_ahm7_retry(data, self.headers)
                 except Exception as e:
@@ -1823,8 +1864,10 @@ def zurvapay_initiate(identifier, amount_pkr, details, customer_name="", custome
                       success_url=None, cancel_url=None):
     """POST /payment/initiate (form-encoded, homepage sample ke mutabiq).
     Returns (checkout_url, None) ya (None, error). success_url/cancel_url
-    sirf web orders ke liye diye jate hain (site ka order page) — Telegram
-    orders pe default bot-server URLs lagte hain."""
+    sirf web orders ke liye diye jate hain — hamesha BOT-SERVER URLs
+    (approved domain, {PUBLIC_BASE_URL}/zurvapay/success?code=...), kyunke
+    Zurvapay site domain (retailshop.pages.dev) ko reject karta hai.
+    Telegram orders pe default bot-server URLs lagte hain."""
     if not ZURVAPAY_PUBLIC_KEY:
         return None, "ZURVAPAY_PUBLIC_KEY set nahi hai"
     ipn = zurvapay_ipn_url()
@@ -1858,6 +1901,7 @@ def zurvapay_initiate(identifier, amount_pkr, details, customer_name="", custome
     err = ""
     if isinstance(d, dict):
         err = str(d.get("message") or d.get("error") or d)
+    log.warning("Zurvapay initiate failed for %s: %s", identifier, err or "unknown")
     return None, f"Zurvapay error: {err or 'unknown'}"
 
 def zurvapay_status_check(identifier):
@@ -2234,6 +2278,145 @@ def _order_status_rate_limited(ip):
         _ORDER_STATUS_RL[ip] = (start, count)
         return count > 30
 
+def zurvapay_redirect_target(kind, code):
+    """Zurvapay success/cancel ke baad customer ko kahan bhejna hai.
+    Returns the site order-page URL (code + delivery token DB se), ya shop
+    home jab order na mile. kind 'success' ya 'cancel' — dono order page
+    pe jate hain, taake customer apna order code + status dekh sake."""
+    code = str(code or "").strip().upper()
+    home = "https://retailshop.pages.dev/"
+    if not code:
+        return home
+    try:
+        c = db()
+        o = c.execute("SELECT delivery_token, success_base FROM orders WHERE code=?", (code,)).fetchone()
+        c.close()
+    except Exception:
+        return home
+    if not o:
+        return home
+    try:
+        token = o["delivery_token"] or ""
+    except Exception:
+        token = ""
+    try:
+        base = (o["success_base"] or "").strip().rstrip("/")
+    except Exception:
+        base = ""
+    if base not in ("https://retailshop.pages.dev", "https://retail-shop.online"):
+        base = "https://retailshop.pages.dev"
+    if not token:
+        return home
+    return f"{base}/order.html?code={code}&token={token}"
+
+
+# POST /api/review rate limit: 5 reviews / 60 min per IP (in-memory).
+_REVIEW_RL = {}
+_REVIEW_RL_LOCK = threading.Lock()
+
+def _review_rate_limited(ip):
+    now = time.time()
+    ip = ip or "unknown"
+    with _REVIEW_RL_LOCK:
+        if len(_REVIEW_RL) > 2000:
+            _REVIEW_RL.clear()
+        start, count = _REVIEW_RL.get(ip, (now, 0))
+        if now - start >= 3600:
+            start, count = now, 0
+        count += 1
+        _REVIEW_RL[ip] = (start, count)
+        return count > 5
+
+
+def handle_submit_review(data, headers=None, client_ip=""):
+    """POST /api/review (Worker se, X-Web-Secret). Stores a real customer
+    review — koi fake/seeded review nahi. Returns (http_status, dict)."""
+    if not _web_auth(headers or {}):
+        return 401, {"ok": False, "error": "unauthorized"}
+    if _review_rate_limited(client_ip):
+        return 429, {"ok": False, "error": "too many reviews — thodi der me dobara try karein"}
+    data = data or {}
+    try:
+        product_id = int(data.get("product_id"))
+    except Exception:
+        return 400, {"ok": False, "error": "product_id ghalat hai"}
+    try:
+        rating = int(data.get("rating"))
+    except Exception:
+        return 400, {"ok": False, "error": "rating 1 se 5 tak honi chahiye"}
+    if rating < 1 or rating > 5:
+        return 400, {"ok": False, "error": "rating 1 se 5 tak honi chahiye"}
+    name = str(data.get("name") or "").strip()
+    text = str(data.get("text") or "").strip()
+    if not name or len(name) > 40:
+        return 400, {"ok": False, "error": "naam 1 se 40 characters tak ho"}
+    if not text or len(text) > 500:
+        return 400, {"ok": False, "error": "review 1 se 500 characters tak ho"}
+    low = (name + " " + text).lower()
+    if "http://" in low or "https://" in low or "www." in low:
+        return 400, {"ok": False, "error": "review me link nahi ho sakta"}
+    c = db()
+    prod = c.execute("SELECT id FROM products WHERE id=?", (product_id,)).fetchone()
+    c.close()
+    if not prod:
+        return 404, {"ok": False, "error": "product nahi mila"}
+    now = int(time.time())
+    c = db()
+    c.execute("INSERT INTO reviews(product_id, name, rating, text, created_at) VALUES(?,?,?,?,?)",
+              (product_id, name, rating, text, now))
+    c.commit(); c.close()
+    log.info("Review added: product %s, rating %s", product_id, rating)
+    return 200, {"ok": True, "review": {"product_id": product_id, "name": name,
+                                         "rating": rating, "text": text, "created_at": now}}
+
+
+def _sold_count(c, product_id):
+    """Real sold count: paid/delivered/pending-fulfillment orders jin me ye
+    product ho (single product_id ya cart items_json). Har order ek dafa
+    gina jata hai, chahe qty zyada ho."""
+    sold = 0
+    try:
+        rows = c.execute(
+            "SELECT product_id, items_json FROM orders "
+            "WHERE status IN ('zurva_processing','ahm7_pending','delivered')").fetchall()
+    except Exception:
+        return 0
+    for r in rows:
+        try:
+            if r["product_id"] == product_id:
+                sold += 1
+                continue
+            items = json.loads(r["items_json"] or "[]")
+            if isinstance(items, list) and any(
+                    isinstance(it, dict) and it.get("pid") == product_id for it in items):
+                sold += 1
+        except Exception:
+            continue
+    return sold
+
+
+def handle_get_reviews(product_id):
+    """GET /api/reviews/<product_id> — public read. Returns the product's
+    reviews (newest first) + real 'sold' count from the orders table."""
+    try:
+        product_id = int(product_id)
+    except Exception:
+        return 400, {"ok": False, "error": "product_id ghalat hai"}
+    c = db()
+    prod = c.execute("SELECT id FROM products WHERE id=?", (product_id,)).fetchone()
+    if not prod:
+        c.close()
+        return 404, {"ok": False, "error": "product nahi mila"}
+    rows = c.execute(
+        "SELECT name, rating, text, created_at FROM reviews "
+        "WHERE product_id=? ORDER BY id DESC LIMIT 50", (product_id,)).fetchall()
+    sold = _sold_count(c, product_id)
+    c.close()
+    return 200, {"ok": True, "product_id": product_id, "sold": sold,
+                 "reviews": [{"name": r["name"], "rating": r["rating"],
+                              "text": r["text"], "created_at": r["created_at"]} for r in rows]}
+
+
 def handle_order_status(code, token, headers=None, client_ip=""):
     """GET /api/order/<code>?token=... (Worker se aata hai). Returns
     (http_status, dict). Security: order code + delivery token dono chahiye.
@@ -2464,6 +2647,9 @@ def handle_web_checkout(data, headers=None):
     if not _web_auth(headers or {}):
         return 401, {"ok": False, "error": "unauthorized (WEB_API_SECRET ghalat ya set nahi)"}
     data = data or {}
+    log.info("Web checkout request: product_id=%s items=%s has_contact=%s",
+             data.get("product_id"), isinstance(data.get("items"), list),
+             bool(str(data.get("contact") or "").strip()))
     # --- Items normalize karo: cart [{product_id, qty}] ya single product_id.
     raw_items = data.get("items")
     lines = []
@@ -2516,20 +2702,30 @@ def handle_web_checkout(data, headers=None):
     oid = create_order(0, contact, [{"pid": ln["pid"], "qty": ln["qty"]} for ln in lines],
                        "zurvapay", f"Rs {total} via Zurvapay (web)", "zurvapay",
                        total, code, "", 0, channel="web")
-    c = db()
-    c.execute("UPDATE orders SET delivery_token=?, web_contact=? WHERE id=?", (token, contact, oid))
-    c.commit(); c.close()
     success_base = str(data.get("success_base") or "").strip().rstrip("/")
     if success_base not in ("https://retailshop.pages.dev", "https://retail-shop.online"):
         success_base = "https://retailshop.pages.dev"
+    c = db()
+    c.execute("UPDATE orders SET delivery_token=?, web_contact=?, success_base=? WHERE id=?",
+              (token, contact, success_base, oid))
+    c.commit(); c.close()
     order_url = f"{success_base}/order.html?code={code}&token={token}"
     details = f"RetailShop order {code} — " + ", ".join(labels)
+    # Zurvapay sirf approved domain (bot server) ki success/cancel URLs
+    # accept karta hai — site ka order-page URL yahan NAHI dena, warna
+    # "domain not allowed" error aata hai. Bot-server handler phir 302 se
+    # customer ko order page pe bhej deta hai (code + token DB se).
+    zp_base = _zurvapay_public_base()
+    zp_success = f"{zp_base}/zurvapay/success?code={code}" if zp_base else None
+    zp_cancel = f"{zp_base}/zurvapay/cancel?code={code}" if zp_base else None
     url, err = zurvapay_initiate(code, total, details[:200],
                                  "RetailShop Customer", "",
-                                 success_url=order_url, cancel_url=order_url)
+                                 success_url=zp_success, cancel_url=zp_cancel)
     if err:
+        log.warning("Web checkout %s: Zurvapay initiate failed: %s", code, err)
         return 502, {"ok": False, "error": f"Payment start nahi ho saki: {err}",
                      "order_code": code, "delivery_token": token, "order_url": order_url}
+    log.info("Web checkout %s: total Rs %s, checkout_url ok", code, total)
     return 200, {"ok": True, "checkout_url": url, "order_code": code,
                  "delivery_token": token, "order_url": order_url}
 

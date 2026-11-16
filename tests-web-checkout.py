@@ -14,6 +14,7 @@ for f in ("/tmp/test-shop.db", "/tmp/test-shop.db-wal", "/tmp/test-shop.db-shm")
 
 sys.path.insert(0, "/home/hatch/workspace/telegram-shop-bot")
 import bot
+bot.PUBLIC_BASE_URL = "http://node19.botkeep.cloud:61495"  # prod value, for URL assertions
 
 PASS, FAIL = [], []
 def check(name, cond, extra=""):
@@ -92,9 +93,11 @@ check("checkout: order_url has code+token",
       out.get("order_url", "").startswith("https://retailshop.pages.dev/order.html?code=")
       and f"code={code}" in out.get("order_url", "") and f"token={tok}" in out.get("order_url", ""),
       f"got {out.get('order_url')!r}")
-check("checkout: success_url/cancel_url = order page",
-      (init_args.get("success_url") or "").startswith("https://retailshop.pages.dev/order.html?code=")
-      and init_args.get("cancel_url") == init_args.get("success_url"),
+check("checkout: success_url/cancel_url = bot-server URLs (approved domain, ?code=)",
+      (init_args.get("success_url") or "").startswith("http://node19.botkeep.cloud:61495/zurvapay/success?code=")
+      and (init_args.get("cancel_url") or "").startswith("http://node19.botkeep.cloud:61495/zurvapay/cancel?code=")
+      and "retailshop.pages.dev" not in (init_args.get("success_url") or "")
+      and f"code={code}" in (init_args.get("success_url") or ""),
       f"got {init_args}")
 c = bot.db()
 o = c.execute("SELECT * FROM orders WHERE code=?", (code,)).fetchone()
@@ -110,6 +113,18 @@ c.close()
 # contact optional: checkout with no contact at all must also work
 s2, out2 = bot.handle_web_checkout({"product_id": gem_pid}, H)
 check("checkout: no contact field still works", s2 == 200 and out2.get("order_code"), f"got {s2} {out2}")
+
+# ---------- 4b. Zurvapay redirect targets (bot-server -> order page) ----------
+tgt = bot.zurvapay_redirect_target("success", code)
+check("redirect: success -> order page with code+token",
+      tgt == f"https://retailshop.pages.dev/order.html?code={code}&token={tok}", f"got {tgt}")
+tgt = bot.zurvapay_redirect_target("cancel", code)
+check("redirect: cancel -> order page too",
+      tgt == f"https://retailshop.pages.dev/order.html?code={code}&token={tok}", f"got {tgt}")
+check("redirect: unknown code -> shop home",
+      bot.zurvapay_redirect_target("success", "RS-000000") == "https://retailshop.pages.dev/")
+check("redirect: empty code -> shop home",
+      bot.zurvapay_redirect_target("success", "") == "https://retailshop.pages.dev/")
 
 # ---------- 5. margin guard (Bolt = loss) ----------
 bolt_pid = pid_by_name("Bolt .new Pro 1 Month")
@@ -299,6 +314,32 @@ check("cart retry: no re-buy of delivered line, still pending on Bolt",
       ok is False and calls["place"] == 0, f"ok={ok} msg={msg} calls={calls['place']}")
 bot.ahm7_place_order = real_place
 
+# ---------- 14. reviews (real, no fakes) ----------
+s, out = bot.handle_submit_review({"product_id": gem_pid, "name": "Ali", "rating": 5, "text": "Bohat acha, instant delivery!"}, H, "5.5.5.5")
+check("review: happy path 200", s == 200 and out.get("ok") is True, f"got {s} {out}")
+s, out = bot.handle_submit_review({"product_id": gem_pid, "name": "Ali", "rating": 5, "text": "x"}, {"X-Web-Secret": "wrong"}, "5.5.5.5")
+check("review: wrong secret -> 401", s == 401, f"got {s} {out}")
+s, out = bot.handle_submit_review({"product_id": gem_pid, "name": "Ali", "rating": 6, "text": "x"}, H, "5.5.5.6")
+check("review: rating 6 -> 400", s == 400, f"got {s} {out}")
+s, out = bot.handle_submit_review({"product_id": gem_pid, "name": "Ali", "rating": 5, "text": "see https://spam.example"}, H, "5.5.5.7")
+check("review: link in text -> 400", s == 400, f"got {s} {out}")
+s, out = bot.handle_submit_review({"product_id": gem_pid, "name": "Ali", "rating": 5, "text": "x" * 501}, H, "5.5.5.8")
+check("review: 501 chars -> 400", s == 400, f"got {s} {out}")
+s, out = bot.handle_submit_review({"product_id": 99999, "name": "Ali", "rating": 5, "text": "ok"}, H, "5.5.5.9")
+check("review: unknown product -> 404", s == 404, f"got {s} {out}")
+s, out = bot.handle_get_reviews(gem_pid)
+# sold for Gemini here: delivered gem order (1) + delivered cart (1) +
+# ahm7_pending cart2 (1) + ahm7_pending IPN order (1) = 4 real orders.
+check("reviews GET: 1 review, sold counts real orders",
+      s == 200 and len(out.get("reviews", [])) == 1 and out.get("sold") == 4, f"got {s} {out}")
+s, out = bot.handle_get_reviews(99999)
+check("reviews GET: unknown product -> 404", s == 404, f"got {s} {out}")
+# rate limit: 5/hour per IP
+for i in range(5):
+    bot.handle_submit_review({"product_id": gem_pid, "name": "R", "rating": 4, "text": f"ok {i}"}, H, "6.6.6.6")
+s, out = bot.handle_submit_review({"product_id": gem_pid, "name": "R", "rating": 4, "text": "one more"}, H, "6.6.6.6")
+check("review: 6th in an hour -> 429", s == 429, f"got {s} {out}")
+
 # ---------- 12. HTTP layer (real health server) ----------
 bot.zurvapay_initiate = real_initiate
 bot.ahm7_place_order = real_place
@@ -341,8 +382,25 @@ try:
         check("HTTP: GET /api/order wrong token -> 404", r.status_code == 404, f"got {r.status_code}")
         r = rq.get(f"http://127.0.0.1:18099/api/order/{http_code}?token={http_tok}", timeout=5)
         check("HTTP: GET /api/order no secret -> 404", r.status_code == 404, f"got {r.status_code}")
+        r = rq.get(f"http://127.0.0.1:18099/zurvapay/success?code={http_code}", allow_redirects=False, timeout=5)
+        check("HTTP: GET /zurvapay/success -> 302 to order page",
+              r.status_code == 302 and r.headers.get("Location", "").startswith("https://retailshop.pages.dev/order.html?code="),
+              f"got {r.status_code} {r.headers.get('Location')}")
     else:
         check("HTTP: order status checks (skipped — no code/token)", False, "no http_code/http_tok")
+    r = rq.get("http://127.0.0.1:18099/zurvapay/cancel?code=RS-000000", allow_redirects=False, timeout=5)
+    check("HTTP: GET /zurvapay/cancel unknown code -> 302 home",
+          r.status_code == 302 and r.headers.get("Location") == "https://retailshop.pages.dev/",
+          f"got {r.status_code} {r.headers.get('Location')}")
+    r = rq.post("http://127.0.0.1:18099/api/review",
+                json={"product_id": gem_pid, "name": "HTTP", "rating": 5, "text": "http test"},
+                headers={"X-Web-Secret": "test-secret-123"}, timeout=5)
+    check("HTTP: POST /api/review -> 200", r.status_code == 200 and r.json().get("ok") is True,
+          f"got {r.status_code} {r.text[:120]}")
+    r = rq.get(f"http://127.0.0.1:18099/api/reviews/{gem_pid}", timeout=5)
+    check("HTTP: GET /api/reviews/:id -> 200 with reviews",
+          r.status_code == 200 and len(r.json().get("reviews", [])) >= 1,
+          f"got {r.status_code} {r.text[:160]}")
 except Exception as e:
     check("HTTP layer reachable", False, str(e))
 
