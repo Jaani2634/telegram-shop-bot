@@ -3,9 +3,13 @@ Telegram Shop Bot - Digital Accounts Seller
 Junaid ke liye - Manual (JazzCash/Easypaisa) + USDT (TRC20) dono
 
 Flow:
- Buyer: /start -> channel gate -> Products -> quantity -> terms -> summary
-   -> payment (PKR manual / USDT TRC20 / wallet) -> proof -> admin approve
-   / USDT auto-verify -> auto delivery
+ Buyer: /start -> channel gate -> Products -> product detail
+   (quantity + / - + terms + I Agree, sab ek screen pe) -> order summary
+   -> payment (Zurvapay 1st / Easypaisa 2nd / JazzCash 3rd / USDT 4th /
+   wallet) -> proof -> admin approve / USDT auto-verify -> auto delivery
+ Language: per-user Roman Urdu (default) ya English — main menu se
+   "🌐 Language / زبان" se badlo. Products products.csv se startup pe
+   auto-sync hote hain (prices + naye products).
  Features: cart, wallet + deposits + top-up codes, first-order coupon (7%),
  categories + pagination + search, reviews, giveaways + referrals,
  support inbox, bulk discounts, mail-type delivery (Muse tokens).
@@ -18,6 +22,7 @@ Run: pip install -r requirements.txt && python bot.py
 
 import os
 import io
+import csv
 import json
 import random
 import sqlite3
@@ -122,6 +127,38 @@ def _add_col(c, table, col, ddl):
     cols = [r[1] for r in c.execute(f"PRAGMA table_info({table})").fetchall()]
     if col not in cols:
         c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
+
+def _sync_products_from_csv(c):
+    """products.csv (bot.py ke saath wali directory) se products upsert karo:
+    naam se match karke price_pkr/price_usdt/description UPDATE, naye INSERT.
+    Stock aur active flags ko haath nahi lagata. CSV na mile to skip."""
+    csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "products.csv")
+    if not os.path.isfile(csv_path):
+        return
+    added = updated = 0
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            name = (row.get("name") or "").strip()
+            if not name:
+                continue
+            try:
+                pkr = int(float((row.get("price_pkr") or "0").strip()))
+                usdt = float((row.get("price_usdt") or "0").strip())
+            except ValueError:
+                continue
+            desc = (row.get("description") or "").strip()
+            cur = c.execute("SELECT id, price_pkr, price_usdt, description FROM products WHERE name=?", (name,)).fetchone()
+            if cur:
+                if cur["price_pkr"] != pkr or cur["price_usdt"] != usdt or (cur["description"] or "") != desc:
+                    c.execute("UPDATE products SET description=?, price_pkr=?, price_usdt=? WHERE id=?",
+                              (desc, pkr, usdt, cur["id"]))
+                    updated += 1
+            else:
+                c.execute("INSERT INTO products(name,description,price_pkr,price_usdt) VALUES(?,?,?,?)",
+                          (name, desc, pkr, usdt))
+                added += 1
+    if added or updated:
+        log.info("products.csv sync: %d added, %d updated", added, updated)
 
 def init_db():
     c = db()
@@ -246,6 +283,10 @@ def init_db():
         direction TEXT DEFAULT 'user',
         created_at TEXT
     );
+    CREATE TABLE IF NOT EXISTS user_prefs(
+        user_id INTEGER PRIMARY KEY,
+        lang TEXT DEFAULT 'ur'
+    );
     """)
     defaults = {
         "jazzcash_number": os.getenv("JAZZCASH_NUMBER", "03XX-XXXXXXX"),
@@ -293,6 +334,13 @@ def init_db():
             c.execute("UPDATE products SET description=? WHERE id=?", (short_desc, row["id"]))
         if (not (row["terms"] or "").strip()) and terms:
             c.execute("UPDATE products SET terms=? WHERE id=?", (terms, row["id"]))
+    # products.csv se auto-sync (16 Nov 2026): har restart pe CSV ki prices
+    # aur naye products DB me aa jate hain — stock/active flags ko haath
+    # nahi lagata. CSV na mile to khamoshi se skip (crash nahi hota).
+    try:
+        _sync_products_from_csv(c)
+    except Exception:
+        log.exception("products.csv sync failed (skipping)")
     c.commit(); c.close()
 
 # Products from Junaid's screenshots (11 Nov 2026). USDT at 280 PKR.
@@ -512,6 +560,409 @@ def stock_count(product_id):
 def is_admin(uid):
     return ADMIN_ID != 0 and uid == ADMIN_ID
 
+# ---------- Language (Roman Urdu default, English optional) ----------
+
+def get_lang(uid):
+    """User ki language: 'ur' (Roman Urdu, default) ya 'en' (English)."""
+    try:
+        c = db(); r = c.execute("SELECT lang FROM user_prefs WHERE user_id=?", (uid,)).fetchone(); c.close()
+        return r["lang"] if r and r["lang"] in ("ur", "en") else "ur"
+    except Exception:
+        return "ur"
+
+def set_lang(uid, lang):
+    if lang not in ("ur", "en"):
+        lang = "ur"
+    c = db()
+    c.execute("INSERT INTO user_prefs(user_id,lang) VALUES(?,?) "
+              "ON CONFLICT(user_id) DO UPDATE SET lang=excluded.lang", (uid, lang))
+    c.commit(); c.close()
+
+def t(uid, key, **kw):
+    """Customer-facing string user ki language me. Roman Urdu ('ur') text
+    bilkul waisa hi hai jaisa pehle tha; 'en' uska English tarjuma hai."""
+    lang = get_lang(uid) if isinstance(uid, int) else "ur"
+    s = STRINGS.get(lang, {}).get(key)
+    if s is None:
+        s = STRINGS["ur"].get(key, key)
+    if kw:
+        try:
+            return s.format(**kw)
+        except Exception:
+            return s
+    return s
+
+# Customer-facing strings: 'ur' = Roman Urdu (pehle wala text, bilkul
+# waisa hi), 'en' = English. Admin commands/messages Roman Urdu me hi
+# rehte hain (admin = owner). Product ke terms/descriptions data hain,
+# is liye wo translate nahi hote.
+STRINGS = {
+"ur": {
+    # Main menu
+    "menu_welcome": "👋 Welcome to RetailShop!",
+    "menu_currency": "💱 Currency: {cur}",
+    "menu_coupon": "🎁 First Order Coupon: {code} — {pct}% off your first order! (Checkout pe apply karein)",
+    "menu_choose": "Neeche se choose karein:",
+    "menu_lang_btn": "🌐 Language / زبان",
+    # Language menu
+    "lang_title": "🌐 Language / زبان\n\nApni language choose karein:",
+    "lang_set": "✅ Language {name} set ho gayi.",
+    # Products list
+    "prod_choose": "🛍️ Products — koi ek choose karein:  (Page {page}/{total})",
+    "prod_prev": "⬅ Prev",
+    "prod_next": "Next ➡",
+    "prod_cart": "🛒 View Cart",
+    "prod_refresh": "🔄 Refresh Stock",
+    "prod_search": "🔍 Search Products",
+    "prod_request": "📝 Request Products",
+    "prod_back_menu": "⬅ Main Menu",
+    "prod_stock": "Stock: {n}",
+    "prod_out_stock": "Out of Stock",
+    # Product detail
+    "prod_not_found": "Product nahi mila.",
+    "prod_no_reviews": "⭐ No reviews yet",
+    "prod_reviews": "⭐ {avg} ({n} reviews)",
+    "prod_get_free": "🎁 Get Free",
+    "prod_price": "💰 Price: {price}",
+    "prod_bulk": "💸 Bulk discounts: {tiers}",
+    "prod_qty_line": "{qty} × {price}",
+    "prod_custom_qty": "🔢 Custom Quantity",
+    "prod_agree": "✅ I Agree — Continue to Payment",
+    "prod_add_cart": "🛒 Add to Cart",
+    "prod_reviews_btn": "⭐ Reviews",
+    "prod_back_products": "⬅ Back to Products",
+    "prod_oos_msg": "❌ Is product ka stock khatam hai. Dusra product choose karein.",
+    "prod_oos_alert": "Out of stock hai.",
+    "prod_oos_note": "🔴 Out of Stock — ye product abhi available nahi hai. Stock aate hi wapas milega.",
+    "prod_qty_info": "Quantity: {qty} — Total: {total}",
+    # Quantity
+    "qty_prompt": "🔢 Quantity kitni chahiye? Number bhejein (1–99):",
+    "qty_only_stock": "Sirf {n} stock hai.",
+    "qty_number_only": "Sirf number bhejein (1–99):",
+    "qty_range": "Quantity 1 se 99 ke beech honi chahiye.",
+    # Terms
+    "terms_title": "📜 Terms & Conditions",
+    # Summary
+    "sum_line": "• {name} × {qty} — {line} ({unit} each)",
+    "sum_subtotal": "Subtotal: {amount}",
+    "sum_coupon": "Coupon {code} (-{pct}%): -{amount}",
+    "sum_total": "Total: {amount}",
+    "sum_wallet": "👛 Wallet balance: Rs {pkr} | ${usdt} USDT",
+    "sum_coupon_btn": "🎟️ Apply Coupon Code",
+    "sum_pay_zurva": "💳 Pay with Zurvapay",
+    "sum_pay_easypaisa": "📱 Easypaisa",
+    "sum_pay_jazzcash": "📱 JazzCash",
+    "sum_pay_usdt": "₮ USDT (TRC20)",
+    "sum_pay_wallet": "👛 Pay from Wallet",
+    "sum_change_qty": "🔢 Change Quantity",
+    "sum_cancel": "❌ Cancel",
+    "sum_expired": "Session expire ho gayi. /start se dobara karein.",
+    # Payment
+    "pay_zurva_only_pkr": "⚡ Zurvapay sirf PKR deposits ke liye hai. USDT ke liye USDT option use karein.",
+    "pay_zurva_fail_dep": "⚠️ Zurvapay payment start nahi ho saki: {err}\nDeposit #{id} pending hai — dobara try karein ya admin se rabta karein.",
+    "pay_zurva_fail_order": "⚠️ Zurvapay payment start nahi ho saki: {err}\nOrder #{oid} ({code}) pending hai — dobara try karein ya admin se rabta karein.",
+    "pay_zurva_paynow": "💳 Pay Now — JazzCash / Easypaisa / Raast QR",
+    "pay_zurva_dep": "⚡ Zurvapay Deposit\n\nAmount: Rs {amount}\nDeposit #{id}\n\nNeeche button se payment karein — JazzCash, Easypaisa ya Raast QR. Payment confirm hote hi wallet auto credit ho jayega.",
+    "pay_manual_dep": "💚 {label} Deposit\n\nAmount: {amount} {currency}\n\nSend to:\nNumber: `{num}`\nName: {name}\n\nPayment karke **Transaction ID (TID)** yahan bhejein, ya screenshot bhejein.\nAdmin approve karte hi wallet credit ho jayega.",
+    "pay_usdt_dep": "🪙 USDT (TRC20) Deposit\n\nAmount: **${amount} USDT**\n\nSend to (TRC20 only):\n`{addr}`\n\nPayment karke **Transaction Hash** yahan bhejein. Bot khud verify karega.",
+    "pay_zurva_order": "⚡ Zurvapay Payment\n\nProduct: {label}\nAmount: Rs {total}\nOrder #{oid} ({code})\n\nNeeche button se payment karein — JazzCash, Easypaisa ya Raast QR. Payment confirm hote hi account isi chat me auto deliver ho jayega.",
+    "pay_manual_order": "💚 {label} Payment\n\nProduct: {label2}\nAmount: Rs {total}\n\nSend to:\nNumber: `{num}`\nName: {name}\n\nPayment karke **Transaction ID (TID)** yahan bhejein, ya screenshot bhejein.\nAdmin approve karte hi account auto deliver ho jayega.",
+    "pay_usdt_order": "🪙 USDT (TRC20) Payment\n\nProduct: {label}\nAmount: **${amount} USDT**\n\nSend to (TRC20 only):\n`{addr}`\n\nPayment karke **Transaction Hash** yahan bhejein. Bot khud verify karega, phir account auto deliver ho jayega.",
+    "pay_pkr_title": "💳 Pay via PKR — Total: Rs {total}\n\nMethod choose karein:",
+    # Order status
+    "status_pending": "⏳ PAID — admin review",
+    "status_delivered": "✅ DELIVERED",
+    "status_rejected": "❌ CANCELLED",
+    "status_oos": "❌ CANCELLED (stock khatam)",
+    # My Orders
+    "orders_none": "📦 Aapki koi order nahi hai.",
+    "orders_title": "📦 My Orders — detail ke liye order pe tap karein:",
+    "order_not_found": "Order nahi mili.",
+    "order_buy_again": "🔁 Buy Again",
+    "order_write_review": "⭐ Write Review",
+    "order_back": "⬅ My Orders",
+    # Wallet
+    "wallet_deposit": "💰 Deposit",
+    "wallet_topup": "🎟️ Redeem Top-up Code",
+    "wallet_stmt": "📄 Wallet Statement",
+    "wallet_stmt_none": "Koi entry nahi hai.",
+    "wallet_stmt_dl": "⬇️ Download Statement (.txt)",
+    "wallet_stmt_caption": "📄 Aapki wallet statement.",
+    # Deposit
+    "dep_title": "💰 Deposit\n\nCurrency choose karein (minimum amount 1):",
+    "dep_pkr": "💚 Deposit in PKR",
+    "dep_usdt": "🪙 Deposit in USDT",
+    "dep_back_wallet": "⬅ Wallet",
+    "dep_amount": "💰 Deposit ({cur})\n\nAmount bhejein — minimum 1 {cur}:",
+    "dep_method_pkr": "💰 Deposit Rs {amount} — payment method choose karein:",
+    "dep_method_usdt": "💰 Deposit ${amount} USDT — payment method choose karein:",
+    "dep_back": "⬅ Back",
+    # Help
+    "help_text": ("❓ Help — Kaise khareedein?\n\n"
+        "1️⃣ Products kholein, category ya search se product choose karein.\n"
+        "2️⃣ Product page pe quantity choose karein (bulk discount ho to kam price milegi).\n"
+        "3️⃣ Terms & Conditions parh ke I Agree dabayein.\n"
+        "4️⃣ Order Summary check karein — coupon ho to Apply Coupon Code dabayein.\n"
+        "5️⃣ Payment karein: Easypaisa / JazzCash (TID ya screenshot bhejein), USDT TRC20 (TX hash bhejein), ya Zurvapay se JazzCash/Easypaisa/Raast QR — auto verify, account khud aa jayega. Wallet balance ho to Pay from Wallet bhi kar sakte hain.\n"
+        "6️⃣ Admin verify karte hi account isi chat me auto deliver ho jayega.\n\n"
+        "💰 Wallet me Deposit karke bhi pay kar sakte hain.\n"
+        "🎁 Pehli order pe FIRST-ORDER coupon se 7% off!"),
+    # Support
+    "support_title": "💬 Support\n\nKoi issue ho — payment, account kaam na kare, ya order na mile — to neeche se admin ko message bhejein.",
+    "support_send": "✉️ Send Message to Admin",
+    "support_tg": "💬 Message Admin (Telegram)",
+    "support_prompt": "✉️ Apna message likhein — admin ko forward kar dunga.\n\n(Cancel ke liye /cancel likhein)",
+    "support_sent": "✅ Aapka message admin ko bhej diya gaya hai. Jawab isi chat me aayega.",
+    # Giveaways
+    "giv_share": "Apna link share karein — jab aapka dost channel join karke pehli order complete karega, referral verified hoga.\n",
+    "giv_mandatory": "\n⚠️ Mandatory: hamara Telegram channel @retail_shop_official aur WhatsApp channel join karna zaroori hai.",
+    "giv_verify_btn": "✅ I Have Joined (Verify Membership)",
+    # Channels / Join Us
+    "channels_title": "📢 Hamare Channels\n\nTelegram channel join karna zaroori hai — bot khud check karta hai.\nWhatsApp channel pe naye products aur offers milte hain.",
+    "joinus_title": "🤝 Join Us\n\nHamare channels join karein — naye products, offers aur giveaways sabse pehle yahin milte hain.",
+    # Channel gate
+    "gate_join_tg": "🔒 Pehle hamara Telegram channel join karein, phir products dikhenge.\n\nChannel join karein, phir neeche **Check Join Status** dabayein.",
+    "gate_check_fail": "⚠️ Channel check nahi ho saka. Admin ne bot ko Telegram channel me admin nahi banaya hoga. Thodi der me dobara /start karein.",
+    "gate_join_wa": "💬 Hamara WhatsApp channel bhi join kar lein — wahan naye products aur offers aate hain.\n\nJoin karke neeche **Maine Join Kar Liya** dabayein.",
+    "gate_joined_tg": "✅ Telegram channel joined! Ab WhatsApp channel bhi join kar lein.",
+    "gate_thanks": "✅ Shukriya! ",
+    # Cart
+    "cart_empty": "🛒 Your Cart khaali hai.",
+    "cart_added": "🛒 Cart me add ho gaya!",
+    "cart_empty_alert": "Cart khaali hai.",
+    "cart_stock_alert": "{name} ka sirf {n} stock hai.",
+    "cart_checkout": "✅ Checkout",
+    "cart_clear": "🧹 Clear Cart",
+    "cart_continue": "🛍️ Continue Shopping",
+    # Reviews
+    "rev_only_delivered": "Review sirf delivered order pe likhi ja sakti hai.",
+    "rev_rating": "⭐ Rating: {rating}/5\n\nAb apni review likhein (text bhejein):",
+    "rev_saved": "✅ Shukriya! Aapki review save ho gayi.",
+    # Search / Request
+    "search_prompt": "🔍 Product search karein — keyword bhejein (jaise 'muse' ya 'capcut'):",
+    "search_none": "🔍 '{kw}' — koi product nahi mila.",
+    "req_prompt": "📝 Konsa product chahiye? Naam + details bhejein — admin ko forward kar dunga:",
+    "req_sent": "✅ Aapki request admin ko bhej di gayi hai. Shukriya!",
+    # Coupon
+    "coupon_prompt": "🎟️ Coupon code bhejein (jaise FIRST-ORDER):",
+    "coupon_applied": "✅ Coupon {code} apply ho gaya! {pct}% off — summary dobara dikha raha hun...",
+    "coupon_wrong": "Ye coupon code galat hai.",
+    "coupon_not_yours": "Aapke paas ye coupon nahi hai.",
+    "coupon_used": "Ye coupon use ho chuka hai.",
+    "coupon_first_only": "Ye coupon sirf pehli order ke liye hai.",
+    # Proof / buy
+    "buy_free": "🎁 FREE product! Order #{oid} — account abhi bhej raha hun...",
+    "buy_order_received": "✅ Order #{oid} ({code}) mil gayi! Admin verify kar raha hai. Approve hote hi account isi chat me aa jayega.",
+    "buy_hash_short": "Ye hash lagta nahi. Poora Transaction Hash bhejein (TronScan link se copy karein).",
+    "buy_usdt_verified": "✅ USDT verified! {reason}\nOrder #{oid} ({code}) — account abhi bhej raha hun...",
+    "buy_usdt_fail": "⚠️ Auto-verify nahi hui: {reason}\nOrder #{oid} ({code}) admin ko bhej di hai — wo manually check karke deliver karega.",
+    "buy_wallet_paid": "✅ Wallet se payment ho gayi! Order #{oid} — account abhi bhej raha hun...",
+    "buy_wallet_refund": "⚠️ Delivery nahi ho saki (stock khatam) — wallet refund kar diya gaya hai.",
+    "buy_wallet_low": "Wallet balance kam hai. Pehle Deposit karein.",
+    # Deposit proof
+    "dep_received": "✅ Deposit #{id} mil gayi! Admin verify kar raha hai. Approve hote hi wallet credit ho jayega.",
+    "dep_usdt_verified": "✅ USDT verified! {reason}\nDeposit #{id} — {amount} {currency} aapke wallet me add ho gaye.",
+    "dep_usdt_fail": "⚠️ Auto-verify nahi hui: {reason}\nDeposit #{id} admin ko bhej di hai — wo manually check karke credit karega.",
+    # Top-up
+    "topup_prompt": "🎟️ Top-up code bhejein:",
+    "topup_wrong": "❌ Ye top-up code galat hai.",
+    "topup_used": "❌ Ye code pehle hi use ho chuka hai.",
+    "topup_ok": "✅ Top-up successful! {amount} {currency} aapke wallet me add ho gaye.",
+    # Misc
+    "misc_expired": "Session expire ho gayi. /start se dobara karein.",
+    "misc_only_number": "Sirf number bhejein (jaise 500):",
+    "misc_min_deposit": "Minimum deposit 1 hai. Dobara amount bhejein:",
+    "misc_giv_verified": "✅ Verified! Aap giveaways ke liye eligible hain.",
+    "misc_giv_check_fail": "Check nahi ho saka — thodi der me dobara try karein.",
+    "misc_giv_join_first": "Pehle Telegram channel join karein, phir verify dabayein.",
+    "misc_join_check": "Abhi join nahi hua — pehle channel join karein, phir dobara check karein.",
+    "misc_join_check_fail": "Check nahi ho saka — bot channel me admin nahi hai.",
+},
+"en": {
+    # Main menu
+    "menu_welcome": "👋 Welcome to RetailShop!",
+    "menu_currency": "💱 Currency: {cur}",
+    "menu_coupon": "🎁 First Order Coupon: {code} — {pct}% off your first order! (Apply it at checkout)",
+    "menu_choose": "Choose below:",
+    "menu_lang_btn": "🌐 Language / زبان",
+    # Language menu
+    "lang_title": "🌐 Language\n\nChoose your language:",
+    "lang_set": "✅ Language set to {name}.",
+    # Products list
+    "prod_choose": "🛍️ Products — choose one:  (Page {page}/{total})",
+    "prod_prev": "⬅ Prev",
+    "prod_next": "Next ➡",
+    "prod_cart": "🛒 View Cart",
+    "prod_refresh": "🔄 Refresh Stock",
+    "prod_search": "🔍 Search Products",
+    "prod_request": "📝 Request Products",
+    "prod_back_menu": "⬅ Main Menu",
+    "prod_stock": "Stock: {n}",
+    "prod_out_stock": "Out of Stock",
+    # Product detail
+    "prod_not_found": "Product not found.",
+    "prod_no_reviews": "⭐ No reviews yet",
+    "prod_reviews": "⭐ {avg} ({n} reviews)",
+    "prod_get_free": "🎁 Get Free",
+    "prod_price": "💰 Price: {price}",
+    "prod_bulk": "💸 Bulk discounts: {tiers}",
+    "prod_qty_line": "{qty} × {price}",
+    "prod_custom_qty": "🔢 Custom Quantity",
+    "prod_agree": "✅ I Agree — Continue to Payment",
+    "prod_add_cart": "🛒 Add to Cart",
+    "prod_reviews_btn": "⭐ Reviews",
+    "prod_back_products": "⬅ Back to Products",
+    "prod_oos_msg": "❌ This product is out of stock. Please choose another product.",
+    "prod_oos_alert": "This product is out of stock.",
+    "prod_oos_note": "🔴 Out of Stock — this product is not available right now. It will be back once restocked.",
+    "prod_qty_info": "Quantity: {qty} — Total: {total}",
+    # Quantity
+    "qty_prompt": "🔢 How many do you want? Send a number (1–99):",
+    "qty_only_stock": "Only {n} in stock.",
+    "qty_number_only": "Please send only a number (1–99):",
+    "qty_range": "Quantity must be between 1 and 99.",
+    # Terms
+    "terms_title": "📜 Terms & Conditions",
+    # Summary
+    "sum_line": "• {name} × {qty} — {line} ({unit} each)",
+    "sum_subtotal": "Subtotal: {amount}",
+    "sum_coupon": "Coupon {code} (-{pct}%): -{amount}",
+    "sum_total": "Total: {amount}",
+    "sum_wallet": "👛 Wallet balance: Rs {pkr} | ${usdt} USDT",
+    "sum_coupon_btn": "🎟️ Apply Coupon Code",
+    "sum_pay_zurva": "💳 Pay with Zurvapay",
+    "sum_pay_easypaisa": "📱 Easypaisa",
+    "sum_pay_jazzcash": "📱 JazzCash",
+    "sum_pay_usdt": "₮ USDT (TRC20)",
+    "sum_pay_wallet": "👛 Pay from Wallet",
+    "sum_change_qty": "🔢 Change Quantity",
+    "sum_cancel": "❌ Cancel",
+    "sum_expired": "Session expired. Please start again with /start.",
+    # Payment
+    "pay_zurva_only_pkr": "⚡ Zurvapay is only for PKR deposits. For USDT, please use the USDT option.",
+    "pay_zurva_fail_dep": "⚠️ Zurvapay payment could not be started: {err}\nDeposit #{id} is pending — please try again or contact the admin.",
+    "pay_zurva_fail_order": "⚠️ Zurvapay payment could not be started: {err}\nOrder #{oid} ({code}) is pending — please try again or contact the admin.",
+    "pay_zurva_paynow": "💳 Pay Now — JazzCash / Easypaisa / Raast QR",
+    "pay_zurva_dep": "⚡ Zurvapay Deposit\n\nAmount: Rs {amount}\nDeposit #{id}\n\nPay using the button below — JazzCash, Easypaisa or Raast QR. Your wallet will be credited automatically once the payment is confirmed.",
+    "pay_manual_dep": "💚 {label} Deposit\n\nAmount: {amount} {currency}\n\nSend to:\nNumber: `{num}`\nName: {name}\n\nAfter payment, send the **Transaction ID (TID)** here, or send a screenshot.\nYour wallet will be credited once the admin approves it.",
+    "pay_usdt_dep": "🪙 USDT (TRC20) Deposit\n\nAmount: **${amount} USDT**\n\nSend to (TRC20 only):\n`{addr}`\n\nAfter payment, send the **Transaction Hash** here. The bot will verify it automatically.",
+    "pay_zurva_order": "⚡ Zurvapay Payment\n\nProduct: {label}\nAmount: Rs {total}\nOrder #{oid} ({code})\n\nPay using the button below — JazzCash, Easypaisa or Raast QR. Your account will be delivered automatically in this chat once the payment is confirmed.",
+    "pay_manual_order": "💚 {label} Payment\n\nProduct: {label2}\nAmount: Rs {total}\n\nSend to:\nNumber: `{num}`\nName: {name}\n\nAfter payment, send the **Transaction ID (TID)** here, or send a screenshot.\nYour account will be delivered automatically once the admin approves it.",
+    "pay_usdt_order": "🪙 USDT (TRC20) Payment\n\nProduct: {label}\nAmount: **${amount} USDT**\n\nSend to (TRC20 only):\n`{addr}`\n\nAfter payment, send the **Transaction Hash** here. The bot will verify it, then your account will be delivered automatically.",
+    "pay_pkr_title": "💳 Pay via PKR — Total: Rs {total}\n\nChoose a method:",
+    # Order status
+    "status_pending": "⏳ PAID — admin review",
+    "status_delivered": "✅ DELIVERED",
+    "status_rejected": "❌ CANCELLED",
+    "status_oos": "❌ CANCELLED (out of stock)",
+    # My Orders
+    "orders_none": "📦 You have no orders.",
+    "orders_title": "📦 My Orders — tap an order for details:",
+    "order_not_found": "Order not found.",
+    "order_buy_again": "🔁 Buy Again",
+    "order_write_review": "⭐ Write Review",
+    "order_back": "⬅ My Orders",
+    # Wallet
+    "wallet_deposit": "💰 Deposit",
+    "wallet_topup": "🎟️ Redeem Top-up Code",
+    "wallet_stmt": "📄 Wallet Statement",
+    "wallet_stmt_none": "No entries yet.",
+    "wallet_stmt_dl": "⬇️ Download Statement (.txt)",
+    "wallet_stmt_caption": "📄 Your wallet statement.",
+    # Deposit
+    "dep_title": "💰 Deposit\n\nChoose a currency (minimum amount 1):",
+    "dep_pkr": "💚 Deposit in PKR",
+    "dep_usdt": "🪙 Deposit in USDT",
+    "dep_back_wallet": "⬅ Wallet",
+    "dep_amount": "💰 Deposit ({cur})\n\nSend the amount — minimum 1 {cur}:",
+    "dep_method_pkr": "💰 Deposit Rs {amount} — choose a payment method:",
+    "dep_method_usdt": "💰 Deposit ${amount} USDT — choose a payment method:",
+    "dep_back": "⬅ Back",
+    # Help
+    "help_text": ("❓ Help — How to buy?\n\n"
+        "1️⃣ Open Products, choose a product by category or search.\n"
+        "2️⃣ Choose the quantity on the product page (bulk discounts give a lower price).\n"
+        "3️⃣ Read the Terms & Conditions and tap I Agree.\n"
+        "4️⃣ Check the Order Summary — tap Apply Coupon Code if you have one.\n"
+        "5️⃣ Pay: Easypaisa / JazzCash (send TID or screenshot), USDT TRC20 (send TX hash), or Zurvapay (JazzCash/Easypaisa/Raast QR) — auto-verified, your account arrives by itself. If you have wallet balance, you can also Pay from Wallet.\n"
+        "6️⃣ Once the admin verifies it, your account is delivered automatically in this chat.\n\n"
+        "💰 You can also pay by depositing into your Wallet.\n"
+        "🎁 Get 7% off your first order with the FIRST-ORDER coupon!"),
+    # Support
+    "support_title": "💬 Support\n\nIf you have any issue — payment, an account that doesn't work, or an order that didn't arrive — send a message to the admin below.",
+    "support_send": "✉️ Send Message to Admin",
+    "support_tg": "💬 Message Admin (Telegram)",
+    "support_prompt": "✉️ Write your message — I'll forward it to the admin.\n\n(To cancel, send /cancel)",
+    "support_sent": "✅ Your message has been sent to the admin. The reply will come in this chat.",
+    # Giveaways
+    "giv_share": "Share your link — when your friend joins the channel and completes their first order, your referral will be verified.\n",
+    "giv_mandatory": "\n⚠️ Mandatory: you must join our Telegram channel @retail_shop_official and WhatsApp channel.",
+    "giv_verify_btn": "✅ I Have Joined (Verify Membership)",
+    # Channels / Join Us
+    "channels_title": "📢 Our Channels\n\nJoining the Telegram channel is required — the bot checks it automatically.\nNew products and offers are posted on the WhatsApp channel.",
+    "joinus_title": "🤝 Join Us\n\nJoin our channels — new products, offers and giveaways appear here first.",
+    # Channel gate
+    "gate_join_tg": "🔒 Please join our Telegram channel first, then the products will appear.\n\nJoin the channel, then tap **Check Join Status** below.",
+    "gate_check_fail": "⚠️ The channel check could not be completed. The admin may not have made the bot an admin of the Telegram channel. Please try /start again in a bit.",
+    "gate_join_wa": "💬 Please also join our WhatsApp channel — new products and offers are posted there.\n\nAfter joining, tap **Maine Join Kar Liya** below.",
+    "gate_joined_tg": "✅ Telegram channel joined! Now please also join the WhatsApp channel.",
+    "gate_thanks": "✅ Thank you! ",
+    # Cart
+    "cart_empty": "🛒 Your cart is empty.",
+    "cart_added": "🛒 Added to cart!",
+    "cart_empty_alert": "Your cart is empty.",
+    "cart_stock_alert": "Only {n} of {name} is in stock.",
+    "cart_checkout": "✅ Checkout",
+    "cart_clear": "🧹 Clear Cart",
+    "cart_continue": "🛍️ Continue Shopping",
+    # Reviews
+    "rev_only_delivered": "You can only review a delivered order.",
+    "rev_rating": "⭐ Rating: {rating}/5\n\nNow write your review (send it as text):",
+    "rev_saved": "✅ Thank you! Your review has been saved.",
+    # Search / Request
+    "search_prompt": "🔍 Search for a product — send a keyword (e.g. 'muse' or 'capcut'):",
+    "search_none": "🔍 '{kw}' — no product found.",
+    "req_prompt": "📝 Which product do you need? Send the name + details — I'll forward it to the admin:",
+    "req_sent": "✅ Your request has been sent to the admin. Thank you!",
+    # Coupon
+    "coupon_prompt": "🎟️ Send your coupon code (e.g. FIRST-ORDER):",
+    "coupon_applied": "✅ Coupon {code} applied! {pct}% off — showing the summary again...",
+    "coupon_wrong": "This coupon code is not correct.",
+    "coupon_not_yours": "You don't have this coupon.",
+    "coupon_used": "This coupon has already been used.",
+    "coupon_first_only": "This coupon is only for your first order.",
+    # Proof / buy
+    "buy_free": "🎁 FREE product! Order #{oid} — sending your account now...",
+    "buy_order_received": "✅ Order #{oid} ({code}) received! The admin is verifying it. Your account will arrive in this chat once approved.",
+    "buy_hash_short": "That doesn't look like a hash. Please send the full Transaction Hash (copy it from the TronScan link).",
+    "buy_usdt_verified": "✅ USDT verified! {reason}\nOrder #{oid} ({code}) — sending your account now...",
+    "buy_usdt_fail": "⚠️ Auto-verification failed: {reason}\nOrder #{oid} ({code}) has been sent to the admin — they will check it manually and deliver.",
+    "buy_wallet_paid": "✅ Paid from wallet! Order #{oid} — sending your account now...",
+    "buy_wallet_refund": "⚠️ Delivery failed (out of stock) — your wallet has been refunded.",
+    "buy_wallet_low": "Your wallet balance is too low. Please deposit first.",
+    # Deposit proof
+    "dep_received": "✅ Deposit #{id} received! The admin is verifying it. Your wallet will be credited once approved.",
+    "dep_usdt_verified": "✅ USDT verified! {reason}\nDeposit #{id} — {amount} {currency} has been added to your wallet.",
+    "dep_usdt_fail": "⚠️ Auto-verification failed: {reason}\nDeposit #{id} has been sent to the admin — they will check it manually and credit your wallet.",
+    # Top-up
+    "topup_prompt": "🎟️ Send your top-up code:",
+    "topup_wrong": "❌ This top-up code is not correct.",
+    "topup_used": "❌ This code has already been used.",
+    "topup_ok": "✅ Top-up successful! {amount} {currency} has been added to your wallet.",
+    # Misc
+    "misc_expired": "Session expired. Please start again with /start.",
+    "misc_only_number": "Please send only a number (e.g. 500):",
+    "misc_min_deposit": "The minimum deposit is 1. Please send the amount again:",
+    "misc_giv_verified": "✅ Verified! You are eligible for giveaways.",
+    "misc_giv_check_fail": "The check could not be completed — please try again in a bit.",
+    "misc_giv_join_first": "Please join the Telegram channel first, then tap verify.",
+    "misc_join_check": "Not joined yet — please join the channel first, then check again.",
+    "misc_join_check_fail": "The check could not be completed — the bot is not an admin of the channel.",
+},
+}
+
+# ---------- Currency / prices ----------
+
 # ---------- Currency / prices ----------
 
 def user_currency(uid):
@@ -561,11 +1012,31 @@ def bulk_text(p, uid):
     parts = [f"{q}+ {fmt_money(up, uid)} each" for q, up in tiers]
     return "💸 Bulk discounts: " + ", ".join(parts)
 
-def stock_tag(p):
+def stock_tag(p, uid=None):
     if p["unlimited"]:
         return "♾️"
     n = stock_count(p["id"])
-    return f"Stock: {n}" if n else "Out of Stock"
+    if uid is None:
+        return f"Stock: {n}" if n else "Out of Stock"
+    return t(uid, "prod_stock", n=n) if n else t(uid, "prod_out_stock")
+
+def product_btn_label(p, uid):
+    """Uniform product button: 🟢/🔴 <Name> — <Price>. Price hamesha poori
+    dikhti hai; bohat lamba naam end se chhota kar diya jata hai."""
+    try:
+        unlimited = bool(p["unlimited"])
+    except Exception:
+        unlimited = False
+    in_stock = unlimited or stock_count(p["id"]) > 0
+    dot = "🟢" if in_stock else "🔴"
+    price = price_text(p, uid)
+    name = p["name"]
+    suffix = f" — {price}"
+    max_total = 58
+    if len(dot) + 1 + len(name) + len(suffix) > max_total:
+        keep = max_total - len(dot) - 1 - len(suffix) - 1
+        name = name[:max(keep, 8)] + "…"
+    return f"{dot} {name}{suffix}"
 
 def review_stats(pid):
     c = db(); r = c.execute("SELECT COUNT(*) n, COALESCE(AVG(rating),0) avg FROM reviews WHERE product_id=?", (pid,)).fetchone(); c.close()
@@ -601,16 +1072,16 @@ def ensure_first_coupon(uid):
 
 def coupon_valid(uid, code):
     if (code or "").strip().upper() != FIRST_COUPON_CODE:
-        return False, "Ye coupon code galat hai."
+        return False, t(uid, "coupon_wrong")
     c = db(); r = c.execute("SELECT * FROM coupons WHERE user_id=? AND code=?", (uid, FIRST_COUPON_CODE)).fetchone()
     if not r:
-        c.close(); return False, "Aapke paas ye coupon nahi hai."
+        c.close(); return False, t(uid, "coupon_not_yours")
     if r["used"]:
-        c.close(); return False, "Ye coupon use ho chuka hai."
+        c.close(); return False, t(uid, "coupon_used")
     done = c.execute("SELECT COUNT(*) n FROM orders WHERE user_id=? AND status='delivered'", (uid,)).fetchone()["n"]
     c.close()
     if done:
-        return False, "Ye coupon sirf pehli order ke liye hai."
+        return False, t(uid, "coupon_first_only")
     return True, "OK"
 
 # ---------- Orders ----------
@@ -696,11 +1167,16 @@ def start_outbox_poller():
     threading.Thread(target=_outbox_poller_loop, daemon=True).start()
     log.info("Outbox poller started (telegram rows)")
 
-def order_status_label(status):
-    return {"pending": "⏳ PAID — admin review",
-            "delivered": "✅ DELIVERED",
-            "rejected": "❌ CANCELLED",
-            "out_of_stock": "❌ CANCELLED (stock khatam)"}.get(status, status)
+def order_status_label(status, uid=None):
+    key = {"pending": "status_pending",
+           "delivered": "status_delivered",
+           "rejected": "status_rejected",
+           "out_of_stock": "status_oos"}.get(status)
+    if key is None:
+        return status
+    if uid is None:
+        return STRINGS["ur"][key]
+    return t(uid, key)
 
 # ---------- Buy state (user_data) ----------
 
@@ -808,20 +1284,21 @@ def set_wa_joined(user_id):
 # ---------- Menu / products views ----------
 
 async def show_menu_text(user_id=None):
-    lines = ["👋 Welcome to RetailShop!"]
+    uid = user_id or 0
+    lines = [t(uid, "menu_welcome")]
     if user_id:
-        lines.append(f"\n💱 Currency: {user_currency(user_id)}")
+        lines.append(f"\n{t(uid, 'menu_currency', cur=user_currency(user_id))}")
         ensure_first_coupon(user_id)
         c = db()
         r = c.execute("SELECT used FROM coupons WHERE user_id=? AND code=?", (user_id, FIRST_COUPON_CODE)).fetchone()
         done = c.execute("SELECT COUNT(*) n FROM orders WHERE user_id=? AND status='delivered'", (user_id,)).fetchone()["n"]
         c.close()
         if r and not r["used"] and not done:
-            lines.append(f"🎁 First Order Coupon: {FIRST_COUPON_CODE} — {FIRST_COUPON_PCT}% off your first order! (Checkout pe apply karein)")
-    lines.append("\nNeeche se choose karein:")
+            lines.append(t(uid, "menu_coupon", code=FIRST_COUPON_CODE, pct=FIRST_COUPON_PCT))
+    lines.append("\n" + t(uid, "menu_choose"))
     return "\n".join(lines)
 
-def menu_kb():
+def menu_kb(uid=None):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🛍️ Products", callback_data="menu_products"),
          InlineKeyboardButton("💰 Deposit", callback_data="menu_deposit")],
@@ -833,6 +1310,7 @@ def menu_kb():
          InlineKeyboardButton("💱 Change Payment Method", callback_data="curr_toggle")],
         [InlineKeyboardButton("❓ Help", callback_data="menu_help"),
          InlineKeyboardButton("💬 Support", callback_data="menu_support")],
+        [InlineKeyboardButton(t(uid or 0, "menu_lang_btn"), callback_data="lang_menu")],
     ])
 
 def _short_name(name, n=38):
@@ -861,62 +1339,89 @@ def products_view_kb(uid, page=0, cat_idx=None):
     total_pages = max(1, (len(prods) + per - 1) // per)
     page = max(0, min(page, total_pages - 1))
     for p in prods[page * per:(page + 1) * per]:
-        kb.append([InlineKeyboardButton(
-            f"{_short_name(p['name'])} — {price_text(p, uid)} ({stock_tag(p)})",
-            callback_data=f"prod_{p['id']}")])
+        kb.append([InlineKeyboardButton(product_btn_label(p, uid), callback_data=f"prod_{p['id']}")])
     nav = []
     if page > 0:
-        nav.append(InlineKeyboardButton("⬅ Prev", callback_data=f"{base}_{page - 1}"))
+        nav.append(InlineKeyboardButton(t(uid, "prod_prev"), callback_data=f"{base}_{page - 1}"))
     if page < total_pages - 1:
-        nav.append(InlineKeyboardButton("Next ➡", callback_data=f"{base}_{page + 1}"))
+        nav.append(InlineKeyboardButton(t(uid, "prod_next"), callback_data=f"{base}_{page + 1}"))
     if nav:
         kb.append(nav)
-    kb.append([InlineKeyboardButton("🛒 View Cart", callback_data="cart"),
-               InlineKeyboardButton("🔄 Refresh Stock", callback_data=f"{base}_{page}")])
-    kb.append([InlineKeyboardButton("🔍 Search Products", callback_data="search_prod"),
-               InlineKeyboardButton("📝 Request Products", callback_data="req_prod")])
-    kb.append([InlineKeyboardButton("⬅ Main Menu", callback_data="back_menu")])
+    kb.append([InlineKeyboardButton(t(uid, "prod_cart"), callback_data="cart"),
+               InlineKeyboardButton(t(uid, "prod_refresh"), callback_data=f"{base}_{page}")])
+    kb.append([InlineKeyboardButton(t(uid, "prod_search"), callback_data="search_prod"),
+               InlineKeyboardButton(t(uid, "prod_request"), callback_data="req_prod")])
+    kb.append([InlineKeyboardButton(t(uid, "prod_back_menu"), callback_data="back_menu")])
     return InlineKeyboardMarkup(kb), total_pages
 
-def products_view_text(page, cat_idx, total_pages):
+def products_view_text(uid, page, cat_idx, total_pages):
     parts = [PROMO_BANNER, ""]
     if cat_idx is not None:
         parts.append(f"📂 {CATEGORIES[cat_idx]}")
-    parts.append(f"🛍️ Products — koi ek choose karein:  (Page {page + 1}/{total_pages})")
+    parts.append(t(uid, "prod_choose", page=page + 1, total=total_pages))
     return "\n".join(parts)
 
 async def render_products_list(q, context, page=0, cat_idx=None):
     kb, total_pages = products_view_kb(q.from_user.id, page, cat_idx)
     context.user_data["last_list"] = f"cat_{cat_idx}_{page}" if cat_idx is not None else f"plist_{page}"
-    await q.edit_message_text(products_view_text(page, cat_idx, total_pages), reply_markup=kb)
+    await q.edit_message_text(products_view_text(q.from_user.id, page, cat_idx, total_pages), reply_markup=kb)
 
 async def render_product_detail(q, context, pid):
+    """Product detail — quantity selector + terms + I Agree, sab ek hi
+    screen pe (naya simplified flow). Out of stock ho to agree button
+    nahi dikhta, sirf out-of-stock note."""
     uid = q.from_user.id
     c = db(); p = c.execute("SELECT * FROM products WHERE id=?", (pid,)).fetchone(); c.close()
     if not p:
-        await q.edit_message_text("Product nahi mila."); return
+        await q.edit_message_text(t(uid, "prod_not_found")); return
+    # Buy state: isi product ki quantity yahan se set hoti hai.
+    if context.user_data.get("buy_pid") != pid:
+        context.user_data["buy_pid"] = pid
+        context.user_data["buy_mode"] = "single"
+        context.user_data["buy_qty"] = 1
+        context.user_data.pop("buy_items", None)
+    if not context.user_data.get("buy_code"):
+        context.user_data["buy_code"] = gen_order_code()
+    qty = max(1, min(99, int(context.user_data.get("buy_qty", 1) or 1)))
+    context.user_data["buy_qty"] = qty
     n, avg = review_stats(pid)
-    rating_line = f"⭐ {avg} ({n} reviews)" if n else "⭐ No reviews yet"
+    rating_line = t(uid, "prod_reviews", avg=avg, n=n) if n else t(uid, "prod_no_reviews")
     is_free = p["price_pkr"] == 0 and p["price_usdt"] == 0
-    buy_label = "🎁 Get Free" if is_free else "🛒 Buy Now"
+    try:
+        unlimited = bool(p["unlimited"])
+    except Exception:
+        unlimited = False
+    in_stock = unlimited or stock_count(pid) > 0
     bulk = bulk_text(p, uid)
     desc = p["description"] or "No description."
     terms = (p["terms"] or "").strip() if "terms" in p.keys() else ""
     text = (f"📦 {p['name']}\n\n{desc}\n\n"
-            f"💰 Price: {price_text(p, uid)}\n"
-            f"📦 {stock_tag(p)}\n{rating_line}\n")
+            f"{t(uid, 'prod_price', price=price_text(p, uid))}\n"
+            f"📦 {stock_tag(p, uid)}\n{rating_line}\n")
     if terms:
         text += f"\n📖 How to Use:\n{terms}\n"
     if bulk:
         text += bulk + "\n"
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(buy_label, callback_data=f"buy_{pid}")],
-        [InlineKeyboardButton("🛒 Add to Cart", callback_data=f"cartadd_{pid}")],
-        [InlineKeyboardButton("🛒 View Cart", callback_data="cart"),
-         InlineKeyboardButton("⭐ Reviews", callback_data=f"rev_{pid}_0")],
-        [InlineKeyboardButton("⬅ Back to Products", callback_data="back_list")],
-    ])
-    await q.edit_message_text(text, reply_markup=kb)
+    kb_rows = []
+    if not in_stock and not is_free:
+        text += f"\n{t(uid, 'prod_oos_note')}\n"
+    else:
+        unit = unit_price_pkr(p, qty)
+        kb_rows.append([
+            InlineKeyboardButton("➖", callback_data=f"qtydec_{pid}"),
+            InlineKeyboardButton(t(uid, "prod_qty_line", qty=qty, price=fmt_money(unit * qty, uid)), callback_data="qty_info"),
+            InlineKeyboardButton("➕", callback_data=f"qtyinc_{pid}"),
+        ])
+        kb_rows.append([InlineKeyboardButton(t(uid, "prod_custom_qty"), callback_data=f"qtycustom_{pid}")])
+        if is_free:
+            kb_rows.append([InlineKeyboardButton(t(uid, "prod_get_free"), callback_data=f"free_{pid}")])
+        else:
+            kb_rows.append([InlineKeyboardButton(t(uid, "prod_agree"), callback_data="detail_agree")])
+    kb_rows.append([InlineKeyboardButton(t(uid, "prod_add_cart"), callback_data=f"cartadd_{pid}")])
+    kb_rows.append([InlineKeyboardButton(t(uid, "prod_cart"), callback_data="cart"),
+                    InlineKeyboardButton(t(uid, "prod_reviews_btn"), callback_data=f"rev_{pid}_0")])
+    kb_rows.append([InlineKeyboardButton(t(uid, "prod_back_products"), callback_data="back_list")])
+    await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb_rows))
 
 async def show_gate_or_menu_message(update, context):
     """Join gate check karke ya gate dikhata hai ya main menu. Returns True
@@ -934,24 +1439,20 @@ async def show_gate_or_menu_message(update, context):
             kb.append([InlineKeyboardButton("💬 Join WhatsApp Channel", url=wa_channel_url())])
         kb.append([InlineKeyboardButton("✅ Check Join Status", callback_data="check_join")])
         await update.message.reply_text(
-            "🔒 Pehle hamara Telegram channel join karein, phir products dikhenge.\n\n"
-            "Channel join karein, phir neeche **Check Join Status** dabayein.",
+            t(user.id, "gate_join_tg"),
             reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
         return False
     if member is None:
-        await update.message.reply_text(
-            "⚠️ Channel check nahi ho saka. Admin ne bot ko Telegram channel me admin nahi banaya hoga. "
-            "Thodi der me dobara /start karein.")
+        await update.message.reply_text(t(user.id, "gate_check_fail"))
         return False
     if wa_channel_url() and not wa_joined_flag(user.id):
         kb = [[InlineKeyboardButton("💬 Join WhatsApp Channel", url=wa_channel_url())],
               [InlineKeyboardButton("✅ Maine Join Kar Liya", callback_data="wa_joined")]]
         await update.message.reply_text(
-            "💬 Hamara WhatsApp channel bhi join kar lein — wahan naye products aur offers aate hain.\n\n"
-            "Join karke neeche **Maine Join Kar Liya** dabayein.",
+            t(user.id, "gate_join_wa"),
             reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
         return False
-    await update.message.reply_text(await show_menu_text(user.id), reply_markup=menu_kb())
+    await update.message.reply_text(await show_menu_text(user.id), reply_markup=menu_kb(user.id))
     return True
 
 # ---------- Auto Delivery ----------
@@ -1586,88 +2087,46 @@ def handle_zurvapay_ipn_http(raw_body, headers=None):
 
 # ---------- Buy flow renders ----------
 
-def qty_kb(uid, pid):
-    c = db(); p = c.execute("SELECT * FROM products WHERE id=?", (pid,)).fetchone(); c.close()
-    kb = []
-    row = []
-    for q in (1, 2, 3, 5, 10):
-        total = unit_price_pkr(p, q) * q
-        row.append(InlineKeyboardButton(f"{q} × {fmt_money(total, uid)}", callback_data=f"qty_{pid}_{q}"))
-        if len(row) == 3:
-            kb.append(row); row = []
-    if row:
-        kb.append(row)
-    kb.append([InlineKeyboardButton("🔢 Custom Quantity", callback_data=f"qtycustom_{pid}")])
-    kb.append([InlineKeyboardButton(f"💱 Change Currency ({user_currency(uid)})", callback_data=f"qtycur_{pid}")])
-    kb.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel_order")])
-    return InlineKeyboardMarkup(kb)
-
-def qty_text(uid, pid):
-    c = db(); p = c.execute("SELECT * FROM products WHERE id=?", (pid,)).fetchone(); c.close()
-    bulk = bulk_text(p, uid)
-    text = f"📦 {p['name']}\n\nUnit price: {fmt_money(p['price_pkr'], uid)}\n"
-    if bulk:
-        text += bulk + "\n"
-    text += f"\n📦 {stock_tag(p)}\n\nQuantity choose karein:"
-    return text
-
-async def render_qty(q, context, pid):
-    await q.edit_message_text(qty_text(q.from_user.id, pid), reply_markup=qty_kb(q.from_user.id, pid))
-
-def terms_for_product(p):
-    t = (p["terms"] or "").strip() if "terms" in p.keys() else ""
-    return t or DEFAULT_TERMS
-
 def summary_text(uid, context):
     lines, subtotal, discount, total = buy_totals(context, uid)
     code = context.user_data.get("buy_code") or gen_order_code()
     context.user_data["buy_code"] = code
     parts = [f"🧾 Order Summary — {code}\n"]
     for l in lines:
-        parts.append(f"• {l['product']['name']} × {l['qty']} — {fmt_money(l['line_pkr'], uid)} ({fmt_money(l['unit_pkr'], uid)} each)")
-    parts.append(f"\nSubtotal: {fmt_money(subtotal, uid)}")
+        parts.append(t(uid, "sum_line", name=l['product']['name'], qty=l['qty'],
+                       line=fmt_money(l['line_pkr'], uid), unit=fmt_money(l['unit_pkr'], uid)))
+    parts.append(f"\n{t(uid, 'sum_subtotal', amount=fmt_money(subtotal, uid))}")
     if discount:
-        parts.append(f"Coupon {context.user_data.get('buy_coupon_code')} (-{FIRST_COUPON_PCT}%): -{fmt_money(discount, uid)}")
-    parts.append(f"Total: {fmt_money(total, uid)}")
-    parts.append(f"\n👛 Wallet balance: Rs {get_wallet(uid, 'PKR')} | ${get_wallet(uid, 'USDT')} USDT")
+        parts.append(t(uid, "sum_coupon", code=context.user_data.get('buy_coupon_code'),
+                       pct=FIRST_COUPON_PCT, amount=fmt_money(discount, uid)))
+    parts.append(t(uid, "sum_total", amount=fmt_money(total, uid)))
+    parts.append(f"\n{t(uid, 'sum_wallet', pkr=get_wallet(uid, 'PKR'), usdt=get_wallet(uid, 'USDT'))}")
     return "\n".join(parts)
 
 def summary_kb(uid, context):
+    """Payment order: 1st Zurvapay, 2nd Easypaisa, 3rd JazzCash, 4th USDT.
+    (Coupon 7% pehli order pe summary me hi apply hota hai.)"""
     _lines, _sub, _disc, total = buy_totals(context, uid)
     kb = []
     if not context.user_data.get("buy_coupon_code"):
-        kb.append([InlineKeyboardButton("🎟️ Apply Coupon Code", callback_data="coupon_apply")])
-    kb.append([InlineKeyboardButton("💚 Pay via PKR", callback_data="paypkr"),
-               InlineKeyboardButton("🪙 Pay via USDT", callback_data="payusdt")])
+        kb.append([InlineKeyboardButton(t(uid, "sum_coupon_btn"), callback_data="coupon_apply")])
     if zurvapay_enabled():
-        kb.append([InlineKeyboardButton("⚡ Zurvapay — JazzCash/Easypaisa/Raast (Auto)", callback_data="pay_zurvapay")])
+        kb.append([InlineKeyboardButton(t(uid, "sum_pay_zurva"), callback_data="pay_zurvapay")])
+    kb.append([InlineKeyboardButton(t(uid, "sum_pay_easypaisa"), callback_data="pay_easypaisa")])
+    kb.append([InlineKeyboardButton(t(uid, "sum_pay_jazzcash"), callback_data="pay_jazzcash")])
+    kb.append([InlineKeyboardButton(t(uid, "sum_pay_usdt"), callback_data="pay_usdt")])
     cur = user_currency(uid)
     bal = get_wallet(uid, cur)
     need = total if cur == "PKR" else round(total / USDT_RATE, 2)
     if total > 0 and bal >= need:
-        kb.append([InlineKeyboardButton("👛 Pay from Wallet", callback_data="pay_wallet")])
-    kb.append([InlineKeyboardButton("🔢 Change Quantity", callback_data="qty_change"),
-               InlineKeyboardButton("❌ Cancel", callback_data="cancel_order")])
+        kb.append([InlineKeyboardButton(t(uid, "sum_pay_wallet"), callback_data="pay_wallet")])
+    kb.append([InlineKeyboardButton(t(uid, "sum_change_qty"), callback_data="qty_change"),
+               InlineKeyboardButton(t(uid, "sum_cancel"), callback_data="cancel_order")])
     return InlineKeyboardMarkup(kb)
 
 async def render_summary(q, context):
     uid = q.from_user.id
     await q.edit_message_text(summary_text(uid, context), reply_markup=summary_kb(uid, context))
-
-async def render_terms(q, context):
-    uid = q.from_user.id
-    lines, _sub, _disc, total = buy_totals(context, uid)
-    pid = context.user_data.get("buy_pid")
-    c = db(); p = c.execute("SELECT * FROM products WHERE id=?", (pid,)).fetchone() if pid else None; c.close()
-    terms = terms_for_product(p) if p else DEFAULT_TERMS
-    text = (f"📜 Terms & Conditions\n\n{terms}\n\n"
-            f"Order: {lines[0]['product']['name']} × {lines[0]['qty']}\n"
-            f"Total: {fmt_money(total, uid)}")
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Agree & Continue to Payment", callback_data="terms_ok")],
-        [InlineKeyboardButton("❌ Cancel", callback_data="cancel_order")],
-    ])
-    await q.edit_message_text(text, reply_markup=kb)
 
 # ---------- Cart / wallet / orders / giveaways renders ----------
 
@@ -1675,21 +2134,22 @@ async def render_cart(q, context):
     uid = q.from_user.id
     lines = cart_lines_db(uid)
     if not lines:
-        text = "🛒 Your Cart khaali hai."
+        text = t(uid, "cart_empty")
     else:
         parts = ["🛒 Your Cart\n"]
         for l in lines:
-            parts.append(f"• {l['product']['name']} × {l['qty']} — {fmt_money(l['line_pkr'], uid)}")
-        parts.append(f"\nTotal: {fmt_money(sum(l['line_pkr'] for l in lines), uid)}")
+            parts.append(t(uid, "sum_line", name=l['product']['name'], qty=l['qty'],
+                           line=fmt_money(l['line_pkr'], uid), unit=fmt_money(l['unit_pkr'], uid)))
+        parts.append(f"\n{t(uid, 'sum_total', amount=fmt_money(sum(l['line_pkr'] for l in lines), uid))}")
         text = "\n".join(parts)
     kb = []
     for l in lines:
         kb.append([InlineKeyboardButton(f"❌ Remove {_short_name(l['product']['name'], 30)}", callback_data=f"cart_rm_{l['pid']}")])
     if lines:
-        kb.append([InlineKeyboardButton("✅ Checkout", callback_data="cart_checkout"),
-                   InlineKeyboardButton("🧹 Clear Cart", callback_data="cart_clear")])
-    kb.append([InlineKeyboardButton("🛍️ Continue Shopping", callback_data="back_list")])
-    kb.append([InlineKeyboardButton("⬅ Main Menu", callback_data="back_menu")])
+        kb.append([InlineKeyboardButton(t(uid, "cart_checkout"), callback_data="cart_checkout"),
+                   InlineKeyboardButton(t(uid, "cart_clear"), callback_data="cart_clear")])
+    kb.append([InlineKeyboardButton(t(uid, "cart_continue"), callback_data="back_list")])
+    kb.append([InlineKeyboardButton(t(uid, "prod_back_menu"), callback_data="back_menu")])
     await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb))
 
 async def render_wallet(q, context):
@@ -1708,10 +2168,10 @@ async def render_wallet(q, context):
             f"Balance USDT: ${bal_usdt}\n\n"
             f"Total purchases: {row['n']} orders (Rs {row['s']})")
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("💰 Deposit", callback_data="menu_deposit"),
-         InlineKeyboardButton("🎟️ Redeem Top-up Code", callback_data="wal_topup")],
-        [InlineKeyboardButton("📄 Wallet Statement", callback_data="wal_stmt")],
-        [InlineKeyboardButton("⬅ Main Menu", callback_data="back_menu")],
+        [InlineKeyboardButton(t(uid, "wallet_deposit"), callback_data="menu_deposit"),
+         InlineKeyboardButton(t(uid, "wallet_topup"), callback_data="wal_topup")],
+        [InlineKeyboardButton(t(uid, "wallet_stmt"), callback_data="wal_stmt")],
+        [InlineKeyboardButton(t(uid, "prod_back_menu"), callback_data="back_menu")],
     ])
     await q.edit_message_text(text, reply_markup=kb)
 
@@ -1719,46 +2179,47 @@ async def render_orders_list(q, context):
     uid = q.from_user.id
     c = db(); rows = c.execute("SELECT * FROM orders WHERE user_id=? ORDER BY id DESC LIMIT 10", (uid,)).fetchall(); c.close()
     if not rows:
-        await q.edit_message_text("📦 Aapki koi order nahi hai.",
-                                  reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Main Menu", callback_data="back_menu")]]))
+        await q.edit_message_text(t(uid, "orders_none"),
+                                  reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(t(uid, "prod_back_menu"), callback_data="back_menu")]]))
         return
     kb = []
     for o in rows:
         c = db(); p = c.execute("SELECT name FROM products WHERE id=?", (o["product_id"],)).fetchone(); c.close()
-        kb.append([InlineKeyboardButton(f"#{o['id']} {_short_name(p['name'], 28) if p else '?'} — {order_status_label(o['status'])}",
+        kb.append([InlineKeyboardButton(f"#{o['id']} {_short_name(p['name'], 28) if p else '?'} — {order_status_label(o['status'], uid)}",
                                         callback_data=f"ord_{o['id']}")])
-    kb.append([InlineKeyboardButton("⬅ Main Menu", callback_data="back_menu")])
-    await q.edit_message_text("📦 My Orders — detail ke liye order pe tap karein:", reply_markup=InlineKeyboardMarkup(kb))
+    kb.append([InlineKeyboardButton(t(uid, "prod_back_menu"), callback_data="back_menu")])
+    await q.edit_message_text(t(uid, "orders_title"), reply_markup=InlineKeyboardMarkup(kb))
 
 async def render_order_detail(q, context, oid):
     uid = q.from_user.id
     c = db(); o = c.execute("SELECT * FROM orders WHERE id=? AND user_id=?", (oid, uid)).fetchone(); c.close()
     if not o:
-        await q.edit_message_text("Order nahi mili."); return
+        await q.edit_message_text(t(uid, "order_not_found")); return
     c = db(); p = c.execute("SELECT * FROM products WHERE id=?", (o["product_id"],)).fetchone(); c.close()
     text = (f"📦 Order #{o['id']} ({o['code'] or '—'})\n\n"
             f"Product: {p['name'] if p else '?'}\n"
             f"Qty: {o['qty']}\n"
             f"Amount: {o['amount_text']}\n"
             f"Payment: {o['payment_method']}\n"
-            f"Status: {order_status_label(o['status'])}\n"
+            f"Status: {order_status_label(o['status'], uid)}\n"
             f"Date: {o['created_at']}")
     kb = []
     if p:
-        kb.append([InlineKeyboardButton("🔁 Buy Again", callback_data=f"buyagain_{p['id']}")])
+        kb.append([InlineKeyboardButton(t(uid, "order_buy_again"), callback_data=f"buyagain_{p['id']}")])
     if o["status"] == "delivered":
-        kb.append([InlineKeyboardButton("⭐ Write Review", callback_data=f"wrev_{o['id']}")])
-    kb.append([InlineKeyboardButton("⬅ My Orders", callback_data="menu_orders")])
+        kb.append([InlineKeyboardButton(t(uid, "order_write_review"), callback_data=f"wrev_{o['id']}")])
+    kb.append([InlineKeyboardButton(t(uid, "order_back"), callback_data="menu_orders")])
     await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb))
 
 async def render_reviews(q, pid, page):
+    uid = q.from_user.id
     c = db(); p = c.execute("SELECT * FROM products WHERE id=?", (pid,)).fetchone()
     total = c.execute("SELECT COUNT(*) n FROM reviews WHERE product_id=?", (pid,)).fetchone()["n"]
     rows = c.execute("SELECT * FROM reviews WHERE product_id=? ORDER BY id DESC LIMIT 5 OFFSET ?", (pid, page * 5)).fetchall()
     c.close()
     n, avg = review_stats(pid)
     parts = [f"⭐ Reviews — {p['name'] if p else ''}\n"]
-    parts.append(f"Average: {avg} ({n} reviews)\n" if n else "No reviews yet.\n")
+    parts.append(t(uid, "prod_reviews", avg=avg, n=n) + "\n" if n else t(uid, "prod_no_reviews") + "\n")
     for r in rows:
         tag = " (Verified purchase)" if r["verified"] else (" (Added by shop)" if r["source"] == "shop" else "")
         parts.append(f"⭐{r['rating']} — {r['user_name'] or 'User'}{tag}\n{r['text'] or ''}\n")
@@ -1766,12 +2227,12 @@ async def render_reviews(q, pid, page):
     kb = []
     nav = []
     if page > 0:
-        nav.append(InlineKeyboardButton("⬅ Prev", callback_data=f"rev_{pid}_{page - 1}"))
+        nav.append(InlineKeyboardButton(t(uid, "prod_prev"), callback_data=f"rev_{pid}_{page - 1}"))
     if page < total_pages - 1:
-        nav.append(InlineKeyboardButton("Next ➡", callback_data=f"rev_{pid}_{page + 1}"))
+        nav.append(InlineKeyboardButton(t(uid, "prod_next"), callback_data=f"rev_{pid}_{page + 1}"))
     if nav:
         kb.append(nav)
-    kb.append([InlineKeyboardButton("⬅ Back to Product", callback_data=f"prod_{pid}")])
+    kb.append([InlineKeyboardButton(t(uid, "prod_back_products"), callback_data=f"prod_{pid}")])
     await q.edit_message_text("\n".join(parts), reply_markup=InlineKeyboardMarkup(kb))
 
 async def render_giveaways(q, context):
@@ -1783,14 +2244,14 @@ async def render_giveaways(q, context):
     parts = ["🎁 Giveaways\n",
              f"Your invite link:\nhttps://t.me/{BOT_USERNAME}?start=ref_{uid}\n",
              f"Referrals: {total} (Verified: {verified})\n",
-             "Apna link share karein — jab aapka dost channel join karke pehli order complete karega, referral verified hoga.\n",
+             t(uid, "giv_share"),
              "🎁 Active Giveaways:"]
     for i, (name, desc) in enumerate(GIVEAWAYS, 1):
         parts.append(f"{i}. {name} — {desc}")
-    parts.append("\n⚠️ Mandatory: hamara Telegram channel @retail_shop_official aur WhatsApp channel join karna zaroori hai.")
+    parts.append(t(uid, "giv_mandatory"))
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ I Have Joined (Verify Membership)", callback_data="giv_verify")],
-        [InlineKeyboardButton("⬅ Main Menu", callback_data="back_menu")],
+        [InlineKeyboardButton(t(uid, "giv_verify_btn"), callback_data="giv_verify")],
+        [InlineKeyboardButton(t(uid, "prod_back_menu"), callback_data="back_menu")],
     ])
     await q.edit_message_text("\n".join(parts), reply_markup=kb)
 
@@ -1818,8 +2279,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------- Buyer: callbacks ----------
 
 async def start_payment(q, context, method):
-    """method: jazzcash/easypaisa/usdt. Buy ya deposit context ke hisaab se
-    payment instructions dikhao aur awaiting set karo."""
+    """method: jazzcash/easypaisa/usdt/zurvapay. Buy ya deposit context ke
+    hisaab se payment instructions dikhao aur awaiting set karo."""
     uid = q.from_user.id
     dep = context.user_data.get("deposit")
     if dep:
@@ -1827,7 +2288,7 @@ async def start_payment(q, context, method):
         if method == "zurvapay":
             # Zurvapay sirf PKR karta hai.
             if dep["currency"] != "PKR":
-                await q.edit_message_text("⚡ Zurvapay sirf PKR deposits ke liye hai. USDT ke liye USDT option use karein.")
+                await q.edit_message_text(t(uid, "pay_zurva_only_pkr"))
                 return
             c = db(); cur = c.execute(
                 "INSERT INTO deposits(user_id,username,currency,amount,payment_method,proof,status,created_at) VALUES(?,?,?,?,?,?, 'pending', ?)",
@@ -1838,30 +2299,30 @@ async def start_payment(q, context, method):
                                          q.from_user.first_name or "", "")
             context.user_data.clear()
             if err:
-                await q.edit_message_text(f"⚠️ Zurvapay payment start nahi ho saki: {err}\nDeposit #{dep_id} pending hai — dobara try karein ya admin se rabta karein.")
+                await q.edit_message_text(t(uid, "pay_zurva_fail_dep", err=err, id=dep_id))
                 return
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("💳 Pay Now — JazzCash / Easypaisa / Raast QR", url=url)]])
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton(t(uid, "pay_zurva_paynow"), url=url)]])
             await q.edit_message_text(
-                f"⚡ Zurvapay Deposit\n\nAmount: Rs {dep['amount']}\nDeposit #{dep_id}\n\nNeeche button se payment karein — JazzCash, Easypaisa ya Raast QR. Payment confirm hote hi wallet auto credit ho jayega.",
+                t(uid, "pay_zurva_dep", amount=dep['amount'], id=dep_id),
                 reply_markup=kb)
             return
         if method in ("jazzcash", "easypaisa"):
             num = get_setting(f"{method}_number"); name = get_setting(f"{method}_name")
             label = "JazzCash" if method == "jazzcash" else "Easypaisa"
             await q.edit_message_text(
-                f"💚 {label} Deposit\n\nAmount: {dep['amount']} {dep['currency']}\n\nSend to:\nNumber: `{num}`\nName: {name}\n\nPayment karke **Transaction ID (TID)** yahan bhejein, ya screenshot bhejein.\nAdmin approve karte hi wallet credit ho jayega.",
+                t(uid, "pay_manual_dep", label=label, amount=dep['amount'], currency=dep['currency'], num=num, name=name),
                 parse_mode="Markdown")
             context.user_data["awaiting"] = "dep_tid"
         else:
             addr = get_setting("usdt_address")
             await q.edit_message_text(
-                f"🪙 USDT (TRC20) Deposit\n\nAmount: **${dep['amount']} USDT**\n\nSend to (TRC20 only):\n`{addr}`\n\nPayment karke **Transaction Hash** yahan bhejein. Bot khud verify karega.",
+                t(uid, "pay_usdt_dep", amount=dep['amount'], addr=addr),
                 parse_mode="Markdown")
             context.user_data["awaiting"] = "dep_hash"
         return
     lines, _sub, _disc, total = buy_totals(context, uid)
     if not lines:
-        await q.edit_message_text("Session expire ho gayi. /start se dobara karein."); return
+        await q.edit_message_text(t(uid, "sum_expired")); return
     context.user_data["pay_method"] = method
     label = "Cart" if context.user_data.get("buy_mode") == "cart" else lines[0]["product"]["name"]
     if method == "zurvapay":
@@ -1878,25 +2339,25 @@ async def start_payment(q, context, method):
         url, err = zurvapay_initiate(code, total, f"RetailShop order {code} — {label}",
                                      q.from_user.first_name or "", "")
         if err:
-            await q.edit_message_text(f"⚠️ Zurvapay payment start nahi ho saki: {err}\nOrder #{oid} ({code}) pending hai — dobara try karein ya admin se rabta karein.")
+            await q.edit_message_text(t(uid, "pay_zurva_fail_order", err=err, oid=oid, code=code))
             return
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("💳 Pay Now — JazzCash / Easypaisa / Raast QR", url=url)]])
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton(t(uid, "pay_zurva_paynow"), url=url)]])
         await q.edit_message_text(
-            f"⚡ Zurvapay Payment\n\nProduct: {label}\nAmount: Rs {total}\nOrder #{oid} ({code})\n\nNeeche button se payment karein — JazzCash, Easypaisa ya Raast QR. Payment confirm hote hi account isi chat me auto deliver ho jayega.",
+            t(uid, "pay_zurva_order", label=label, total=total, oid=oid, code=code),
             reply_markup=kb)
         return
     if method in ("jazzcash", "easypaisa"):
         num = get_setting(f"{method}_number"); name = get_setting(f"{method}_name")
         mlabel = "JazzCash" if method == "jazzcash" else "Easypaisa"
         await q.edit_message_text(
-            f"💚 {mlabel} Payment\n\nProduct: {label}\nAmount: Rs {total}\n\nSend to:\nNumber: `{num}`\nName: {name}\n\nPayment karke **Transaction ID (TID)** yahan bhejein, ya screenshot bhejein.\nAdmin approve karte hi account auto deliver ho jayega.",
+            t(uid, "pay_manual_order", label=mlabel, label2=label, total=total, num=num, name=name),
             parse_mode="Markdown")
         context.user_data["awaiting"] = "tid"
     else:
         addr = get_setting("usdt_address")
         total_usdt = round(total / USDT_RATE, 2)
         await q.edit_message_text(
-            f"🪙 USDT (TRC20) Payment\n\nProduct: {label}\nAmount: **${total_usdt} USDT**\n\nSend to (TRC20 only):\n`{addr}`\n\nPayment karke **Transaction Hash** yahan bhejein. Bot khud verify karega, phir account auto deliver ho jayega.",
+            t(uid, "pay_usdt_order", label=label, amount=total_usdt, addr=addr),
             parse_mode="Markdown")
         context.user_data["awaiting"] = "hash"
 
@@ -1907,14 +2368,32 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ---------- Main menu ----------
     if data == "back_menu":
-        await q.edit_message_text(await show_menu_text(uid), reply_markup=menu_kb())
+        await q.edit_message_text(await show_menu_text(uid), reply_markup=menu_kb(uid))
         return
 
     if data == "curr_toggle":
         new = "USDT" if user_currency(uid) == "PKR" else "PKR"
         set_user_currency(uid, new)
         await q.answer(f"Currency ab {new} hai.", show_alert=False)
-        await q.edit_message_text(await show_menu_text(uid), reply_markup=menu_kb())
+        await q.edit_message_text(await show_menu_text(uid), reply_markup=menu_kb(uid))
+        return
+
+    # ---------- Language ----------
+    if data == "lang_menu":
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🇵🇰 Roman Urdu", callback_data="lang_ur"),
+             InlineKeyboardButton("🇬🇧 English", callback_data="lang_en")],
+            [InlineKeyboardButton(t(uid, "prod_back_menu"), callback_data="back_menu")],
+        ])
+        await q.edit_message_text(t(uid, "lang_title"), reply_markup=kb)
+        return
+
+    if data in ("lang_ur", "lang_en"):
+        lang = "ur" if data == "lang_ur" else "en"
+        set_lang(uid, lang)
+        name = "Roman Urdu" if lang == "ur" else "English"
+        await q.answer(t(uid, "lang_set", name=name), show_alert=False)
+        await q.edit_message_text(await show_menu_text(uid), reply_markup=menu_kb(uid))
         return
 
     if data == "menu_products":
@@ -1930,10 +2409,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             kb.append([InlineKeyboardButton("👥 Telegram Group", url=tg_group_url())])
         if wa_channel_url():
             kb.append([InlineKeyboardButton("💬 WhatsApp Channel", url=wa_channel_url())])
-        kb.append([InlineKeyboardButton("⬅ Main Menu", callback_data="back_menu")])
+        kb.append([InlineKeyboardButton(t(uid, "prod_back_menu"), callback_data="back_menu")])
         await q.edit_message_text(
-            "📢 Hamare Channels\n\nTelegram channel join karna zaroori hai — bot khud check karta hai.\n"
-            "WhatsApp channel pe naye products aur offers milte hain.",
+            t(uid, "channels_title"),
             reply_markup=InlineKeyboardMarkup(kb))
         return
 
@@ -1946,9 +2424,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             kb.append([InlineKeyboardButton("👥 Telegram Group", url=tg_group_url())])
         if wa_channel_url():
             kb.append([InlineKeyboardButton("💬 WhatsApp Channel", url=wa_channel_url())])
-        kb.append([InlineKeyboardButton("⬅ Main Menu", callback_data="back_menu")])
+        kb.append([InlineKeyboardButton(t(uid, "prod_back_menu"), callback_data="back_menu")])
         await q.edit_message_text(
-            "🤝 Join Us\n\nHamare channels join karein — naye products, offers aur giveaways sabse pehle yahin milte hain.",
+            t(uid, "joinus_title"),
             reply_markup=InlineKeyboardMarkup(kb))
         return
 
@@ -1958,33 +2436,24 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "menu_support":
         sup = get_setting("support_username")
-        kb = [[InlineKeyboardButton("✉️ Send Message to Admin", callback_data="support_send")]]
+        kb = [[InlineKeyboardButton(t(uid, "support_send"), callback_data="support_send")]]
         if sup:
-            kb.append([InlineKeyboardButton("💬 Message Admin (Telegram)", url=f"https://t.me/{sup.lstrip('@')}")])
-        kb.append([InlineKeyboardButton("⬅ Main Menu", callback_data="back_menu")])
+            kb.append([InlineKeyboardButton(t(uid, "support_tg"), url=f"https://t.me/{sup.lstrip('@')}")])
+        kb.append([InlineKeyboardButton(t(uid, "prod_back_menu"), callback_data="back_menu")])
         await q.edit_message_text(
-            "💬 Support\n\nKoi issue ho — payment, account kaam na kare, ya order na mile — to neeche se admin ko message bhejein.",
+            t(uid, "support_title"),
             reply_markup=InlineKeyboardMarkup(kb))
         return
 
     if data == "support_send":
         context.user_data["awaiting"] = "support"
-        await q.edit_message_text("✉️ Apna message likhein — admin ko forward kar dunga.\n\n(Cancel ke liye /cancel likhein)")
+        await q.edit_message_text(t(uid, "support_prompt"))
         return
 
     if data == "menu_help":
         await q.edit_message_text(
-            "❓ Help — Kaise khareedein?\n\n"
-            "1️⃣ Products kholein, category ya search se product choose karein.\n"
-            "2️⃣ Quantity choose karein (bulk discount ho to kam price milegi).\n"
-            "3️⃣ Terms & Conditions parh ke Agree karein.\n"
-            "4️⃣ Order Summary check karein — coupon ho to Apply Coupon Code dabayein.\n"
-            "5️⃣ Payment karein: Easypaisa / JazzCash (TID ya screenshot bhejein), USDT TRC20 (TX hash bhejein), ya Zurvapay se JazzCash/Easypaisa/Raast QR — auto verify, account khud aa jayega. Wallet balance ho to Pay from Wallet bhi kar sakte hain.\n"
-
-            "6️⃣ Admin verify karte hi account isi chat me auto deliver ho jayega.\n\n"
-            "💰 Wallet me Deposit karke bhi pay kar sakte hain.\n"
-            "🎁 Pehli order pe FIRST-ORDER coupon se 7% off!",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Main Menu", callback_data="back_menu")]]))
+            t(uid, "help_text"),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(t(uid, "prod_back_menu"), callback_data="back_menu")]]))
         return
 
     if data == "menu_wallet":
@@ -1998,51 +2467,51 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "giv_verify":
         member, _err = await tg_is_member(context.bot, uid)
         if member is True:
-            await q.answer("✅ Verified! Aap giveaways ke liye eligible hain.", show_alert=True)
+            await q.answer(t(uid, "misc_giv_verified"), show_alert=True)
         elif member is None:
-            await q.answer("Check nahi ho saka — thodi der me dobara try karein.", show_alert=True)
+            await q.answer(t(uid, "misc_giv_check_fail"), show_alert=True)
         else:
-            await q.answer("Pehle Telegram channel join karein, phir verify dabayein.", show_alert=True)
+            await q.answer(t(uid, "misc_giv_join_first"), show_alert=True)
         return
 
     # ---------- Deposit ----------
     if data == "menu_deposit":
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("💚 Deposit in PKR", callback_data="dep_cur_PKR"),
-             InlineKeyboardButton("🪙 Deposit in USDT", callback_data="dep_cur_USDT")],
-            [InlineKeyboardButton("⬅ Wallet", callback_data="menu_wallet")],
+            [InlineKeyboardButton(t(uid, "dep_pkr"), callback_data="dep_cur_PKR"),
+             InlineKeyboardButton(t(uid, "dep_usdt"), callback_data="dep_cur_USDT")],
+            [InlineKeyboardButton(t(uid, "dep_back_wallet"), callback_data="menu_wallet")],
         ])
-        await q.edit_message_text("💰 Deposit\n\nCurrency choose karein (minimum amount 1):", reply_markup=kb)
+        await q.edit_message_text(t(uid, "dep_title"), reply_markup=kb)
         return
 
     if data.startswith("dep_cur_"):
         cur = data.split("_")[2]
         context.user_data["deposit_currency"] = cur
         context.user_data["awaiting"] = "dep_amount"
-        await q.edit_message_text(f"💰 Deposit ({cur})\n\nAmount bhejein — minimum 1 {cur}:")
+        await q.edit_message_text(t(uid, "dep_amount", cur=cur))
         return
 
     if data == "wal_topup":
         context.user_data["awaiting"] = "topup"
-        await q.edit_message_text("🎟️ Top-up code bhejein:")
+        await q.edit_message_text(t(uid, "topup_prompt"))
         return
 
     if data == "wal_stmt":
         entries = wallet_statement_entries(uid, limit=20)
-        text = "📄 Wallet Statement (last 20)\n\n" + ("\n".join(entries) if entries else "Koi entry nahi hai.")
+        text = "📄 Wallet Statement (last 20)\n\n" + ("\n".join(entries) if entries else t(uid, "wallet_stmt_none"))
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("⬇️ Download Statement (.txt)", callback_data="wal_stmt_dl")],
-            [InlineKeyboardButton("⬅ Wallet", callback_data="menu_wallet")],
+            [InlineKeyboardButton(t(uid, "wallet_stmt_dl"), callback_data="wal_stmt_dl")],
+            [InlineKeyboardButton(t(uid, "dep_back_wallet"), callback_data="menu_wallet")],
         ])
         await q.edit_message_text(text, reply_markup=kb)
         return
 
     if data == "wal_stmt_dl":
         entries = wallet_statement_entries(uid, limit=200)
-        txt = "RetailShop — Wallet Statement\n" + "\n".join(entries) if entries else "RetailShop — Wallet Statement\n\nKoi entry nahi hai."
+        txt = "RetailShop — Wallet Statement\n" + "\n".join(entries) if entries else "RetailShop — Wallet Statement\n\n" + t(uid, "wallet_stmt_none")
         await context.bot.send_document(
             uid, document=InputFile(io.BytesIO(txt.encode("utf-8")), filename="wallet_statement.txt"),
-            caption="📄 Aapki wallet statement.")
+            caption=t(uid, "wallet_stmt_caption"))
         return
 
     # ---------- Channel gate ----------
@@ -2053,22 +2522,22 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 kb = [[InlineKeyboardButton("💬 Join WhatsApp Channel", url=wa_channel_url())],
                       [InlineKeyboardButton("✅ Maine Join Kar Liya", callback_data="wa_joined")]]
                 await q.edit_message_text(
-                    "✅ Telegram channel joined! Ab WhatsApp channel bhi join kar lein.",
+                    t(uid, "gate_joined_tg"),
                     reply_markup=InlineKeyboardMarkup(kb))
                 return
-            await q.edit_message_text("✅ Channel joined! " + await show_menu_text(uid), reply_markup=menu_kb())
+            await q.edit_message_text(t(uid, "gate_thanks") + await show_menu_text(uid), reply_markup=menu_kb(uid))
             return
         if member is None:
-            await q.answer("Check nahi ho saka — bot channel me admin nahi hai.", show_alert=True)
+            await q.answer(t(uid, "misc_join_check_fail"), show_alert=True)
             return
-        await q.answer("Abhi join nahi hua — pehle channel join karein, phir dobara check karein.", show_alert=True)
+        await q.answer(t(uid, "misc_join_check"), show_alert=True)
         return
 
     if data == "wa_joined":
         # NOTE: WhatsApp channel join ko Telegram bot verify NAHI kar sakta —
         # WhatsApp ka koi public API nahi hai. Ye button user ke bharose pe hai.
         set_wa_joined(uid)
-        await q.edit_message_text("✅ Shukriya! " + await show_menu_text(uid), reply_markup=menu_kb())
+        await q.edit_message_text(t(uid, "gate_thanks") + await show_menu_text(uid), reply_markup=menu_kb(uid))
         return
 
     # ---------- Products list / detail ----------
@@ -2090,12 +2559,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "search_prod":
         context.user_data["awaiting"] = "search"
-        await q.edit_message_text("🔍 Product search karein — keyword bhejein (jaise 'muse' ya 'capcut'):")
+        await q.edit_message_text(t(uid, "search_prompt"))
         return
 
     if data == "req_prod":
         context.user_data["awaiting"] = "request"
-        await q.edit_message_text("📝 Konsa product chahiye? Naam + details bhejein — admin ko forward kar dunga:")
+        await q.edit_message_text(t(uid, "req_prompt"))
         return
 
     if data == "back_list":
@@ -2114,7 +2583,16 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("prod_"):
-        await render_product_detail(q, context, int(data.split("_")[1]))
+        pid = int(data.split("_")[1])
+        c = db(); p = c.execute("SELECT * FROM products WHERE id=?", (pid,)).fetchone(); c.close()
+        if p:
+            try:
+                unlimited = bool(p["unlimited"])
+            except Exception:
+                unlimited = False
+            if not unlimited and stock_count(pid) == 0:
+                await q.answer(t(uid, "prod_oos_alert"), show_alert=True)
+        await render_product_detail(q, context, pid)
         return
 
     # ---------- Reviews ----------
@@ -2136,7 +2614,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             c.execute("INSERT INTO carts(user_id,product_id,qty) VALUES(?,?,1)", (uid, pid))
         c.commit(); c.close()
-        await q.answer("🛒 Cart me add ho gaya!", show_alert=False)
+        await q.answer(t(uid, "cart_added"), show_alert=False)
         await render_product_detail(q, context, pid)
         return
 
@@ -2158,10 +2636,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "cart_checkout":
         lines = cart_lines_db(uid)
         if not lines:
-            await q.answer("Cart khaali hai.", show_alert=True); return
+            await q.answer(t(uid, "cart_empty_alert"), show_alert=True); return
         for l in lines:
             if not l["product"]["unlimited"] and l["qty"] > stock_count(l["pid"]):
-                await q.answer(f"{l['product']['name']} ka sirf {stock_count(l['pid'])} stock hai.", show_alert=True); return
+                await q.answer(t(uid, "cart_stock_alert", name=l['product']['name'], n=stock_count(l['pid'])), show_alert=True); return
         context.user_data["buy_mode"] = "cart"
         context.user_data["buy_items"] = [{"pid": l["pid"], "qty": l["qty"]} for l in lines]
         context.user_data["buy_code"] = gen_order_code()
@@ -2170,21 +2648,22 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await render_summary(q, context)
         return
 
-    # ---------- Buy flow ----------
+    # ---------- Buy flow (naya simplified flow) ----------
+    # category -> product detail (quantity + terms + agree) -> payment -> pay
     if data.startswith("buy_") or data.startswith("buyagain_"):
         pid = int(data.split("_")[1])
         c = db(); p = c.execute("SELECT * FROM products WHERE id=?", (pid,)).fetchone(); c.close()
         if not p:
-            await q.edit_message_text("Product nahi mila."); return
+            await q.edit_message_text(t(uid, "prod_not_found")); return
         if not p["unlimited"] and stock_count(pid) == 0:
-            await q.edit_message_text("❌ Is product ka stock khatam hai. Dusra product choose karein.")
+            await q.edit_message_text(t(uid, "prod_oos_msg"))
             return
         if p["price_pkr"] == 0 and p["price_usdt"] == 0:
             # FREE product — no payment, instant delivery
             code = gen_order_code()
             oid = create_order(uid, q.from_user.username or "", [{"pid": pid, "qty": 1}],
                                "free", "FREE", "free", 0, code, "", 0)
-            await q.edit_message_text(f"🎁 FREE product! Order #{oid} — account abhi bhej raha hun...")
+            await q.edit_message_text(t(uid, "buy_free", oid=oid))
             await deliver_order(context, oid)
             return
         context.user_data["buy_pid"] = pid
@@ -2193,7 +2672,57 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["buy_code"] = gen_order_code()
         context.user_data.pop("buy_coupon_code", None)
         context.user_data.pop("buy_items", None)
-        await render_qty(q, context, pid)
+        await render_product_detail(q, context, pid)
+        return
+
+    # Quantity + / − (detail screen pe)
+    if data.startswith("qtyinc_") or data.startswith("qtydec_"):
+        pid = int(data.split("_")[1])
+        c = db(); p = c.execute("SELECT * FROM products WHERE id=?", (pid,)).fetchone(); c.close()
+        if not p:
+            return
+        cur = int(context.user_data.get("buy_qty", 1) or 1)
+        if data.startswith("qtyinc_"):
+            new_qty = min(cur + 1, 99)
+            if not p["unlimited"] and new_qty > stock_count(pid):
+                await q.answer(t(uid, "qty_only_stock", n=stock_count(pid)), show_alert=True); return
+        else:
+            new_qty = max(cur - 1, 1)
+        context.user_data["buy_pid"] = pid
+        context.user_data["buy_mode"] = "single"
+        context.user_data["buy_qty"] = new_qty
+        if not context.user_data.get("buy_code"):
+            context.user_data["buy_code"] = gen_order_code()
+        await render_product_detail(q, context, pid)
+        return
+
+    if data == "qty_info":
+        pid = context.user_data.get("buy_pid")
+        qty = int(context.user_data.get("buy_qty", 1) or 1)
+        if pid:
+            c = db(); p = c.execute("SELECT * FROM products WHERE id=?", (pid,)).fetchone(); c.close()
+            if p:
+                await q.answer(t(uid, "prod_qty_info", qty=qty, total=fmt_money(unit_price_pkr(p, qty) * qty, uid)), show_alert=False)
+        return
+
+    # FREE product — detail screen se seedha delivery
+    if data.startswith("free_"):
+        pid = int(data.split("_")[1])
+        c = db(); p = c.execute("SELECT * FROM products WHERE id=?", (pid,)).fetchone(); c.close()
+        if not p:
+            await q.edit_message_text(t(uid, "prod_not_found")); return
+        if not (p["price_pkr"] == 0 and p["price_usdt"] == 0):
+            await render_product_detail(q, context, pid); return
+        code = gen_order_code()
+        oid = create_order(uid, q.from_user.username or "", [{"pid": pid, "qty": 1}],
+                           "free", "FREE", "free", 0, code, "", 0)
+        await q.edit_message_text(t(uid, "buy_free", oid=oid))
+        await deliver_order(context, oid)
+        return
+
+    # I Agree — detail screen se order summary (payment) pe jao
+    if data == "detail_agree" or data == "terms_ok":
+        await render_summary(q, context)
         return
 
     if data.startswith("qty_"):
@@ -2206,37 +2735,33 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not p:
             return
         if not p["unlimited"] and qty > stock_count(pid):
-            await q.answer(f"Sirf {stock_count(pid)} stock hai.", show_alert=True); return
+            await q.answer(t(uid, "qty_only_stock", n=stock_count(pid)), show_alert=True); return
         context.user_data["buy_pid"] = pid
         context.user_data["buy_mode"] = "single"
         context.user_data["buy_qty"] = qty
         if not context.user_data.get("buy_code"):
             context.user_data["buy_code"] = gen_order_code()
-        await render_terms(q, context)
+        await render_product_detail(q, context, pid)
         return
 
     if data.startswith("qtycustom_"):
         pid = int(data.split("_")[1])
         context.user_data["custom_pid"] = pid
         context.user_data["awaiting"] = "custom_qty"
-        await q.message.reply_text("🔢 Quantity kitni chahiye? Number bhejein (1–99):")
+        await q.message.reply_text(t(uid, "qty_prompt"))
         return
 
     if data.startswith("qtycur_"):
         pid = int(data.split("_")[1])
         new = "USDT" if user_currency(uid) == "PKR" else "PKR"
         set_user_currency(uid, new)
-        await render_qty(q, context, pid)
-        return
-
-    if data == "terms_ok":
-        await render_summary(q, context)
+        await render_product_detail(q, context, pid)
         return
 
     if data == "cancel_order":
         clear_buy_state(context)
         context.user_data.pop("awaiting", None)
-        await q.edit_message_text(await show_menu_text(uid), reply_markup=menu_kb())
+        await q.edit_message_text(await show_menu_text(uid), reply_markup=menu_kb(uid))
         return
 
     if data == "qty_change":
@@ -2245,26 +2770,28 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             pid = context.user_data.get("buy_pid")
             if pid:
-                await render_qty(q, context, pid)
+                await render_product_detail(q, context, pid)
             else:
                 await render_products_list(q, context, 0, None)
         return
 
     if data == "coupon_apply":
         context.user_data["awaiting"] = "coupon"
-        await q.message.reply_text("🎟️ Coupon code bhejein (jaise FIRST-ORDER):")
+        await q.message.reply_text(t(uid, "coupon_prompt"))
         return
 
     if data == "paypkr":
         lines, _sub, _disc, total = buy_totals(context, uid)
         if not lines:
-            await q.edit_message_text("Session expire ho gayi. /start se dobara karein."); return
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("💚 JazzCash", callback_data="pay_jazzcash")],
-            [InlineKeyboardButton("💚 Easypaisa", callback_data="pay_easypaisa")],
-            [InlineKeyboardButton("⬅ Back to Summary", callback_data="summary_back")],
-        ])
-        await q.edit_message_text(f"💳 Pay via PKR — Total: Rs {total}\n\nMethod choose karein:", reply_markup=kb)
+            await q.edit_message_text(t(uid, "sum_expired")); return
+        kb_rows = []
+        if zurvapay_enabled():
+            kb_rows.append([InlineKeyboardButton(t(uid, "sum_pay_zurva"), callback_data="pay_zurvapay")])
+        kb_rows.append([InlineKeyboardButton(t(uid, "sum_pay_easypaisa"), callback_data="pay_easypaisa")])
+        kb_rows.append([InlineKeyboardButton(t(uid, "sum_pay_jazzcash"), callback_data="pay_jazzcash")])
+        kb_rows.append([InlineKeyboardButton(t(uid, "sum_cancel"), callback_data="summary_back")])
+        kb = InlineKeyboardMarkup(kb_rows)
+        await q.edit_message_text(t(uid, "pay_pkr_title", total=total), reply_markup=kb)
         return
 
     if data == "payusdt":
@@ -2278,12 +2805,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "pay_wallet":
         lines, _sub, discount, total = buy_totals(context, uid)
         if not lines:
-            await q.edit_message_text("Session expire ho gayi. /start se dobara karein."); return
+            await q.edit_message_text(t(uid, "sum_expired")); return
         cur = user_currency(uid)
         need = total if cur == "PKR" else round(total / USDT_RATE, 2)
         bal = get_wallet(uid, cur)
         if bal < need:
-            await q.answer("Wallet balance kam hai. Pehle Deposit karein.", show_alert=True); return
+            await q.answer(t(uid, "buy_wallet_low"), show_alert=True); return
         code = context.user_data.get("buy_code") or gen_order_code()
         coupon_code = context.user_data.get("buy_coupon_code") or ""
         items = [{"pid": l["pid"], "qty": l["qty"]} for l in lines]
@@ -2293,15 +2820,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if context.user_data.get("buy_mode") == "cart":
             c = db(); c.execute("DELETE FROM carts WHERE user_id=?", (uid,)); c.commit(); c.close()
         clear_buy_state(context)
-        await q.edit_message_text(f"✅ Wallet se payment ho gayi! Order #{oid} — account abhi bhej raha hun...")
+        await q.edit_message_text(t(uid, "buy_wallet_paid", oid=oid))
         ok = await deliver_order(context, oid)
         if not ok:
             add_wallet(uid, cur, need)  # refund — stock khatam thi
-            await context.bot.send_message(uid, "⚠️ Delivery nahi ho saki (stock khatam) — wallet refund kar diya gaya hai.")
+            await context.bot.send_message(uid, t(uid, "buy_wallet_refund"))
         return
 
     if data.startswith("pay_"):
-        method = data.split("_")[1]  # jazzcash / easypaisa / usdt
+        method = data.split("_")[1]  # zurvapay / easypaisa / jazzcash / usdt
         await start_payment(q, context, method)
         return
 
@@ -2314,7 +2841,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         oid = int(data.split("_")[1])
         c = db(); o = c.execute("SELECT * FROM orders WHERE id=? AND user_id=?", (oid, uid)).fetchone(); c.close()
         if not o or o["status"] != "delivered":
-            await q.answer("Review sirf delivered order pe likhi ja sakti hai.", show_alert=True); return
+            await q.answer(t(uid, "rev_only_delivered"), show_alert=True); return
         c = db(); p = c.execute("SELECT name FROM products WHERE id=?", (o["product_id"],)).fetchone(); c.close()
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("⭐1", callback_data=f"revrate_{oid}_1"),
@@ -2335,7 +2862,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         context.user_data["review"] = {"oid": oid, "rating": rating}
         context.user_data["awaiting"] = "review_text"
-        await q.message.reply_text(f"⭐ Rating: {rating}/5\n\nAb apni review likhein (text bhejein):")
+        await q.message.reply_text(t(uid, "rev_rating", rating=rating))
         return
 
     # ---------- Admin approve / reject ----------
@@ -2423,7 +2950,7 @@ async def _handle_buy_proof(update, context, deposit=False):
         if awaiting == "dep_hash":
             tx = (update.message.text or "").strip()
             if len(tx) < 20:
-                await update.message.reply_text("Ye hash lagta nahi. Poora Transaction Hash bhejein (TronScan link se copy karein)."); return
+                await update.message.reply_text(t(user.id, "buy_hash_short")); return
             addr = get_setting("usdt_address")
             ok, reason = verify_usdt(tx, addr, float(amount))
             if ok:
@@ -2433,14 +2960,14 @@ async def _handle_buy_proof(update, context, deposit=False):
                 dep_id = cur.lastrowid; c.commit(); c.close()
                 add_wallet(user.id, currency, amount)
                 context.user_data.clear()
-                await update.message.reply_text(f"✅ USDT verified! {reason}\nDeposit #{dep_id} — {amount} {currency} aapke wallet me add ho gaye.")
+                await update.message.reply_text(t(user.id, "dep_usdt_verified", reason=reason, id=dep_id, amount=amount, currency=currency))
                 return
             c = db(); cur = c.execute(
                 "INSERT INTO deposits(user_id,username,currency,amount,payment_method,proof,status,created_at) VALUES(?,?,?,?,?,?, 'pending', ?)",
                 (user.id, user.username or "", currency, amount, "usdt", tx, datetime.now().strftime("%Y-%m-%d %H:%M")))
             dep_id = cur.lastrowid; c.commit(); c.close()
             context.user_data.clear()
-            await update.message.reply_text(f"⚠️ Auto-verify nahi hui: {reason}\nDeposit #{dep_id} admin ko bhej di hai — wo manually check karke credit karega.")
+            await update.message.reply_text(t(user.id, "dep_usdt_fail", reason=reason, id=dep_id))
             await notify_admin_deposit(context, dep_id)
             return
         # dep_tid (manual PKR)
@@ -2449,7 +2976,7 @@ async def _handle_buy_proof(update, context, deposit=False):
             (user.id, user.username or "", currency, amount, method, proof, datetime.now().strftime("%Y-%m-%d %H:%M")))
         dep_id = cur.lastrowid; c.commit(); c.close()
         context.user_data.clear()
-        await update.message.reply_text(f"✅ Deposit #{dep_id} mil gayi! Admin verify kar raha hai. Approve hote hi wallet credit ho jayega.")
+        await update.message.reply_text(t(user.id, "dep_received", id=dep_id))
         await notify_admin_deposit(context, dep_id)
         return
 
@@ -2458,7 +2985,7 @@ async def _handle_buy_proof(update, context, deposit=False):
     method = context.user_data.get("pay_method", "?")
     if not lines:
         context.user_data.clear()
-        await update.message.reply_text("Session expire ho gayi. /start se dobara karein.")
+        await update.message.reply_text(t(user.id, "misc_expired"))
         return
     awaiting = context.user_data.get("awaiting")
     code = context.user_data.get("buy_code") or gen_order_code()
@@ -2474,13 +3001,13 @@ async def _handle_buy_proof(update, context, deposit=False):
         if context.user_data.get("buy_mode") == "cart":
             c = db(); c.execute("DELETE FROM carts WHERE user_id=?", (user.id,)); c.commit(); c.close()
         context.user_data.clear()
-        await update.message.reply_text(f"✅ Order #{oid} ({code}) mil gayi! Admin verify kar raha hai. Approve hote hi account isi chat me aa jayega.")
+        await update.message.reply_text(t(user.id, "buy_order_received", oid=oid, code=code))
         await notify_admin_pending(context, oid)
 
     elif awaiting == "hash":
         tx = (update.message.text or "").strip()
         if len(tx) < 20:
-            await update.message.reply_text("Ye hash lagta nahi. Poora Transaction Hash bhejein (TronScan link se copy karein)."); return
+            await update.message.reply_text(t(user.id, "buy_hash_short")); return
         addr = get_setting("usdt_address")
         total_usdt = round(total / USDT_RATE, 2)
         ok, reason = verify_usdt(tx, addr, total_usdt)
@@ -2489,7 +3016,7 @@ async def _handle_buy_proof(update, context, deposit=False):
             if context.user_data.get("buy_mode") == "cart":
                 c = db(); c.execute("DELETE FROM carts WHERE user_id=?", (user.id,)); c.commit(); c.close()
             context.user_data.clear()
-            await update.message.reply_text(f"✅ USDT verified! {reason}\nOrder #{oid} ({code}) — account abhi bhej raha hun...")
+            await update.message.reply_text(t(user.id, "buy_usdt_verified", reason=reason, oid=oid, code=code))
             await deliver_order(context, oid)
         else:
             # verify fail -> pending for manual admin check, buyer ko batao
@@ -2497,7 +3024,7 @@ async def _handle_buy_proof(update, context, deposit=False):
             if context.user_data.get("buy_mode") == "cart":
                 c = db(); c.execute("DELETE FROM carts WHERE user_id=?", (user.id,)); c.commit(); c.close()
             context.user_data.clear()
-            await update.message.reply_text(f"⚠️ Auto-verify nahi hui: {reason}\nOrder #{oid} ({code}) admin ko bhej di hai — wo manually check karke deliver karega.")
+            await update.message.reply_text(t(user.id, "buy_usdt_fail", reason=reason, oid=oid, code=code))
             await notify_admin_pending(context, oid)
 
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2524,7 +3051,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             (user.id, user.username or "", text, "user", datetime.now().strftime("%Y-%m-%d %H:%M")))
         c.commit(); c.close()
         context.user_data.pop("awaiting", None)
-        await update.message.reply_text("✅ Aapka message admin ko bhej diya gaya hai. Jawab isi chat me aayega.")
+        await update.message.reply_text(t(user.id, "support_sent"))
         await context.bot.send_message(
             ADMIN_ID,
             f"💬 Support message\nFrom: @{user.username or user.id} ({user.id})\n\n{text}\n\nReply ke liye: /reply {user.id} <text>")
@@ -2540,7 +3067,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["buy_coupon_code"] = code.strip().upper()
         context.user_data.pop("awaiting", None)
         await update.message.reply_text(
-            f"✅ Coupon {code.strip().upper()} apply ho gaya! {FIRST_COUPON_PCT}% off — summary dobara dikha raha hun...",
+            t(user.id, "coupon_applied", code=code.strip().upper(), pct=FIRST_COUPON_PCT),
             reply_markup=None)
         # summary dobara bhejdo (message handler se edit nahi ho sakta)
         await update.message.reply_text(summary_text(user.id, context), reply_markup=summary_kb(user.id, context))
@@ -2553,11 +3080,11 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         c = db(); prods = c.execute("SELECT * FROM products WHERE active=1 AND name LIKE ? ORDER BY id LIMIT 10", (f"%{kw}%",)).fetchall(); c.close()
         if not prods:
-            await update.message.reply_text(f"🔍 '{kw}' — koi product nahi mila.", reply_markup=menu_kb())
+            await update.message.reply_text(t(user.id, "search_none", kw=kw), reply_markup=menu_kb(user.id))
             return
         kb = []
         for p in prods:
-            kb.append([InlineKeyboardButton(f"{_short_name(p['name'])} — {price_text(p, user.id)} ({stock_tag(p)})",
+            kb.append([InlineKeyboardButton(product_btn_label(p, user.id),
                                             callback_data=f"prod_{p['id']}")])
         kb.append([InlineKeyboardButton("⬅ Products", callback_data="menu_products")])
         await update.message.reply_text(f"🔍 Search results for '{kw}':", reply_markup=InlineKeyboardMarkup(kb))
@@ -2568,7 +3095,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("awaiting", None)
         if not text:
             return
-        await update.message.reply_text("✅ Aapki request admin ko bhej di gayi hai. Shukriya!")
+        await update.message.reply_text(t(user.id, "req_sent"))
         await context.bot.send_message(
             ADMIN_ID,
             f"📝 Product request\nFrom: @{user.username or user.id} ({user.id})\n\n{text}")
@@ -2587,7 +3114,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         c.execute("INSERT INTO reviews(product_id,user_name,rating,text,verified,source) VALUES(?,?,?,?,1,'user')",
                   (o["product_id"], name, rev["rating"], text))
         c.commit(); c.close()
-        await update.message.reply_text("✅ Shukriya! Aapki review save ho gayi.")
+        await update.message.reply_text(t(user.id, "rev_saved"))
         return
 
     if awaiting == "topup":
@@ -2597,12 +3124,12 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         c = db(); r = c.execute("SELECT * FROM topup_codes WHERE code=?", (code,)).fetchone()
         if not r:
-            c.close(); await update.message.reply_text("❌ Ye top-up code galat hai."); return
+            c.close(); await update.message.reply_text(t(user.id, "topup_wrong")); return
         if r["used_by"]:
-            c.close(); await update.message.reply_text("❌ Ye code pehle hi use ho chuka hai."); return
+            c.close(); await update.message.reply_text(t(user.id, "topup_used")); return
         c.execute("UPDATE topup_codes SET used_by=? WHERE code=?", (user.id, code)); c.commit(); c.close()
         add_wallet(user.id, r["currency"], r["amount"])
-        await update.message.reply_text(f"✅ Top-up successful! {r['amount']} {r['currency']} aapke wallet me add ho gaye.")
+        await update.message.reply_text(t(user.id, "topup_ok", amount=r['amount'], currency=r['currency']))
         return
 
     if awaiting == "dep_amount":
@@ -2610,27 +3137,26 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             amount = float((update.message.text or "").strip())
         except ValueError:
-            await update.message.reply_text("Sirf number bhejein (jaise 500):"); return
+            await update.message.reply_text(t(user.id, "misc_only_number")); return
         if amount < 1:
-            await update.message.reply_text("Minimum deposit 1 hai. Dobara amount bhejein:"); return
+            await update.message.reply_text(t(user.id, "misc_min_deposit")); return
         context.user_data["deposit"] = {"currency": cur, "amount": amount}
         context.user_data.pop("awaiting", None)
         if cur == "PKR":
-            kb_rows = [
-                [InlineKeyboardButton("💚 JazzCash", callback_data="pay_jazzcash"),
-                 InlineKeyboardButton("💚 Easypaisa", callback_data="pay_easypaisa")],
-            ]
+            kb_rows = []
             if zurvapay_enabled():
-                kb_rows.append([InlineKeyboardButton("⚡ Zurvapay (Auto) — JazzCash/Easypaisa/Raast", callback_data="pay_zurvapay")])
-            kb_rows.append([InlineKeyboardButton("⬅ Back", callback_data="menu_deposit")])
+                kb_rows.append([InlineKeyboardButton(t(user.id, "sum_pay_zurva"), callback_data="pay_zurvapay")])
+            kb_rows.append([InlineKeyboardButton(t(user.id, "sum_pay_easypaisa"), callback_data="pay_easypaisa"),
+                            InlineKeyboardButton(t(user.id, "sum_pay_jazzcash"), callback_data="pay_jazzcash")])
+            kb_rows.append([InlineKeyboardButton(t(user.id, "dep_back"), callback_data="menu_deposit")])
             kb = InlineKeyboardMarkup(kb_rows)
-            await update.message.reply_text(f"💰 Deposit Rs {amount} — payment method choose karein:", reply_markup=kb)
+            await update.message.reply_text(t(user.id, "dep_method_pkr", amount=amount), reply_markup=kb)
         else:
             kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🪙 USDT (TRC20)", callback_data="pay_usdt")],
-                [InlineKeyboardButton("⬅ Back", callback_data="menu_deposit")],
+                [InlineKeyboardButton(t(user.id, "sum_pay_usdt"), callback_data="pay_usdt")],
+                [InlineKeyboardButton(t(user.id, "dep_back"), callback_data="menu_deposit")],
             ])
-            await update.message.reply_text(f"💰 Deposit ${amount} USDT — payment method choose karein:", reply_markup=kb)
+            await update.message.reply_text(t(user.id, "dep_method_usdt", amount=amount), reply_markup=kb)
         return
 
     if awaiting == "custom_qty":
@@ -2639,28 +3165,28 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             qty = int((update.message.text or "").strip())
         except ValueError:
-            await update.message.reply_text("Sirf number bhejein (1–99):"); return
+            await update.message.reply_text(t(user.id, "qty_number_only")); return
         if qty < 1 or qty > 99:
-            await update.message.reply_text("Quantity 1 se 99 ke beech honi chahiye."); return
+            await update.message.reply_text(t(user.id, "qty_range")); return
         c = db(); p = c.execute("SELECT * FROM products WHERE id=?", (pid,)).fetchone(); c.close()
         if not p:
             return
         if not p["unlimited"] and qty > stock_count(pid):
-            await update.message.reply_text(f"❌ Sirf {stock_count(pid)} stock hai."); return
+            await update.message.reply_text(t(user.id, "qty_only_stock", n=stock_count(pid))); return
         context.user_data["buy_pid"] = pid
         context.user_data["buy_mode"] = "single"
         context.user_data["buy_qty"] = qty
         if not context.user_data.get("buy_code"):
             context.user_data["buy_code"] = gen_order_code()
-        lines, _sub, _disc, total = buy_totals(context, user.id)
-        terms = terms_for_product(p)
-        text = (f"📜 Terms & Conditions\n\n{terms}\n\n"
-                f"Order: {p['name']} × {qty}\nTotal: {fmt_money(total, user.id)}")
+        # Naya flow: quantity set ho gayi — user ab I Agree dabake payment pe
+        # ja sakta hai (detail screen pe wapas jaane ki zaroorat nahi).
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Agree & Continue to Payment", callback_data="terms_ok")],
-            [InlineKeyboardButton("❌ Cancel", callback_data="cancel_order")],
+            [InlineKeyboardButton(t(user.id, "prod_agree"), callback_data="detail_agree")],
+            [InlineKeyboardButton(t(user.id, "prod_back_products"), callback_data=f"prod_{pid}")],
         ])
-        await update.message.reply_text(text, reply_markup=kb)
+        await update.message.reply_text(
+            t(user.id, "prod_qty_info", qty=qty, total=fmt_money(unit_price_pkr(p, qty) * qty, user.id)),
+            reply_markup=kb)
         return
 
 # ---------- Admin ----------
