@@ -37,15 +37,18 @@ m = bot.load_ahm7_mapping()
 check("mapping has 26 products", len(m) == 26, f"got {len(m)}")
 mapped = [v for v in m.values() if v["ahm7_product_id"]]
 check("mapping: 21 mapped", len(mapped) == 21, f"got {len(mapped)}")
-check("mapping: 8 profitable at site prices",
-      sum(1 for v in mapped if (v["margin_pkr"] or 0) > 0) == 8)
-check("mapping: 13 loss/breakeven (guard blocks)",
-      sum(1 for v in mapped if (v["margin_pkr"] or 0) <= 0) == 13)
+check("mapping: 18 profitable at site prices (+100)",
+      sum(1 for v in mapped if (v["margin_pkr"] or 0) > 0) == 18,
+      f"got {sum(1 for v in mapped if (v['margin_pkr'] or 0) > 0)}")
+check("mapping: 3 loss/breakeven (guard blocks)",
+      sum(1 for v in mapped if (v["margin_pkr"] or 0) <= 0) == 3)
+check("mapping: Muse Ai 1B Credits site price is 171 (+100)",
+      m["Muse Ai 1B Credits"]["site_price_pkr"] == 171)
 check("mapping: 5 no-match", sum(1 for v in m.values() if not v["ahm7_product_id"]) == 5)
-for name, want in [("Bolt .new Pro 1 Month", -504), ("500$ API CLAUDE 30D (FW)", -171),
-                   ("Muse Ai 31B Token (NW)", -165), ("Muse Ai 1B Credits", -2),
-                   ("Gemini Plus 6m Links (No Card Required)", 113),
-                   ("Amazon Prime 6 Months", 31)]:
+for name, want in [("Bolt .new Pro 1 Month", -404), ("500$ API CLAUDE 30D (FW)", -71),
+                   ("Muse Ai 31B Token (NW)", -65), ("Muse Ai 1B Credits", 98),
+                   ("Gemini Plus 6m Links (No Card Required)", 213),
+                   ("Amazon Prime 6 Months", 131)]:
     check(f"margin {name} = {want}", m[name]["margin_pkr"] == want, f"got {m[name]['margin_pkr']}")
 
 # ---------- 2. auth ----------
@@ -95,8 +98,8 @@ check("checkout: success_url/cancel_url = order page",
       f"got {init_args}")
 c = bot.db()
 o = c.execute("SELECT * FROM orders WHERE code=?", (code,)).fetchone()
-check("checkout: order in DB, channel=web, amount=site price 379, uid=0",
-      o and o["channel"] == "web" and o["amount_pkr"] == 379 and o["user_id"] == 0,
+check("checkout: order in DB, channel=web, amount=site price 479, uid=0",
+      o and o["channel"] == "web" and o["amount_pkr"] == 479 and o["user_id"] == 0,
       f"got {dict(o) if o else None}")
 check("checkout: delivery_token + web_contact stored",
       o and o["delivery_token"] == tok and o["web_contact"] == "buyer@example.com",
@@ -112,7 +115,7 @@ check("checkout: no contact field still works", s2 == 200 and out2.get("order_co
 bolt_pid = pid_by_name("Bolt .new Pro 1 Month")
 bolt_code = bot.gen_order_code()
 bolt_oid = bot.create_order(0, "", [{"pid": bolt_pid, "qty": 1}], "zurvapay",
-                            "Rs 399 via Zurvapay (web)", "zurvapay", 399, bolt_code, "", 0, channel="web")
+                            "Rs 499 via Zurvapay (web)", "zurvapay", 499, bolt_code, "", 0, channel="web")
 c = bot.db(); c.execute("UPDATE orders SET status='zurva_processing' WHERE id=?", (bolt_oid,)); c.commit(); c.close()
 real_place = bot.ahm7_place_order
 def _place_guard(*a, **k):
@@ -126,12 +129,12 @@ check("margin guard: status ahm7_pending + note",
       o["status"] == "ahm7_pending" and "margin guard" in (o["ahm7_note"] or ""), f"got {dict(o)}")
 
 # ---------- 6. 402 path (Gemini, profitable) ----------
-def _place_402(pid, ref):
+def _place_402(pid, ref, quantity=1):
     calls["place"] += 1
     return None, "AHM7 error HTTP 402: insufficient_balance (needed: 300, balances: {'pkr': 0})"
 bot.ahm7_place_order = _place_402
 gem_oid = bot.create_order(0, "", [{"pid": gem_pid, "qty": 1}], "zurvapay",
-                           "Rs 379 via Zurvapay (web)", "zurvapay", 379, bot.gen_order_code(), "", 0, channel="web")
+                           "Rs 479 via Zurvapay (web)", "zurvapay", 479, bot.gen_order_code(), "", 0, channel="web")
 c = bot.db(); c.execute("UPDATE orders SET status='zurva_processing' WHERE id=?", (gem_oid,)); c.commit(); c.close()
 ok, msg = bot.fulfill_web_order(gem_oid)
 check("402 path: returns False, no crash", ok is False, f"ok={ok} msg={msg}")
@@ -140,7 +143,7 @@ check("402 path: status ahm7_pending, note has 402",
       o["status"] == "ahm7_pending" and "402" in (o["ahm7_note"] or ""), f"got {dict(o)}")
 
 # ---------- 7. success path (mocked buy; delivery = order page, no DM) ----------
-def _place_ok(pid, ref):
+def _place_ok(pid, ref, quantity=1):
     calls["place"] += 1
     return ({"orderId": "AHM7-TEST123", "status": "approved", "totalCharged": 266,
              "currency": "pkr", "credentials": ["test@example.com | Pass123"],
@@ -200,7 +203,7 @@ check("status: missing token -> 404", s == 404, f"got {s} {out}")
 s, out = bot.handle_order_status(code, tok, {"X-Web-Secret": "wrong"}, "1.2.3.4")
 check("status: wrong secret -> 404, no leak", s == 404, f"got {s} {out}")
 tg_oid = bot.create_order(999, "tguser", [{"pid": gem_pid, "qty": 1}], "zurvapay",
-                          "Rs 379 via Zurvapay", "zurvapay", 379, bot.gen_order_code(), "", 0, channel="telegram")
+                          "Rs 479 via Zurvapay", "zurvapay", 479, bot.gen_order_code(), "", 0, channel="telegram")
 c = bot.db(); tg_code = c.execute("SELECT code FROM orders WHERE id=?", (tg_oid,)).fetchone()["code"]; c.close()
 s, out = bot.handle_order_status(tg_code, GEM_TOKEN, H, "1.2.3.4")
 check("status: telegram order -> 404 (web only)", s == 404, f"got {s} {out}")
@@ -212,11 +215,11 @@ check("status: rate limit 31st call -> 429", rl[:30] == [200] * 30 and rl[30] ==
 # ---------- 11. IPN integration (mocked signature verify) ----------
 bot.ahm7_place_order = _place_402
 ipn_oid = bot.create_order(0, "", [{"pid": gem_pid, "qty": 1}], "zurvapay",
-                           "Rs 379 via Zurvapay (web)", "zurvapay", 379, bot.gen_order_code(), "", 0, channel="web")
+                           "Rs 479 via Zurvapay (web)", "zurvapay", 479, bot.gen_order_code(), "", 0, channel="web")
 c = bot.db(); icode = c.execute("SELECT code FROM orders WHERE id=?", (ipn_oid,)).fetchone()["code"]; c.close()
 real_verify = bot.verify_zurvapay_ipn
 bot.verify_zurvapay_ipn = lambda data, raw_body=b"", headers=None: (True, "test")
-f = {"identifier": icode, "amount": "379", "status": "success", "signature": "x",
+f = {"identifier": icode, "amount": "479", "status": "success", "signature": "x",
      "signatures": ["x"], "txid": "TESTTX1"}
 ok, msg = bot._zurva_handle_order_ipn(icode, f)
 check("IPN: web order -> paid-pending (402), IPN handled True", ok is True and "paid-pending" in msg, f"ok={ok} msg={msg}")
@@ -225,6 +228,76 @@ check("IPN: order status ahm7_pending", o["status"] == "ahm7_pending", f"got {o[
 ok2, msg2 = bot._zurva_handle_order_ipn(icode, f)
 check("IPN: duplicate IPN does not re-process", ok2 is True and "pehle hi" in msg2, f"ok={ok2} msg={msg2}")
 bot.verify_zurvapay_ipn = real_verify
+
+
+# ---------- 13. cart checkout (multi-item) ----------
+ama_pid = pid_by_name("Amazon Prime 6 Months")
+muse_pid = pid_by_name("Muse Ai 1B Credits")
+# validation
+s, out = bot.handle_web_checkout({"items": []}, H)
+check("cart: empty items -> 400", s == 400, f"got {s} {out}")
+s, out = bot.handle_web_checkout({"items": [{"product_id": gem_pid, "qty": 0}]}, H)
+check("cart: qty 0 -> 400", s == 400, f"got {s} {out}")
+s, out = bot.handle_web_checkout({"items": [{"product_id": gem_pid, "qty": 11}]}, H)
+check("cart: qty 11 -> 400", s == 400, f"got {s} {out}")
+s, out = bot.handle_web_checkout({"items": [{"product_id": 99999, "qty": 1}]}, H)
+check("cart: unknown product -> 404", s == 404, f"got {s} {out}")
+s, out = bot.handle_web_checkout({"items": [{"product_id": gem_pid, "qty": 1},
+                                           {"product_id": ama_pid, "qty": 2}]}, H)
+check("cart: checkout 200 + checkout_url",
+      s == 200 and out.get("checkout_url", "").startswith("https://"),
+      f"got {s} {out}")
+cart_code = out.get("order_code", "")
+c = bot.db()
+o = c.execute("SELECT * FROM orders WHERE code=?", (cart_code,)).fetchone()
+c.close()
+check("cart: order total = 479 + 799*2 = 2077",
+      o and o["amount_pkr"] == 2077, f"got {dict(o) if o else None}")
+check("cart: items_json has both lines",
+      o and len(json.loads(o["items_json"])) == 2, f"got {o['items_json'] if o else None}")
+# multi-line fulfillment (mocked buy, per-line creds with labels)
+def _place_multi(pid, ref, quantity=1):
+    calls["place"] += 1
+    return ({"orderId": f"AHM7-{pid}", "status": "approved", "totalCharged": 100,
+             "currency": "pkr",
+             "credentials": [{"email": f"user-{pid}@example.com", "password": f"P{pid}"}],
+             "product": {}}, None)
+bot.ahm7_place_order = _place_multi
+calls["place"] = 0
+c = bot.db(); c.execute("UPDATE orders SET status='zurva_processing' WHERE id=?", (o["id"],)); c.commit(); c.close()
+ok, msg = bot.fulfill_web_order(o["id"])
+check("cart fulfill: delivered True, 2 AHM7 calls", ok is True and calls["place"] == 2, f"ok={ok} msg={msg} calls={calls['place']}")
+c = bot.db(); o2 = c.execute("SELECT status, ahm7_order_id, ahm7_credentials FROM orders WHERE id=?", (o["id"],)).fetchone(); c.close()
+creds2 = json.loads(o2["ahm7_credentials"] or "[]")
+check("cart fulfill: status delivered, both AHM7 ids stored",
+      o2["status"] == "delivered"
+      and len((o2["ahm7_order_id"] or "").split(",")) == 2
+      and all(x.startswith("AHM7-") for x in (o2["ahm7_order_id"] or "").split(",")),
+      f"got {dict(o2)}")
+check("cart fulfill: creds carry product labels",
+      len(creds2) == 2 and any(x.get("label", "").startswith("Gemini") for x in creds2)
+      and any(x.get("label", "").startswith("Amazon") for x in creds2), f"got {creds2}")
+# cart with a loss-maker: profitable line delivers, loss line blocks, order stays pending
+cart2_code = bot.gen_order_code()
+cart2_oid = bot.create_order(0, "", [{"pid": gem_pid, "qty": 1}, {"pid": bolt_pid, "qty": 1}],
+                             "zurvapay", "Rs 978 via Zurvapay (web)", "zurvapay", 978,
+                             cart2_code, "", 0, channel="web")
+c = bot.db(); c.execute("UPDATE orders SET status='zurva_processing' WHERE id=?", (cart2_oid,)); c.commit(); c.close()
+ok, msg = bot.fulfill_web_order(cart2_oid)
+c = bot.db(); o3 = c.execute("SELECT status, ahm7_credentials, ahm7_note FROM orders WHERE id=?", (cart2_oid,)).fetchone(); c.close()
+creds3 = json.loads(o3["ahm7_credentials"] or "[]")
+check("cart margin guard: pending, Gemini creds saved, note names Bolt",
+      ok is False and o3["status"] == "ahm7_pending"
+      and len(creds3) == 1 and creds3[0].get("label", "").startswith("Gemini")
+      and "margin guard" in (o3["ahm7_note"] or "") and "Bolt" in (o3["ahm7_note"] or ""),
+      f"ok={ok} msg={msg} got {dict(o3)}")
+# retry must not re-buy the delivered Gemini line
+calls["place"] = 0
+bot.ahm7_place_order = _place_guard
+ok, msg = bot.fulfill_web_order(cart2_oid)
+check("cart retry: no re-buy of delivered line, still pending on Bolt",
+      ok is False and calls["place"] == 0, f"ok={ok} msg={msg} calls={calls['place']}")
+bot.ahm7_place_order = real_place
 
 # ---------- 12. HTTP layer (real health server) ----------
 bot.zurvapay_initiate = real_initiate

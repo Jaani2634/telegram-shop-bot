@@ -2265,6 +2265,13 @@ def handle_order_status(code, token, headers=None, client_ip=""):
         return 404, {"ok": False, "error": "not found"}
     c = db(); p = c.execute("SELECT name FROM products WHERE id=?", (o["product_id"],)).fetchone(); c.close()
     pname = p["name"] if p else ""
+    try:
+        _lines = json.loads(o["items_json"] or "[]")
+        _n = len(_lines) if isinstance(_lines, list) else 0
+    except Exception:
+        _n = 0
+    if _n > 1 and pname:
+        pname = f"{pname} (+{_n - 1} more)"
     out = {"ok": True, "code": code, "product": pname, "amount_pkr": o["amount_pkr"]}
     status = o["status"]
     if status == "delivered":
@@ -2285,16 +2292,24 @@ def handle_order_status(code, token, headers=None, client_ip=""):
     out["message"] = "Payment confirm ho rahi hai — order process ho raha hai."
     return 200, out
 
-def ahm7_place_order(product_id, customer_ref):
-    """AHM7 POST /v1/orders (currency pkr, Idempotency-Key = RetailShop order
-    code — retry kabhi double-buy nahi karta). Returns (order_dict, None)
+def ahm7_place_order(product_id, customer_ref, quantity=1):
+    """AHM7 POST /v1/orders (currency pkr, Idempotency-Key = customer_ref —
+    retry kabhi double-buy nahi karta). quantity: usi product ki kitni
+    units (1–100). Cart orders me har distinct product ki apni call hoti
+    hai, is liye customer_ref har line ke liye alag hona chahiye
+    (maslan f"{order_code}-{pid}"). Returns (order_dict, None)
     ya (None, error_string). API-level failures kabhi raise nahi karte."""
     if not AHM7_API_KEY:
         return None, "AHM7_API_KEY set nahi hai (Botkeep env me add karein)"
     try:
+        quantity = int(quantity)
+    except Exception:
+        quantity = 1
+    quantity = max(1, min(100, quantity))
+    try:
         r = requests.post(
             f"{AHM7_BASE_URL}/orders",
-            json={"productId": product_id, "quantity": 1, "currency": "pkr",
+            json={"productId": product_id, "quantity": quantity, "currency": "pkr",
                   "customerRef": customer_ref},
             headers={"X-Api-Key": AHM7_API_KEY, "Idempotency-Key": customer_ref,
                      "Content-Type": "application/json"},
@@ -2326,8 +2341,12 @@ def fulfill_web_order(order_id):
     """Paid web order -> AHM7 auto-buy -> credentials order row me save.
     Delivery website ke order page pe hoti hai (GET /api/order/<code> +
     delivery token) — Telegram DM NAHI (same-channel rule).
-    Returns (True, msg) jab delivered, (False, reason) jab paid-pending
-    (manual review / wallet top-up ke baad retry). Business failures kabhi
+    Cart orders me items_json ki har line alag AHM7 buy hoti hai
+    (Idempotency-Key = f"{code}-{pid}", is liye retry kabhi double-buy
+    nahi karta). Koi line fail ho to poora order 'ahm7_pending' me rehta
+    hai — pehle se khareedi lines ki credentials save rehti hain aur
+    retry sirf baaki lines khareedta hai. Returns (True, msg) jab
+    delivered, (False, reason) jab paid-pending. Business failures kabhi
     raise nahi karte — order hamesha 'ahm7_pending' me safe rehta hai."""
     c = db()
     o = c.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
@@ -2338,87 +2357,165 @@ def fulfill_web_order(order_id):
         return True, "already delivered"
     if o["status"] not in ("zurva_processing", "ahm7_pending"):
         return False, f"order status {o['status']} hai — fulfillment nahi ho sakti"
-    c = db()
-    prod = c.execute("SELECT * FROM products WHERE id=?", (o["product_id"],)).fetchone()
-    c.close()
-    if not prod:
-        note = f"product nahi mila (id={o['product_id']}) — manual handling"
+    # --- Lines nikalo: cart items_json, warna legacy single product_id.
+    try:
+        lines = json.loads(o["items_json"] or "[]")
+    except Exception:
+        lines = []
+    if not isinstance(lines, list) or not lines:
+        lines = [{"pid": o["product_id"], "qty": o["qty"] or 1}]
+    norm = []
+    for ln in lines:
+        try:
+            pid = int((ln or {}).get("pid") or (ln or {}).get("product_id") or 0)
+            qty = int((ln or {}).get("qty") or 1)
+        except Exception:
+            continue
+        if pid > 0:
+            norm.append({"pid": pid, "qty": max(1, min(100, qty))})
+    if not norm:
+        note = "order me koi product line nahi — manual handling"
         _ahm7_mark_pending(order_id, note)
-        _zurva_send(ADMIN_ID, f"⚠️ Web order {o['code']} paid-pending: {note}.")
         return False, note
-    mapping = load_ahm7_mapping().get(prod["name"])
-    if not mapping or not mapping.get("ahm7_product_id"):
-        note = f"AHM7 mapping nahi hai ({prod['name']}) — manual handling"
-        _ahm7_mark_pending(order_id, note)
-        _zurva_send(ADMIN_ID, f"⚠️ Web order {o['code']} paid-pending: {note}. Manual deliver karein (credentials order row me save karein, order page pe dikh jayenge).")
-        return False, note
-    cost = mapping.get("cost_pkr")
-    site_price = o["amount_pkr"] or 0
-    if cost is None or cost >= site_price:
-        note = f"margin guard: AHM7 cost Rs {cost} >= site price Rs {site_price} — auto-buy nahi hua"
-        _ahm7_mark_pending(order_id, note)
-        _zurva_send(ADMIN_ID, f"⚠️ Web order {o['code']} paid-pending: {note}. Price barhao ya manual deliver karein.")
-        return False, note
-    # Pehle se buy ho chuka (retry) — dobara buy NAHI, sirf delivered mark karo.
+    # --- Pehle se khareedi lines (creds me pid tag hota hai).
+    try:
+        stored_creds = json.loads(o["ahm7_credentials"] or "[]")
+    except Exception:
+        stored_creds = []
+    if not isinstance(stored_creds, list):
+        stored_creds = []
     try:
         stored_id = o["ahm7_order_id"] or ""
-        stored_creds = o["ahm7_credentials"] or ""
     except Exception:
-        stored_id, stored_creds = "", ""
-    if stored_id and stored_creds:
+        stored_id = ""
+    bought_pids = {cr.get("pid") for cr in stored_creds
+                   if isinstance(cr, dict) and isinstance(cr.get("pid"), int)}
+    # Legacy single-order creds (pid tag nahi) — dobara buy nahi karna.
+    if stored_id and stored_creds and len(norm) == 1 and not bought_pids:
         c = db(); c.execute("UPDATE orders SET status='delivered' WHERE id=?", (order_id,)); c.commit(); c.close()
         return True, "already bought — credentials order page pe available (dobara buy nahi hua)"
-    order_obj, err = ahm7_place_order(mapping["ahm7_product_id"], o["code"])
-    if err:
-        note = f"AHM7 buy fail: {err}"
-        _ahm7_mark_pending(order_id, note)
-        _zurva_send(ADMIN_ID, f"⚠️ Web order {o['code']} paid-pending: {note}. Wallet top-up / retry karein.")
-        return False, note
-    creds = order_obj.get("credentials") or []
-    if not creds:
-        note = f"AHM7 buy OK ({order_obj.get('orderId')}) lekin credentials khaali mile — manual check"
-        _ahm7_mark_pending(order_id, note)
-        _zurva_send(ADMIN_ID, f"⚠️ Web order {o['code']} paid-pending: {note}.")
+    combined = list(stored_creds)
+    ahm7_ids = [s for s in (stored_id.split(",") if stored_id else []) if s]
+    failures = []
+    mapping_all = load_ahm7_mapping()
+    for ln in norm:
+        pid, qty = ln["pid"], ln["qty"]
+        if pid in bought_pids:
+            continue
+        c = db()
+        prod = c.execute("SELECT * FROM products WHERE id=?", (pid,)).fetchone()
+        c.close()
+        if not prod:
+            failures.append(f"product nahi mila (id={pid})")
+            continue
+        mapping = mapping_all.get(prod["name"])
+        if not mapping or not mapping.get("ahm7_product_id"):
+            failures.append(f"AHM7 mapping nahi hai ({prod['name']})")
+            continue
+        cost = mapping.get("cost_pkr")
+        site_price = mapping.get("site_price_pkr") or 0
+        if cost is None or cost * qty >= site_price * qty:
+            failures.append(
+                f"margin guard: {prod['name']} cost Rs {cost} >= site price Rs {site_price} — auto-buy nahi hua")
+            continue
+        order_obj, err = ahm7_place_order(mapping["ahm7_product_id"], f"{o['code']}-{pid}",
+                                          quantity=qty)
+        if err:
+            failures.append(f"AHM7 buy fail ({prod['name']}): {err}")
+            continue
+        creds = order_obj.get("credentials") or []
+        if not creds:
+            failures.append(f"AHM7 buy OK ({order_obj.get('orderId')}) lekin credentials khaali mile ({prod['name']})")
+            continue
+        ahm7_ids.append(str(order_obj.get("orderId") or ""))
+        for cred in creds:
+            if isinstance(cred, dict):
+                tagged = dict(cred)
+                tagged["pid"] = pid
+                tagged["label"] = prod["name"]
+                combined.append(tagged)
+            else:
+                combined.append({"pid": pid, "label": prod["name"], "login": str(cred)})
+    if failures:
+        note = "; ".join(failures)[:500]
+        c = db()
+        c.execute("UPDATE orders SET ahm7_order_id=?, ahm7_credentials=?, ahm7_note=?, status='ahm7_pending' WHERE id=?",
+                  (",".join(ahm7_ids), json.dumps(combined, ensure_ascii=False), note, order_id))
+        c.commit(); c.close()
+        _zurva_send(ADMIN_ID, f"⚠️ Web order {o['code']} paid-pending: {note}. Manual deliver karein ya retry karein.")
         return False, note
     c = db()
     c.execute("UPDATE orders SET ahm7_order_id=?, ahm7_credentials=?, ahm7_note=?, status='delivered' WHERE id=?",
-              (str(order_obj.get("orderId") or ""), json.dumps(creds, ensure_ascii=False),
-               f"AHM7 {order_obj.get('orderId')} total {order_obj.get('totalCharged')} {order_obj.get('currency')}",
-               order_id))
+              (",".join(ahm7_ids), json.dumps(combined, ensure_ascii=False),
+               f"AHM7 {','.join(ahm7_ids)}", order_id))
     c.commit(); c.close()
-    return True, f"delivered via AHM7 {order_obj.get('orderId')} — credentials order page pe available"
+    return True, f"delivered via AHM7 {','.join(ahm7_ids)} — credentials order page pe available"
 
 def handle_web_checkout(data, headers=None):
     """POST /api/web-checkout (Worker se aata hai). Returns (http_status, dict).
     Website order banata hai (channel='web', uid=0 — koi Telegram identity
     nahi) + Zurvapay initiate karta hai. Delivery website ke order page pe
-    hoti hai: order_code + random delivery_token milte hain; payment ke
+    hoti hai: order_code + random delivery token milte hain; payment ke
     baad customer order.html?code=...&token=... pe credentials dekhta hai.
+    Do shapes: single {product_id} ya cart {items: [{product_id, qty}]}.
     Amount hamesha server-side mapping ki site price hoti hai — client jo
     bhejta hai us pe bharosa nahi (tamper-proof). contact optional hai
     (email ya Telegram) — sirf manual follow-up ke liye, kabhi required nahi."""
     if not _web_auth(headers or {}):
         return 401, {"ok": False, "error": "unauthorized (WEB_API_SECRET ghalat ya set nahi)"}
     data = data or {}
-    try:
-        product_id = int(data.get("product_id"))
-    except Exception:
-        return 400, {"ok": False, "error": "product_id ghalat hai"}
+    # --- Items normalize karo: cart [{product_id, qty}] ya single product_id.
+    raw_items = data.get("items")
+    lines = []
+    if isinstance(raw_items, list) and raw_items:
+        if len(raw_items) > 26:
+            return 400, {"ok": False, "error": "cart me zyada items hain"}
+        merged = {}
+        for it in raw_items:
+            try:
+                pid = int((it or {}).get("product_id"))
+                _q = (it or {}).get("qty")
+                qty = 1 if _q is None else int(_q)
+            except Exception:
+                return 400, {"ok": False, "error": "cart items ghalat hain"}
+            if pid <= 0 or qty < 1 or qty > 10:
+                return 400, {"ok": False, "error": "cart items ghalat hain"}
+            merged[pid] = merged.get(pid, 0) + qty
+        lines = [{"pid": pid, "qty": min(10, q)} for pid, q in merged.items()]
+    else:
+        try:
+            product_id = int(data.get("product_id"))
+        except Exception:
+            return 400, {"ok": False, "error": "product_id ghalat hai"}
+        if product_id <= 0:
+            return 400, {"ok": False, "error": "product_id ghalat hai"}
+        lines = [{"pid": product_id, "qty": 1}]
     contact = str(data.get("contact") or "").strip()[:120]
-    c = db(); prod = c.execute("SELECT * FROM products WHERE id=?", (product_id,)).fetchone(); c.close()
-    if not prod:
-        return 404, {"ok": False, "error": "product nahi mila"}
-    mapping = load_ahm7_mapping().get(prod["name"])
-    if not mapping:
-        return 400, {"ok": False, "error": "ye product web checkout pe available nahi hai"}
-    site_price = mapping.get("site_price_pkr") or 0
-    if site_price <= 0:
-        return 400, {"ok": False, "error": "product ki price set nahi hai"}
+    # --- Har line validate karo + total server-side nikalo.
+    mapping_all = load_ahm7_mapping()
+    total = 0
+    labels = []
+    for ln in lines:
+        c = db(); prod = c.execute("SELECT * FROM products WHERE id=?", (ln["pid"],)).fetchone(); c.close()
+        if not prod:
+            return 404, {"ok": False, "error": "product nahi mila"}
+        mapping = mapping_all.get(prod["name"])
+        if not mapping:
+            return 400, {"ok": False, "error": f"ye product web checkout pe available nahi hai ({prod['name']})"}
+        site_price = mapping.get("site_price_pkr") or 0
+        if site_price <= 0:
+            return 400, {"ok": False, "error": "product ki price set nahi hai"}
+        ln["name"] = prod["name"]
+        ln["unit_price"] = site_price
+        total += site_price * ln["qty"]
+        labels.append(f"{prod['name']} x{ln['qty']}" if ln["qty"] > 1 else prod["name"])
+    if total <= 0:
+        return 400, {"ok": False, "error": "total price set nahi hai"}
     code = gen_order_code()
     token = _gen_delivery_token()
-    oid = create_order(0, contact, [{"pid": product_id, "qty": 1}], "zurvapay",
-                       f"Rs {site_price} via Zurvapay (web)", "zurvapay", site_price, code, "", 0,
-                       channel="web")
+    oid = create_order(0, contact, [{"pid": ln["pid"], "qty": ln["qty"]} for ln in lines],
+                       "zurvapay", f"Rs {total} via Zurvapay (web)", "zurvapay",
+                       total, code, "", 0, channel="web")
     c = db()
     c.execute("UPDATE orders SET delivery_token=?, web_contact=? WHERE id=?", (token, contact, oid))
     c.commit(); c.close()
@@ -2426,7 +2523,8 @@ def handle_web_checkout(data, headers=None):
     if success_base not in ("https://retailshop.pages.dev", "https://retail-shop.online"):
         success_base = "https://retailshop.pages.dev"
     order_url = f"{success_base}/order.html?code={code}&token={token}"
-    url, err = zurvapay_initiate(code, site_price, f"RetailShop order {code} — {prod['name']}",
+    details = f"RetailShop order {code} — " + ", ".join(labels)
+    url, err = zurvapay_initiate(code, total, details[:200],
                                  "RetailShop Customer", "",
                                  success_url=order_url, cancel_url=order_url)
     if err:
