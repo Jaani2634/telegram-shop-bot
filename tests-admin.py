@@ -389,6 +389,69 @@ bot._send_otp_telegram = orig_tg
 bot._send_otp_sms = orig_sms
 bot._send_otp_email = orig_email
 
+# ---------- 8c. Admin OTP via Gmail SMTP fallback ----------
+# Resend fail ho to admin OTP email SMTP se jaye. Real _send_otp_email
+# (mocked nahi) + mocked low-level senders. No network.
+bot._OTP_SEND_RL.clear()
+bot._OTP_LOCKS.clear()
+bot.ADMIN_ID = 7965730503
+bot.BOT_TOKEN = "123456:TESTTOKEN"
+bot.TWILIO_ACCOUNT_SID = ""
+bot.TWILIO_AUTH_TOKEN = ""
+bot.TWILIO_FROM_NUMBER = ""
+orig_smtp_user_a = bot.SMTP_USER
+orig_smtp_pass_a = bot.SMTP_PASS
+orig_resend_a = bot._send_email_via_resend
+orig_smtp_a = bot._send_email_via_smtp
+orig_resend_key_a = bot.RESEND_API_KEY
+smtp_captured_a = []
+resend_captured_a = []
+bot._send_email_via_resend = lambda to, subj, text: (resend_captured_a.append((to, subj, text)), True)[1]
+bot._send_email_via_smtp = lambda to, subj, text: (smtp_captured_a.append((to, subj, text)), True)[1]
+bot._send_otp_telegram = lambda code: True  # mocked: telegram ok
+
+# SMTP-only: no Resend key, SMTP set -> email channel via SMTP
+bot.RESEND_API_KEY = ""
+bot.SMTP_USER = "smtp@example.com"
+bot.SMTP_PASS = "apppass1234567890"
+smtp_captured_a.clear(); resend_captured_a.clear()
+s, out = bot.handle_admin_otp_send(
+    {"identifier": ADMIN_EMAIL, "password": "adminpass123", "purpose": "login"}, H, fresh_ip())
+check("smtp-admin: SMTP-only -> 200 channels [email, telegram]",
+      s == 200 and out.get("channels") == ["email", "telegram"], f"got {s} {out}")
+check("smtp-admin: code went via SMTP to ADMIN_EMAIL",
+      len(smtp_captured_a) == 1 and smtp_captured_a[0][0] == ADMIN_EMAIL
+      and "admin login code" in smtp_captured_a[0][1], f"got {smtp_captured_a}")
+
+# Resend fail -> SMTP fallback, channels still [email, telegram]
+bot.RESEND_API_KEY = "re_test"
+bot._send_email_via_resend = lambda to, subj, text: False
+smtp_captured_a.clear(); resend_captured_a.clear()
+s, out = bot.handle_admin_otp_send(
+    {"identifier": ADMIN_EMAIL, "password": "adminpass123", "purpose": "login"}, H, fresh_ip())
+check("smtp-admin: Resend fail -> SMTP fallback, 200 [email, telegram]",
+      s == 200 and out.get("channels") == ["email", "telegram"]
+      and len(smtp_captured_a) == 1, f"got {s} {out}")
+
+# SMTP-only but no Telegram (real sender, BOT_TOKEN empty -> False,
+# no network call) -> email only, no 503
+bot._send_otp_telegram = orig_tg
+bot.BOT_TOKEN = ""
+smtp_captured_a.clear()
+s, out = bot.handle_admin_otp_send(
+    {"identifier": ADMIN_EMAIL, "password": "adminpass123", "purpose": "login"}, H, fresh_ip())
+check("smtp-admin: SMTP-only, no Telegram -> 200 [email] only",
+      s == 200 and out.get("channels") == ["email"], f"got {s} {out}")
+
+# restore
+bot.BOT_TOKEN = "123456:TESTTOKEN"
+bot.SMTP_USER = orig_smtp_user_a
+bot.SMTP_PASS = orig_smtp_pass_a
+bot._send_email_via_resend = orig_resend_a
+bot._send_email_via_smtp = orig_smtp_a
+bot.RESEND_API_KEY = orig_resend_key_a
+bot._send_otp_telegram = orig_tg
+
 # ---------- 9. HTTP layer (real health server, admin routes) ----------
 bot.start_health_server()
 time.sleep(1.0)

@@ -29,6 +29,7 @@ import re
 import secrets
 import time
 import sqlite3
+import smtplib
 import logging
 import requests
 import threading
@@ -39,6 +40,7 @@ from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime, timedelta
+from email.message import EmailMessage
 from dotenv import load_dotenv
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
@@ -103,8 +105,9 @@ AHM7_BASE_URL = os.getenv("AHM7_BASE_URL", "https://api.ahm7.tech/v1").rstrip("/
 # channels se ja sakta hai — Telegram (bot khud ADMIN_ID ko bhejta hai),
 # Twilio SMS (phone) + Resend email. Har channel best-effort aur alag hai:
 # Twilio sirf tab jab uski keys set hon, Resend sirf tab jab uski key set
-# ho, Telegram hamesha (admin ke liye). Koi bhi channel available na ho to
-# OTP send 503 deta hai (otp_not_configured). Keys kabhi code me nahi —
+# ho, Gmail SMTP sirf tab jab SMTP_USER + SMTP_PASS set hon, Telegram
+# hamesha (admin ke liye). Koi bhi channel available na ho to OTP send
+# 503 deta hai (otp_not_configured). Keys kabhi code me nahi —
 # sirf env se (Botkeep .env me set karo).
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "raisjunaidnazeer@gmail.com").strip().lower()
 ADMIN_PHONE = os.getenv("ADMIN_PHONE", "+923706462990").strip()
@@ -113,6 +116,12 @@ TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
 TWILIO_FROM_NUMBER = os.getenv("TWILIO_FROM_NUMBER", "")
 RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
 RESEND_FROM = os.getenv("RESEND_FROM", "onboarding@resend.dev")
+# Gmail SMTP fallback — Resend free tier sirf owner email ko bhej sakta
+# hai (403 domain restriction), is liye SMTP_USER ek Gmail address aur
+# SMTP_PASS uska app password hai (16 chars; spaces hon to hata diye
+# jate hain). Dono Botkeep env se aate hain, value kabhi log nahi hoti.
+SMTP_USER = os.getenv("SMTP_USER", "").strip()
+SMTP_PASS = os.getenv("SMTP_PASS", "")
 
 # IPN HTTP thread se PTB loop tak pohanchne ke liye (main() me set hota hai).
 PTB_APP = None
@@ -2847,16 +2856,16 @@ def handle_auth_signup(data, headers=None, client_ip=""):
     c.commit(); c.close()
     token = _create_web_session(uid)
     # Email verification code — best-effort, signup kabhi block nahi karta:
-    # Resend free tier (ya key missing) ki wajah se send fail ho to bhi
+    # Resend free tier (sirf owner email) ya SMTP dono fail hon to bhi
     # account banta hai (unverified), login chalta hai, profile me banner
     # + resend button dikhta hai. Verification tab enforce hogi jab send
     # theek se kaam karne lage.
     verification_sent = False
-    if RESEND_API_KEY:
+    if _email_configured():
         try:
             _code = _issue_email_otp(uid)
             if _code:
-                verification_sent = bool(_send_email_via_resend(
+                verification_sent = bool(_send_email(
                     email, "Pheonix Retail Shop — email verification code",
                     ("Assalam-o-Alaikum,\n\nAapka Pheonix Retail Shop email verification code: "
                      f"{_code}\nYe code 10 minute ke liye valid hai. Kisi ko na dein.\n\n"
@@ -3016,13 +3025,24 @@ def _resend_configured():
     return bool(RESEND_API_KEY)
 
 
+def _smtp_configured():
+    """Gmail SMTP tab jab SMTP_USER + SMTP_PASS dono set hon."""
+    return bool(SMTP_USER and SMTP_PASS)
+
+
+def _email_configured():
+    """Koi email sender available ho: Resend ya Gmail SMTP."""
+    return bool(_resend_configured() or _smtp_configured())
+
+
 def _otp_configured():
     """Admin OTP tab jab koi ek channel available ho: Twilio (keys set),
-    Resend (key set), ya Telegram (ADMIN_ID set — bot khud bhejta hai).
-    Twilio Pakistan me trial nahi deta, is liye koi ek channel bhi
-    missing ho to 503 nahi — sirf tab 503 jab kuch bhi available na ho."""
+    Resend (key set), Gmail SMTP (user + app password set), ya Telegram
+    (ADMIN_ID set — bot khud bhejta hai). Twilio Pakistan me trial nahi
+    deta, is liye koi ek channel bhi missing ho to 503 nahi — sirf tab
+    503 jab kuch bhi available na ho."""
     return bool(_twilio_configured() or _resend_configured()
-                or (ADMIN_ID and BOT_TOKEN))
+                or _smtp_configured() or (ADMIN_ID and BOT_TOKEN))
 
 
 def _otp_send_allowed(admin_id):
@@ -3085,9 +3105,44 @@ def _send_email_via_resend(to_email, subject, text):
         return False
 
 
+def _send_email_via_smtp(to_email, subject, text):
+    """Gmail SMTP se plain email bhejo (smtp.gmail.com:587, STARTTLS).
+    App password kabhi log nahi hota. Returns True/False."""
+    if not _smtp_configured():
+        return False
+    try:
+        msg = EmailMessage()
+        msg["From"] = SMTP_USER
+        msg["To"] = to_email
+        msg["Subject"] = subject
+        msg.set_content(text)
+        with smtplib.SMTP("smtp.gmail.com", 587, timeout=20) as server:
+            server.starttls()
+            # Gmail app password 16 chars, groups me spaces ke saath
+            # dikhaya jata hai — login se pehle spaces hata do.
+            server.login(SMTP_USER, SMTP_PASS.replace(" ", "").strip())
+            server.send_message(msg)
+        return True
+    except Exception as e:
+        log.warning("SMTP email failed: %s", e)
+        return False
+
+
+def _send_email(to_email, subject, text):
+    """Email bhejo — pehle Resend, fail ho to Gmail SMTP fallback.
+    Returns True jab koi ek sender kaam kar jaye, False jab dono fail
+    hon ya koi configured na ho. Code kabhi log nahi hota."""
+    if _resend_configured() and _send_email_via_resend(to_email, subject, text):
+        return True
+    if _smtp_configured() and _send_email_via_smtp(to_email, subject, text):
+        return True
+    return False
+
+
 def _send_otp_email(to_email, code):
-    """Resend email (admin OTP). Code kabhi log nahi hota. Returns True/False."""
-    return _send_email_via_resend(
+    """Admin OTP email — Resend, fail ho to Gmail SMTP fallback.
+    Code kabhi log nahi hota. Returns True/False."""
+    return _send_email(
         to_email, "Pheonix Retail Shop — admin login code",
         ("Assalam-o-Alaikum,\n\nAapka Pheonix Retail Shop admin code: "
          f"{code}\nYe code 10 minute ke liye valid hai. Kisi ko na dein.\n\n"
@@ -3199,11 +3254,12 @@ def handle_admin_otp_send(data, headers=None, client_ip=""):
     c.commit(); c.close()
     # Har channel best-effort aur alag: Twilio sirf jab keys set hon
     # (Pakistan me trial nahi — keys missing hon to skip, fail nahi),
-    # Resend sirf jab key set ho, Telegram hamesha (admin ke liye).
+    # email (Resend, fail ho to Gmail SMTP fallback) sirf jab koi email
+    # sender configured ho, Telegram hamesha (admin ke liye).
     channels = []
     if _twilio_configured() and _send_otp_sms(ADMIN_PHONE, code):
         channels.append("sms")
-    if _resend_configured() and _send_otp_email(ADMIN_EMAIL, code):
+    if _email_configured() and _send_otp_email(ADMIN_EMAIL, code):
         channels.append("email")
     if _send_otp_telegram(code):
         channels.append("telegram")
@@ -3306,12 +3362,12 @@ def handle_auth_verify_email_send(headers=None):
             return 200, {"ok": True, "already_verified": True}
     except Exception:
         pass
-    if not _resend_configured():
+    if not _email_configured():
         return 503, {"ok": False, "error": "email_not_configured"}
     code = _issue_email_otp(u["id"])
     if not code:
         return 429, {"ok": False, "error": "bohat zyada koshishein — 1 ghante baad try karein"}
-    sent = _send_email_via_resend(
+    sent = _send_email(
         u["email"], _EMAIL_OTP_SUBJECT,
         ("Assalam-o-Alaikum,\n\nAapka Pheonix Retail Shop email verification code: "
          f"{code}\nYe code 10 minute ke liye valid hai. Kisi ko na dein.\n\n"

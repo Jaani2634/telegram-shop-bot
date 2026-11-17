@@ -409,6 +409,146 @@ check("email-verify: send without Resend key -> 503 email_not_configured",
 bot.RESEND_API_KEY = ""
 bot._send_email_via_resend = orig_send_email
 
+# ---------- 8c. Gmail SMTP fallback for email OTP ----------
+# Resend free tier sirf owner email ko bhej sakta hai (403) — SMTP
+# fallback: pehle Resend, fail ho to Gmail SMTP. Mocked senders, no network.
+orig_smtp_user = bot.SMTP_USER
+orig_smtp_pass = bot.SMTP_PASS
+orig_send_smtp = bot._send_email_via_smtp
+orig_resend_key2 = bot.RESEND_API_KEY
+smtp_captured = []
+resend_captured = []
+bot._send_email_via_resend = lambda to, subj, text: (resend_captured.append((to, subj, text)), True)[1]
+bot._send_email_via_smtp = lambda to, subj, text: (smtp_captured.append((to, subj, text)), True)[1]
+
+# unit: Resend ok -> SMTP kabhi call nahi hota
+bot.RESEND_API_KEY = "re_test"
+bot.SMTP_USER = "smtp@example.com"
+bot.SMTP_PASS = "apppass1234567890"
+resend_captured.clear(); smtp_captured.clear()
+check("smtp: _send_email Resend ok -> True, SMTP not tried",
+      bot._send_email("u@example.com", "s", "t") is True
+      and len(resend_captured) == 1 and len(smtp_captured) == 0)
+# unit: Resend fail -> SMTP fallback ok
+bot._send_email_via_resend = lambda to, subj, text: False
+resend_captured.clear(); smtp_captured.clear()
+check("smtp: _send_email Resend fail -> SMTP fallback True",
+      bot._send_email("u@example.com", "s", "t") is True
+      and len(smtp_captured) == 1, f"got resend={resend_captured} smtp={smtp_captured}")
+# unit: dono fail -> False
+bot._send_email_via_smtp = lambda to, subj, text: False
+check("smtp: _send_email both fail -> False",
+      bot._send_email("u@example.com", "s", "t") is False)
+# unit: koi configured nahi -> False
+bot.RESEND_API_KEY = ""
+bot.SMTP_USER = ""
+bot.SMTP_PASS = ""
+check("smtp: _send_email neither configured -> False",
+      bot._send_email("u@example.com", "s", "t") is False)
+check("smtp: _email_configured false jab dono missing",
+      bot._email_configured() is False)
+
+# unit: _send_email_via_smtp — mocked smtplib.SMTP, no network.
+# STARTTLS + login (spaces hata kar) + send_message verify karo.
+class _FakeSMTP:
+    instances = []
+    def __init__(self, host, port, timeout=None):
+        self.host, self.port, self.timeout = host, port, timeout
+        self.calls = []
+        _FakeSMTP.instances.append(self)
+    def starttls(self):
+        self.calls.append("starttls")
+    def login(self, user, pw):
+        self.calls.append(("login", user, pw))
+    def send_message(self, msg):
+        self.calls.append(("send", msg["From"], msg["To"], msg["Subject"]))
+    def __enter__(self):
+        return self
+    def __exit__(self, *a):
+        return False
+orig_smtplib_smtp = bot.smtplib.SMTP
+bot.smtplib.SMTP = _FakeSMTP
+bot._send_email_via_smtp = orig_send_smtp  # real sender (upar mock tha)
+bot.SMTP_USER = "shop@gmail.com"
+bot.SMTP_PASS = "abcd efgh ijkl mnop"
+_FakeSMTP.instances.clear()
+check("smtp: _send_email_via_smtp mocked SMTP -> True",
+      bot._send_email_via_smtp("u@example.com", "Code", "body") is True)
+_f = _FakeSMTP.instances[0] if _FakeSMTP.instances else None
+check("smtp: host smtp.gmail.com:587 + starttls",
+      _f is not None and _f.host == "smtp.gmail.com" and _f.port == 587
+      and "starttls" in _f.calls,
+      f"got {_f.host if _f else None}:{_f.port if _f else None} {_f.calls if _f else None}")
+check("smtp: login with user + password spaces removed",
+      _f is not None and ("login", "shop@gmail.com", "abcdefghijklmnop") in _f.calls,
+      f"got {_f.calls if _f else None}")
+check("smtp: send_message from SMTP_USER to recipient",
+      _f is not None and ("send", "shop@gmail.com", "u@example.com", "Code") in _f.calls,
+      f"got {_f.calls if _f else None}")
+bot.smtplib.SMTP = orig_smtplib_smtp
+# SMTP not configured -> real sender returns False, no SMTP object made
+bot.SMTP_USER = ""
+bot.SMTP_PASS = ""
+_FakeSMTP.instances.clear()
+bot.smtplib.SMTP = _FakeSMTP
+check("smtp: _send_email_via_smtp unconfigured -> False, no connect",
+      bot._send_email_via_smtp("u@example.com", "Code", "body") is False
+      and len(_FakeSMTP.instances) == 0)
+bot.smtplib.SMTP = orig_smtplib_smtp
+
+# flow: SMTP-only — signup auto-send + verify-email send endpoint
+bot.RESEND_API_KEY = ""
+bot.SMTP_USER = "smtp@example.com"
+bot.SMTP_PASS = "apppass1234567890"
+bot._send_email_via_resend = lambda to, subj, text: False
+bot._send_email_via_smtp = lambda to, subj, text: (smtp_captured.append((to, subj, text)), True)[1]
+smtp_captured.clear()
+s, out = bot.handle_auth_signup(
+    {"name": "SMTP Only", "email": "smtponly@example.com", "phone": "+92 300 1110014", "password": "secret123"}, H, fresh_ip())
+check("smtp: SMTP-only signup -> 200 verification_sent true",
+      s == 200 and out.get("user", {}).get("verification_sent") is True, f"got {s} {out}")
+TOK_SM = out.get("token", "")
+check("smtp: SMTP-only signup code went via SMTP to signup address",
+      len(smtp_captured) == 1 and smtp_captured[0][0] == "smtponly@example.com",
+      f"got {smtp_captured}")
+smtp_captured.clear()
+s, out = bot.handle_auth_verify_email_send(bearer(TOK_SM))
+check("smtp: SMTP-only verify-email send -> 200 channels [email]",
+      s == 200 and out.get("channels") == ["email"], f"got {s} {out}")
+
+# flow: Resend fail -> SMTP fallback (endpoint level)
+bot.RESEND_API_KEY = "re_test"
+bot._send_email_via_resend = lambda to, subj, text: False
+smtp_captured.clear()
+s, out = bot.handle_auth_verify_email_send(bearer(TOK_SM))
+check("smtp: Resend fail -> SMTP fallback, send -> 200",
+      s == 200 and len(smtp_captured) == 1, f"got {s} {out}")
+
+# flow: dono fail -> send 502; signup verification_sent false
+bot._send_email_via_smtp = lambda to, subj, text: False
+s, out = bot.handle_auth_verify_email_send(bearer(TOK_SM))
+check("smtp: both senders fail -> send 502",
+      s == 502, f"got {s} {out}")
+s, out = bot.handle_auth_signup(
+    {"name": "Both Fail", "email": "bothfail@example.com", "phone": "+92 300 1110015", "password": "secret123"}, H, fresh_ip())
+check("smtp: both fail -> signup still 200, sent=false",
+      s == 200 and out.get("user", {}).get("verification_sent") is False, f"got {s} {out}")
+
+# flow: neither configured -> send 503 email_not_configured
+bot.RESEND_API_KEY = ""
+bot.SMTP_USER = ""
+bot.SMTP_PASS = ""
+s, out = bot.handle_auth_verify_email_send(bearer(TOK_SM))
+check("smtp: neither configured -> send 503 email_not_configured",
+      s == 503 and out.get("error") == "email_not_configured", f"got {s} {out}")
+
+# restore
+bot.RESEND_API_KEY = orig_resend_key2
+bot.SMTP_USER = orig_smtp_user
+bot.SMTP_PASS = orig_smtp_pass
+bot._send_email_via_smtp = orig_send_smtp
+bot._send_email_via_resend = orig_send_email
+
 # ---------- 9. HTTP layer (real health server) ----------
 bot.start_health_server()
 time.sleep(1.0)
