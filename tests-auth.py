@@ -44,7 +44,7 @@ def pid_by_name(name):
 
 # ---------- 1. signup ----------
 s, out = bot.handle_auth_signup(
-    {"name": "Ali Khan", "email": "Ali@Example.COM", "password": "secret123"}, H, fresh_ip())
+    {"name": "Ali Khan", "email": "Ali@Example.COM", "phone": "+92 300 1110001", "password": "secret123"}, H, fresh_ip())
 check("signup: happy path 200 + token + user",
       s == 200 and out.get("ok") is True and out.get("user", {}).get("email") == "ali@example.com"
       and out.get("user", {}).get("name") == "Ali Khan",
@@ -57,28 +57,30 @@ check("signup: response leaks no hashes",
       and "secret123" not in json.dumps(out), f"got {out}")
 
 s, out = bot.handle_auth_signup(
-    {"name": "Ali Again", "email": "ali@example.com", "password": "secret123"}, H, fresh_ip())
+    {"name": "Ali Again", "email": "ali@example.com", "phone": "+92 300 1110002", "password": "secret123"}, H, fresh_ip())
 check("signup: duplicate email -> 409", s == 409, f"got {s} {out}")
 s, out = bot.handle_auth_signup(
-    {"name": "Ali Again", "email": "ALI@EXAMPLE.COM", "password": "secret123"}, H, fresh_ip())
+    {"name": "Ali Again", "email": "ALI@EXAMPLE.COM", "phone": "+92 300 1110003", "password": "secret123"}, H, fresh_ip())
 check("signup: duplicate email (other case) -> 409", s == 409, f"got {s} {out}")
 
 for label, data in [
-    ("bad email (no @)", {"name": "A", "email": "not-an-email", "password": "secret123"}),
-    ("bad email (no domain)", {"name": "A", "email": "a@", "password": "secret123"}),
-    ("short password (7)", {"name": "A", "email": "a2@example.com", "password": "short7!"}),
-    ("empty name", {"name": "", "email": "a3@example.com", "password": "secret123"}),
-    ("name 61 chars", {"name": "x" * 61, "email": "a4@example.com", "password": "secret123"}),
-    ("missing password", {"name": "A", "email": "a5@example.com", "password": ""}),
+    ("bad email (no @)", {"name": "A", "email": "not-an-email", "phone": "+92 300 1110004", "password": "secret123"}),
+    ("bad email (no domain)", {"name": "A", "email": "a@", "phone": "+92 300 1110004", "password": "secret123"}),
+    ("short password (7)", {"name": "A", "email": "a2@example.com", "phone": "+92 300 1110004", "password": "short7!"}),
+    ("empty name", {"name": "", "email": "a3@example.com", "phone": "+92 300 1110004", "password": "secret123"}),
+    ("name 61 chars", {"name": "x" * 61, "email": "a4@example.com", "phone": "+92 300 1110004", "password": "secret123"}),
+    ("missing password", {"name": "A", "email": "a5@example.com", "phone": "+92 300 1110004", "password": ""}),
+    ("missing phone", {"name": "A", "email": "a6b@example.com", "password": "secret123"}),
+    ("phone without country code", {"name": "A", "email": "a7@example.com", "phone": "03001110004", "password": "secret123"}),
 ]:
     s, out = bot.handle_auth_signup(data, H, fresh_ip())
     check(f"signup: {label} -> 400", s == 400, f"got {s} {out}")
 
 s, out = bot.handle_auth_signup(
-    {"name": "A", "email": "a6@example.com", "password": "secret123"}, BAD_H, fresh_ip())
+    {"name": "A", "email": "a6@example.com", "phone": "+92 300 1110005", "password": "secret123"}, BAD_H, fresh_ip())
 check("signup: wrong secret -> 401", s == 401, f"got {s} {out}")
 s, out = bot.handle_auth_signup(
-    {"name": "A", "email": "a6@example.com", "password": "secret123"}, {}, fresh_ip())
+    {"name": "A", "email": "a6@example.com", "phone": "+92 300 1110005", "password": "secret123"}, {}, fresh_ip())
 check("signup: no secret -> 401", s == 401, f"got {s} {out}")
 
 # ---------- 2. password storage (hashed, scrypt verifies) ----------
@@ -181,7 +183,7 @@ check("logout: no token -> 200", s == 200, f"got {s} {out}")
 gem_pid = pid_by_name("Gemini Plus 6m Links (No Card Required)")
 ama_pid = pid_by_name("Amazon Prime 6 Months")
 s, out = bot.handle_auth_signup(
-    {"name": "Bilal", "email": "bilal@example.com", "password": "secret123"}, H, fresh_ip())
+    {"name": "Bilal", "email": "bilal@example.com", "phone": "+92 300 1110006", "password": "secret123"}, H, fresh_ip())
 TOK_BILAL = out.get("token", "")
 def seed_web_order(email, items, amount, status="delivered"):
     code = bot.gen_order_code()
@@ -261,7 +263,7 @@ rl_ip = "203.0.113.1"
 results = []
 for i in range(11):
     s, _ = bot.handle_auth_signup(
-        {"name": "RL", "email": f"rl{i}@example.com", "password": "secret123"}, H, rl_ip)
+        {"name": "RL", "email": f"rl{i}@example.com", "phone": f"+9230090000{i:02d}", "password": "secret123"}, H, rl_ip)
     results.append(s)
 check("rate limit: signup 10/hour per IP (11th -> 429)",
       results[:10] == [200] * 10 and results[10] == 429, f"got {results}")
@@ -287,7 +289,7 @@ time.sleep(1.0)
 import requests as rq
 try:
     r = rq.post("http://127.0.0.1:18098/api/auth/signup",
-                json={"name": "HTTP", "email": "http@example.com", "password": "secret123"},
+                json={"name": "HTTP", "email": "http@example.com", "phone": "+92 300 1110007", "password": "secret123"},
                 headers={"X-Web-Secret": "test-secret-123"}, timeout=5)
     j = r.json()
     check("HTTP: POST /api/auth/signup -> 200 + token",
@@ -295,7 +297,7 @@ try:
           f"got {r.status_code} {r.text[:160]}")
     http_tok = j.get("token", "")
     r = rq.post("http://127.0.0.1:18098/api/auth/signup",
-                json={"name": "HTTP", "email": "http@example.com", "password": "secret123"},
+                json={"name": "HTTP", "email": "http@example.com", "phone": "+92 300 1110007", "password": "secret123"},
                 timeout=5)
     check("HTTP: signup without secret -> 401", r.status_code == 401, f"got {r.status_code}")
     r = rq.get("http://127.0.0.1:18098/api/auth/me",

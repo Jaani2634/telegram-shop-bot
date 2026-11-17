@@ -98,6 +98,19 @@ WEB_API_SECRET = os.getenv("WEB_API_SECRET", "")
 AHM7_API_KEY = os.getenv("AHM7_API_KEY", "")
 AHM7_BASE_URL = os.getenv("AHM7_BASE_URL", "https://api.ahm7.tech/v1").rstrip("/")
 
+# ---------- Web admin dashboard + OTP (admin login) ----------
+# Admin kaun hai: email ya phone env se match kare (Junaid). OTP do
+# channels se jata hai — Twilio SMS (phone) + Resend email. Keys kabhi
+# code me nahi — sirf env se (Botkeep .env me set karo). Dono me se koi
+# ek bhi missing ho to OTP send 503 deta hai (otp_not_configured).
+ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "raisjunaidnazeer@gmail.com").strip().lower()
+ADMIN_PHONE = os.getenv("ADMIN_PHONE", "+923706462990").strip()
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
+TWILIO_FROM_NUMBER = os.getenv("TWILIO_FROM_NUMBER", "")
+RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
+RESEND_FROM = os.getenv("RESEND_FROM", "onboarding@resend.dev")
+
 # IPN HTTP thread se PTB loop tak pohanchne ke liye (main() me set hota hai).
 PTB_APP = None
 PTB_LOOP = None
@@ -315,6 +328,16 @@ def init_db():
         expires_at TEXT NOT NULL,
         created_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS admin_otps(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        admin_user_id INTEGER NOT NULL,
+        purpose TEXT NOT NULL,
+        code_hash TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        attempts INTEGER DEFAULT 0,
+        used INTEGER DEFAULT 0,
+        created_at TEXT NOT NULL
+    );
     """)
     defaults = {
         "jazzcash_number": os.getenv("JAZZCASH_NUMBER", "03XX-XXXXXXX"),
@@ -353,6 +376,16 @@ def init_db():
     # (live DB pe yahi hoga jab naya code pehli dafa chalega).
     _add_col(c, "reviews", "name", "TEXT NOT NULL DEFAULT ''")
     _add_col(c, "reviews", "created_at", "INTEGER NOT NULL DEFAULT 0")
+    # Web accounts: phone (country code ke saath) + admin flag; sessions:
+    # admin session ka flag (admin endpoints sirf admin sessions se khulte hain).
+    _add_col(c, "web_users", "phone", "TEXT DEFAULT ''")
+    _add_col(c, "web_users", "is_admin", "INTEGER DEFAULT 0")
+    _add_col(c, "web_sessions", "is_admin", "INTEGER DEFAULT 0")
+    try:
+        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_web_users_phone "
+                  "ON web_users(phone) WHERE phone <> ''")
+    except Exception:
+        pass
     # Purani Telegram reviews (user_name) ka naam naye `name` column me bhar do.
     try:
         c.execute("UPDATE reviews SET name = user_name WHERE (name IS NULL OR name = '') "
@@ -583,6 +616,33 @@ def start_health_server():
                 self.end_headers()
                 self.wfile.write(body)
                 return
+            if self.path.startswith("/api/admin/"):
+                # Admin dashboard (Bearer admin token — admin session).
+                try:
+                    parsed = urlparse(self.path)
+                    qs = parse_qs(parsed.query)
+                    p = parsed.path
+                    if p == "/api/admin/stats":
+                        status, out = handle_admin_stats(self.headers)
+                    elif p == "/api/admin/orders":
+                        status, out = handle_admin_orders(self.headers, qs)
+                    elif p.startswith("/api/admin/order/"):
+                        status, out = handle_admin_order_detail(
+                            self.headers, p[len("/api/admin/order/"):].strip("/"))
+                    elif p == "/api/admin/users":
+                        status, out = handle_admin_users(self.headers, qs)
+                    else:
+                        status, out = 404, {"ok": False, "error": "not found"}
+                except Exception as e:
+                    log.exception("Admin handler crashed")
+                    status, out = 500, {"ok": False, "error": f"handler error: {e}"}
+                body = json.dumps(out, ensure_ascii=False).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             if self.path.startswith("/api/order/"):
                 # Website order status (Worker se, X-Web-Secret + delivery token).
                 try:
@@ -644,7 +704,7 @@ def start_health_server():
                 self.end_headers()
                 self.wfile.write(msg.encode("utf-8", "ignore"))
                 return
-            if self.path.startswith("/api/web-checkout") or self.path.startswith("/api/ahm7-retry") or self.path.startswith("/api/review") or self.path.startswith("/api/auth/signup") or self.path.startswith("/api/auth/login") or self.path.startswith("/api/auth/logout") or self.path.startswith("/api/auth/delete"):
+            if self.path.startswith("/api/web-checkout") or self.path.startswith("/api/ahm7-retry") or self.path.startswith("/api/review") or self.path.startswith("/api/auth/signup") or self.path.startswith("/api/auth/login") or self.path.startswith("/api/auth/logout") or self.path.startswith("/api/auth/delete") or self.path.startswith("/api/admin/otp/send") or self.path.startswith("/api/admin/otp/verify"):
                 # Site checkout / review (Cloudflare Worker se) — JSON in, JSON out.
                 try:
                     length = int(self.headers.get("Content-Length") or 0)
@@ -681,6 +741,11 @@ def start_health_server():
                         status, out = handle_auth_logout(self.headers)
                     elif self.path.startswith("/api/auth/delete"):
                         status, out = handle_auth_delete(self.headers)
+                    elif self.path.startswith("/api/admin/otp/send"):
+                        ip = self.client_address[0] if self.client_address else ""
+                        status, out = handle_admin_otp_send(data, self.headers, ip)
+                    elif self.path.startswith("/api/admin/otp/verify"):
+                        status, out = handle_admin_otp_verify(data, self.headers)
                     else:
                         status, out = handle_ahm7_retry(data, self.headers)
                 except Exception as e:
@@ -2616,16 +2681,17 @@ def _verify_password(password, stored):
 def _now_str():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-def _create_web_session(user_id):
+def _create_web_session(user_id, is_admin=0):
     """Naya session banao (30 din). Returns plaintext token (sirf caller
-    ko wapas dena hai — DB me sirf SHA-256 digest jata hai)."""
+    ko wapas dena hai — DB me sirf SHA-256 digest jata hai).
+    is_admin=1 sirf admin OTP verify se banta hai (admin dashboard)."""
     token = secrets.token_hex(16)  # 32 hex chars
     token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
     now = _now_str()
     expires = (datetime.now() + timedelta(days=_AUTH_SESSION_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
     c = db()
-    c.execute("INSERT INTO web_sessions(user_id, token_hash, expires_at, created_at) "
-              "VALUES(?,?,?,?)", (user_id, token_hash, expires, now))
+    c.execute("INSERT INTO web_sessions(user_id, token_hash, expires_at, created_at, is_admin) "
+              "VALUES(?,?,?,?,?)", (user_id, token_hash, expires, now, 1 if is_admin else 0))
     c.commit(); c.close()
     return token
 
@@ -2664,7 +2730,61 @@ def _auth_session_user(headers):
     return u, None
 
 def _public_web_user(u):
-    return {"name": u["name"], "email": u["email"]}
+    """Site ko wapas dene wala user object — kabhi password hash ya
+    token nahi. Phone + is_admin admin dashboard / header ke liye."""
+    try:
+        phone = u["phone"] or ""
+    except Exception:
+        phone = ""
+    try:
+        is_admin = bool(u["is_admin"])
+    except Exception:
+        is_admin = False
+    return {"name": u["name"], "email": u["email"],
+            "phone": phone, "is_admin": is_admin}
+
+def _normalize_phone(raw):
+    """Phone normalize karo: spaces/dashes/parens hatao; '00' -> '+'.
+    Sirf +countrycode + 7-15 digits valid. Galat ho to None."""
+    s = re.sub(r"[\s\-().]", "", str(raw or "").strip())
+    if s.startswith("00"):
+        s = "+" + s[2:]
+    if not re.match(r"^\+\d{7,15}$", s):
+        return None
+    return s
+
+
+def _is_admin_identity(email, phone):
+    """Admin kaun hai: email ya phone env (ADMIN_EMAIL / ADMIN_PHONE)
+    se match kare — ye Junaid ka account hai."""
+    try:
+        em = (email or "").strip().lower()
+    except Exception:
+        em = ""
+    try:
+        ph = (phone or "").strip()
+    except Exception:
+        ph = ""
+    return bool((em and em == ADMIN_EMAIL) or (ph and ph == ADMIN_PHONE))
+
+
+def _find_web_user_by_identifier(c, ident):
+    """web_users me identifier dhoondo: email (@ ho) YA phone (+ ho)
+    YA username (name). Naam ek se zyada users ka ho to None (ambiguous
+    — galat account me login nahi karwana)."""
+    ident = (ident or "").strip()
+    if not ident:
+        return None
+    if "@" in ident:
+        return c.execute("SELECT * FROM web_users WHERE email=?", (ident.lower(),)).fetchone()
+    ph = _normalize_phone(ident)
+    if ph:
+        return c.execute("SELECT * FROM web_users WHERE phone=?", (ph,)).fetchone()
+    rows = c.execute("SELECT * FROM web_users WHERE name=?", (ident,)).fetchall()
+    if len(rows) == 1:
+        return rows[0]
+    return None
+
 
 def handle_auth_signup(data, headers=None, client_ip=""):
     """POST /api/auth/signup (Worker se, X-Web-Secret). Returns (status, dict).
@@ -2677,10 +2797,13 @@ def handle_auth_signup(data, headers=None, client_ip=""):
     name = str(data.get("name") or "").strip()
     email = str(data.get("email") or "").strip().lower()
     password = str(data.get("password") or "")
+    phone = _normalize_phone(data.get("phone") or "")
     if not name or len(name) > 60:
         return 400, {"ok": False, "error": "naam 1 se 60 characters tak ho"}
     if not email or not _EMAIL_RE.match(email):
         return 400, {"ok": False, "error": "email ghalat hai"}
+    if not phone:
+        return 400, {"ok": False, "error": "phone number country code ke saath likhein (masalan +92 370 6462990)"}
     if len(password) < 8:
         return 400, {"ok": False, "error": "password kam se kam 8 characters ka ho"}
     c = db()
@@ -2689,36 +2812,53 @@ def handle_auth_signup(data, headers=None, client_ip=""):
         c.close()
         log.info("Auth signup: email=%s result=duplicate", email)
         return 409, {"ok": False, "error": "is email se account pehle se hai"}
-    cur = c.execute("INSERT INTO web_users(email, name, password_hash, created_at) "
-                    "VALUES(?,?,?,?)", (email, name, _hash_password(password), _now_str()))
+    exists = c.execute("SELECT id FROM web_users WHERE phone=? AND phone <> ''", (phone,)).fetchone()
+    if exists:
+        c.close()
+        log.info("Auth signup: phone=%s result=duplicate", phone)
+        return 409, {"ok": False, "error": "is phone number se account pehle se hai"}
+    is_admin = 1 if _is_admin_identity(email, phone) else 0
+    cur = c.execute("INSERT INTO web_users(email, name, password_hash, created_at, phone, is_admin) "
+                    "VALUES(?,?,?,?,?,?)", (email, name, _hash_password(password), _now_str(), phone, is_admin))
     uid = cur.lastrowid
     c.commit(); c.close()
     token = _create_web_session(uid)
     log.info("Auth signup: email=%s result=ok", email)
     return 200, {"ok": True, "token": token,
-                 "user": {"name": name, "email": email}}
+                 "user": {"name": name, "email": email, "phone": phone, "is_admin": bool(is_admin)}}
 
 def handle_auth_login(data, headers=None, client_ip=""):
     """POST /api/auth/login (Worker se, X-Web-Secret). Returns (status, dict).
-    Ghalat email ya ghalat password — dono pe ek hi generic 401 (ye nahi
-    batate ke email exist karta hai ya nahi)."""
+    Identifier = username (name) YA email YA phone. Ghalat identifier ya
+    ghalat password — dono pe ek hi generic 401 (ye nahi batate ke
+    identifier exist karta hai ya nahi)."""
     if not _web_auth(headers or {}):
         return 401, {"ok": False, "error": "unauthorized"}
     data = data or {}
-    email = str(data.get("email") or "").strip().lower()
+    ident = str(data.get("identifier") or data.get("email") or "").strip()
     password = str(data.get("password") or "")
-    if _auth_rate_limited(_AUTH_LOGIN_RL, f"{client_ip}|{email}", 3600, 20):
+    if _auth_rate_limited(_AUTH_LOGIN_RL, f"{client_ip}|{ident.lower()}", 3600, 20):
         return 429, {"ok": False, "error": "too many logins — thodi der me dobara try karein"}
-    if not email or not password:
-        return 400, {"ok": False, "error": "email aur password chahiye"}
+    if not ident or not password:
+        return 400, {"ok": False, "error": "username, email ya phone + password chahiye"}
     c = db()
-    u = c.execute("SELECT * FROM web_users WHERE email=?", (email,)).fetchone()
-    c.close()
+    u = _find_web_user_by_identifier(c, ident)
     if not u or not _verify_password(password, u["password_hash"]):
-        log.info("Auth login: email=%s result=fail", email)
+        c.close()
+        log.info("Auth login: identifier=%s result=fail", ident)
         return 401, {"ok": False, "error": _AUTH_GENERIC_ERROR}
+    # Admin flag dobara check karo (env badla ho to flag bhi badle).
+    is_admin = 1 if _is_admin_identity(u["email"], u["phone"] if "phone" in u.keys() else "") else 0
+    try:
+        cur_admin = u["is_admin"] if "is_admin" in u.keys() else 0
+    except Exception:
+        cur_admin = 0
+    if bool(cur_admin) != bool(is_admin):
+        c.execute("UPDATE web_users SET is_admin=? WHERE id=?", (is_admin, u["id"]))
+        c.commit()
+    c.close()
     token = _create_web_session(u["id"])
-    log.info("Auth login: email=%s result=ok", email)
+    log.info("Auth login: identifier=%s result=ok", ident)
     return 200, {"ok": True, "token": token, "user": _public_web_user(u)}
 
 def handle_auth_me(headers=None):
@@ -2804,6 +2944,459 @@ def handle_auth_orders(headers=None):
         })
     c.close()
     return 200, {"ok": True, "orders": orders}
+
+
+# ---------- Admin dashboard + OTP (admin login) ----------
+# Admin session: web_sessions row jis ka is_admin=1 HO aur user ka
+# is_admin bhi 1 ho. OTP: 6-digit code, Twilio SMS (ADMIN_PHONE) +
+# Resend email (ADMIN_EMAIL) dono pe — ek hi code dono channels pe.
+# Code kabhi log ya response me nahi aata (sirf SHA-256 hash DB me).
+
+_OTP_TTL_S = 600            # code 10 minute valid
+_OTP_MAX_SENDS_HOUR = 5     # per admin, per hour
+_OTP_MAX_ATTEMPTS = 10      # phir 15 minute lock
+_OTP_LOCK_S = 900
+_OTP_SEND_RL = {}           # admin_user_id -> (window_start, count)
+_OTP_LOCKS = {}             # admin_user_id -> locked_until epoch
+_OTP_RL_LOCK = threading.Lock()
+_PAID_ORDER_STATUSES = ("zurva_processing", "ahm7_pending", "delivered", "out_of_stock")
+_ADMIN_GENERIC_ERROR = "admin verification available nahi hai"
+
+
+def _otp_configured():
+    return bool(TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_FROM_NUMBER
+                and RESEND_API_KEY)
+
+
+def _otp_send_allowed(admin_id):
+    now = time.time()
+    with _OTP_RL_LOCK:
+        if len(_OTP_SEND_RL) > 2000:
+            _OTP_SEND_RL.clear()
+        start, count = _OTP_SEND_RL.get(admin_id, (now, 0))
+        if now - start >= 3600:
+            start, count = now, 0
+        count += 1
+        _OTP_SEND_RL[admin_id] = (start, count)
+        return count <= _OTP_MAX_SENDS_HOUR
+
+
+def _otp_locked(admin_id):
+    until = _OTP_LOCKS.get(admin_id, 0)
+    if until and time.time() < until:
+        return True
+    if until:
+        _OTP_LOCKS.pop(admin_id, None)
+    return False
+
+
+def _send_otp_sms(to_phone, code):
+    """Twilio SMS. Code kabhi log nahi hota. Returns True/False."""
+    try:
+        r = requests.post(
+            f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Messages.json",
+            auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
+            data={"To": to_phone, "From": TWILIO_FROM_NUMBER,
+                  "Body": f"Pheonix Retail Shop admin code: {code}. 10 minute ke liye valid hai. Kisi ko na dein."},
+            timeout=15)
+        if r.status_code in (200, 201):
+            return True
+        log.warning("Twilio OTP SMS failed: HTTP %s", r.status_code)
+        return False
+    except Exception as e:
+        log.warning("Twilio OTP SMS error: %s", e)
+        return False
+
+
+def _send_otp_email(to_email, code):
+    """Resend email. Code kabhi log nahi hota. Returns True/False."""
+    try:
+        r = requests.post(
+            "https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {RESEND_API_KEY}",
+                     "Content-Type": "application/json"},
+            json={"from": RESEND_FROM, "to": [to_email],
+                  "subject": "Pheonix Retail Shop — admin login code",
+                  "text": ("Assalam-o-Alaikum,\n\nAapka Pheonix Retail Shop admin code: "
+                           f"{code}\nYe code 10 minute ke liye valid hai. Kisi ko na dein.\n\n"
+                           "— Pheonix Retail Shop")},
+            timeout=15)
+        if r.status_code in (200, 201):
+            return True
+        log.warning("Resend OTP email failed: HTTP %s", r.status_code)
+        return False
+    except Exception as e:
+        log.warning("Resend OTP email error: %s", e)
+        return False
+
+
+def _admin_session_user(headers):
+    """Bearer admin session token se admin user nikalo.
+    Session ka is_admin=1 HONA chahiye AUR user ka is_admin bhi 1 ho.
+    Returns (user_row, None) ya (None, (status, error_dict))."""
+    token = _bearer_token(headers or {})
+    if not token:
+        return None, (401, {"ok": False, "error": "unauthorized"})
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    c = db()
+    s = c.execute("SELECT * FROM web_sessions WHERE token_hash=?", (token_hash,)).fetchone()
+    if not s:
+        c.close()
+        return None, (401, {"ok": False, "error": "unauthorized"})
+    if (s["expires_at"] or "") <= _now_str():
+        c.execute("DELETE FROM web_sessions WHERE id=?", (s["id"],))
+        c.commit(); c.close()
+        return None, (401, {"ok": False, "error": "unauthorized"})
+    try:
+        sess_admin = bool(s["is_admin"])
+    except Exception:
+        sess_admin = False
+    if not sess_admin:
+        c.close()
+        return None, (403, {"ok": False, "error": "admin only"})
+    u = c.execute("SELECT * FROM web_users WHERE id=?", (s["user_id"],)).fetchone()
+    c.close()
+    if not u:
+        return None, (401, {"ok": False, "error": "unauthorized"})
+    try:
+        user_admin = bool(u["is_admin"])
+    except Exception:
+        user_admin = False
+    if not user_admin:
+        return None, (403, {"ok": False, "error": "admin only"})
+    return u, None
+
+
+def handle_admin_otp_send(data, headers=None, client_ip=""):
+    """POST /api/admin/otp/send {identifier, password, purpose}.
+    Sirf admin account ke liye: password check + is_admin check ke baad
+    ek hi 6-digit code Twilio SMS (ADMIN_PHONE) + Resend email
+    (ADMIN_EMAIL) dono pe bhejo. Account exist karta hai ya nahi, password
+    ghalat hai ya admin nahi — sab pe ek hi generic 403 (leak nahi)."""
+    if not _web_auth(headers or {}):
+        return 401, {"ok": False, "error": "unauthorized"}
+    if not _otp_configured():
+        return 503, {"ok": False, "error": "otp_not_configured"}
+    data = data or {}
+    ident = str(data.get("identifier") or "").strip()
+    password = str(data.get("password") or "")
+    purpose = str(data.get("purpose") or "").strip()
+    if purpose not in ("signup", "login"):
+        return 400, {"ok": False, "error": "purpose ghalat hai"}
+    if not ident or not password:
+        return 400, {"ok": False, "error": "identifier aur password chahiye"}
+    c = db()
+    u = _find_web_user_by_identifier(c, ident)
+    if not u or not _verify_password(password, u["password_hash"]):
+        c.close()
+        return 403, {"ok": False, "error": _ADMIN_GENERIC_ERROR}
+    try:
+        user_admin = bool(u["is_admin"])
+    except Exception:
+        user_admin = False
+    if not user_admin:
+        c.close()
+        return 403, {"ok": False, "error": _ADMIN_GENERIC_ERROR}
+    admin_id = u["id"]
+    if not _otp_send_allowed(admin_id):
+        c.close()
+        return 429, {"ok": False, "error": "bohat zyada koshishein — 1 ghante baad try karein"}
+    # Purane unused codes isi purpose ke liye invalid kar do.
+    c.execute("UPDATE admin_otps SET used=1 WHERE admin_user_id=? AND purpose=? AND used=0",
+              (admin_id, purpose))
+    code = str(secrets.randbelow(900000) + 100000)
+    code_hash = hashlib.sha256(code.encode("utf-8")).hexdigest()
+    now = datetime.now()
+    expires = (now + timedelta(seconds=_OTP_TTL_S)).strftime("%Y-%m-%d %H:%M:%S")
+    c.execute("INSERT INTO admin_otps(admin_user_id, purpose, code_hash, expires_at, attempts, used, created_at) "
+              "VALUES(?,?,?,?,0,0,?)", (admin_id, purpose, code_hash, expires, _now_str()))
+    c.commit(); c.close()
+    channels = []
+    if _send_otp_sms(ADMIN_PHONE, code):
+        channels.append("sms")
+    if _send_otp_email(ADMIN_EMAIL, code):
+        channels.append("email")
+    if not channels:
+        # Dono channels fail — code bekaar hai, delete kar do taake retry fresh ho.
+        c = db()
+        c.execute("DELETE FROM admin_otps WHERE admin_user_id=? AND purpose=? AND code_hash=? AND used=0",
+                  (admin_id, purpose, code_hash))
+        c.commit(); c.close()
+        return 502, {"ok": False, "error": "OTP bheja nahi ja saka — dobara try karein"}
+    log.info("Admin OTP send: purpose=%s channels=%s", purpose, ",".join(channels))
+    return 200, {"ok": True, "channels": channels, "expires_in": _OTP_TTL_S}
+
+
+def handle_admin_otp_verify(data, headers=None):
+    """POST /api/admin/otp/verify {identifier, purpose, code}.
+    Code theek ho to admin session token wapas do. Ghalat code pe
+    generic 401; 10 ghalat koshishon ke baad 15 minute lock (429)."""
+    if not _web_auth(headers or {}):
+        return 401, {"ok": False, "error": "unauthorized"}
+    data = data or {}
+    ident = str(data.get("identifier") or "").strip()
+    purpose = str(data.get("purpose") or "").strip()
+    code = str(data.get("code") or "").strip()
+    if purpose not in ("signup", "login") or not ident or not re.match(r"^\d{6}$", code):
+        return 400, {"ok": False, "error": "identifier, purpose aur 6-digit code chahiye"}
+    c = db()
+    u = _find_web_user_by_identifier(c, ident)
+    if not u:
+        c.close()
+        return 401, {"ok": False, "error": "code ghalat ya expire ho gaya hai"}
+    try:
+        user_admin = bool(u["is_admin"])
+    except Exception:
+        user_admin = False
+    if not user_admin:
+        c.close()
+        return 401, {"ok": False, "error": "code ghalat ya expire ho gaya hai"}
+    admin_id = u["id"]
+    if _otp_locked(admin_id):
+        c.close()
+        return 429, {"ok": False, "error": "bohat zyada ghalat koshishein — 15 minute baad try karein"}
+    row = c.execute(
+        "SELECT * FROM admin_otps WHERE admin_user_id=? AND purpose=? AND used=0 "
+        "ORDER BY id DESC LIMIT 1", (admin_id, purpose)).fetchone()
+    if not row or (row["expires_at"] or "") <= _now_str():
+        c.close()
+        return 401, {"ok": False, "error": "code ghalat ya expire ho gaya hai"}
+    want = hashlib.sha256(code.encode("utf-8")).hexdigest()
+    if not hmac.compare_digest(want, row["code_hash"] or ""):
+        attempts = (row["attempts"] or 0) + 1
+        c.execute("UPDATE admin_otps SET attempts=? WHERE id=?", (attempts, row["id"]))
+        c.commit()
+        if attempts >= _OTP_MAX_ATTEMPTS:
+            _OTP_LOCKS[admin_id] = time.time() + _OTP_LOCK_S
+        c.close()
+        return 401, {"ok": False, "error": "code ghalat ya expire ho gaya hai"}
+    c.execute("UPDATE admin_otps SET used=1 WHERE id=?", (row["id"],))
+    c.commit(); c.close()
+    token = _create_web_session(admin_id, is_admin=1)
+    log.info("Admin OTP verify: purpose=%s result=ok", purpose)
+    return 200, {"ok": True, "token": token, "user": _public_web_user(u)}
+
+
+def _admin_order_buyer(c, o):
+    """Order row -> buyer {name, email, phone, source}."""
+    try:
+        ch = (o["channel"] or "telegram") or "telegram"
+    except Exception:
+        ch = "telegram"
+    if ch == "web":
+        email = ""
+        try:
+            email = (o["web_contact"] or "").strip()
+        except Exception:
+            email = ""
+        w = None
+        if email:
+            w = c.execute("SELECT name, email, phone FROM web_users WHERE email=?", (email,)).fetchone()
+        if w:
+            return {"name": w["name"], "email": w["email"], "phone": w["phone"] or "", "source": "web"}
+        return {"name": "", "email": email, "phone": "", "source": "web"}
+    try:
+        uname = o["username"] or ""
+    except Exception:
+        uname = ""
+    return {"name": uname, "email": "", "phone": "", "source": ch}
+
+
+def _admin_order_product(c, o):
+    """Product naam (+N more jahan cart me kayi items hon)."""
+    try:
+        p = c.execute("SELECT name FROM products WHERE id=?", (o["product_id"],)).fetchone()
+    except Exception:
+        p = None
+    pname = p["name"] if p else ""
+    try:
+        lines = json.loads(o["items_json"] or "[]")
+        n = len(lines) if isinstance(lines, list) else 0
+    except Exception:
+        n = 0
+    if n > 1 and pname:
+        pname = f"{pname} (+{n - 1} more)"
+    return pname
+
+
+def _admin_delivery_label(status):
+    return {"delivered": "Delivered",
+            "zurva_processing": "Paid — delivering",
+            "ahm7_pending": "Paid — waiting for supplier",
+            "pending": "Unpaid",
+            "out_of_stock": "Paid — stock issue",
+            "rejected": "Rejected"}.get(status or "", status or "")
+
+
+def _admin_order_row(c, o):
+    try:
+        ch = (o["channel"] or "telegram") or "telegram"
+    except Exception:
+        ch = "telegram"
+    return {"code": o["code"], "created_at": o["created_at"] or "",
+            "product": _admin_order_product(c, o),
+            "product_id": o["product_id"],
+            "qty": o["qty"] or 1,
+            "amount_pkr": o["amount_pkr"] or 0,
+            "amount_text": o["amount_text"] or "",
+            "payment_method": o["payment_method"],
+            "status": o["status"],
+            "delivery": _admin_delivery_label(o["status"]),
+            "channel": ch,
+            "buyer": _admin_order_buyer(c, o)}
+
+
+def handle_admin_stats(headers=None):
+    """GET /api/admin/stats — Bearer admin token."""
+    u, err = _admin_session_user(headers or {})
+    if err:
+        return err
+    c = db()
+    total = c.execute("SELECT COUNT(*) n FROM orders").fetchone()["n"]
+    paid = c.execute("SELECT COUNT(*) n FROM orders WHERE status IN (?,?,?,?)",
+                     _PAID_ORDER_STATUSES).fetchone()["n"]
+    pending = c.execute("SELECT COUNT(*) n FROM orders WHERE status='pending'").fetchone()["n"]
+    rev = c.execute("SELECT COALESCE(SUM(amount_pkr),0) s FROM orders WHERE status IN (?,?,?,?)",
+                    _PAID_ORDER_STATUSES).fetchone()["s"]
+    users = c.execute("SELECT COUNT(*) n FROM web_users").fetchone()["n"]
+    today = datetime.now().strftime("%Y-%m-%d")
+    today_n = c.execute("SELECT COUNT(*) n FROM orders WHERE substr(created_at,1,10)=?",
+                        (today,)).fetchone()["n"]
+    c.close()
+    return 200, {"ok": True, "stats": {"total_orders": total, "paid_orders": paid,
+                                        "pending_orders": pending,
+                                        "total_revenue_pkr": rev,
+                                        "total_users": users, "today_orders": today_n}}
+
+
+def handle_admin_orders(headers=None, query=None):
+    """GET /api/admin/orders?status=&method=&q=&limit=&offset= — Bearer admin token.
+    Sab orders (web + Telegram), newest first. q code/username/web_contact me dhoondta hai."""
+    u, err = _admin_session_user(headers or {})
+    if err:
+        return err
+    query = query or {}
+    status = (query.get("status") or [""])[0].strip()
+    method = (query.get("method") or [""])[0].strip()
+    q = (query.get("q") or [""])[0].strip()
+    try:
+        limit = max(1, min(100, int((query.get("limit") or ["50"])[0])))
+    except Exception:
+        limit = 50
+    try:
+        offset = max(0, int((query.get("offset") or ["0"])[0]))
+    except Exception:
+        offset = 0
+    where, args = [], []
+    if status:
+        where.append("status=?"); args.append(status)
+    if method:
+        where.append("LOWER(payment_method)=LOWER(?)"); args.append(method)
+    if q:
+        where.append("(code LIKE ? OR username LIKE ? OR web_contact LIKE ?)")
+        args += [f"%{q}%", f"%{q}%", f"%{q}%"]
+    wsql = (" WHERE " + " AND ".join(where)) if where else ""
+    c = db()
+    total = c.execute(f"SELECT COUNT(*) n FROM orders{wsql}", args).fetchone()["n"]
+    rows = c.execute(f"SELECT * FROM orders{wsql} ORDER BY id DESC LIMIT ? OFFSET ?",
+                     args + [limit, offset]).fetchall()
+    orders = [_admin_order_row(c, o) for o in rows]
+    c.close()
+    return 200, {"ok": True, "orders": orders, "total": total,
+                 "limit": limit, "offset": offset}
+
+
+def handle_admin_order_detail(headers=None, code=""):
+    """GET /api/admin/order/:code — Bearer admin token. Full detail.
+    Delivery token kabhi nahi milta; delivered account credentials
+    (login/password) admin ko milte hain (ye shop ka apna data hai)."""
+    u, err = _admin_session_user(headers or {})
+    if err:
+        return err
+    code = (code or "").strip()
+    if not code:
+        return 404, {"ok": False, "error": "order nahi mila"}
+    c = db()
+    o = c.execute("SELECT * FROM orders WHERE code=?", (code,)).fetchone()
+    if not o:
+        c.close()
+        return 404, {"ok": False, "error": "order nahi mila"}
+    out = _admin_order_row(c, o)
+    try:
+        lines = json.loads(o["items_json"] or "[]")
+        if not isinstance(lines, list):
+            lines = []
+    except Exception:
+        lines = []
+    items = []
+    for ln in lines:
+        try:
+            pid = int((ln or {}).get("product_id") or 0)
+            qty = int((ln or {}).get("qty") or 1)
+        except Exception:
+            continue
+        p = c.execute("SELECT name FROM products WHERE id=?", (pid,)).fetchone()
+        items.append({"product_id": pid, "product": p["name"] if p else "",
+                      "qty": qty})
+    out["items"] = items
+    out["proof"] = o["proof"] or ""
+    out["discount_pkr"] = o["discount_pkr"] or 0
+    out["coupon_code"] = o["coupon_code"] or ""
+    out["account_id"] = o["account_id"]
+    try:
+        out["ahm7_order_id"] = o["ahm7_order_id"] or ""
+    except Exception:
+        out["ahm7_order_id"] = ""
+    try:
+        out["ahm7_note"] = o["ahm7_note"] or ""
+    except Exception:
+        out["ahm7_note"] = ""
+    out["credentials"] = None
+    if o["account_id"]:
+        a = c.execute("SELECT login, password FROM accounts WHERE id=?",
+                      (o["account_id"],)).fetchone()
+        if a:
+            out["credentials"] = {"login": a["login"], "password": a["password"]}
+    c.close()
+    return 200, {"ok": True, "order": out}
+
+
+def handle_admin_users(headers=None, query=None):
+    """GET /api/admin/users?q=&limit=&offset= — Bearer admin token.
+    Web users + unke web orders ki count."""
+    u, err = _admin_session_user(headers or {})
+    if err:
+        return err
+    query = query or {}
+    q = (query.get("q") or [""])[0].strip()
+    try:
+        limit = max(1, min(100, int((query.get("limit") or ["50"])[0])))
+    except Exception:
+        limit = 50
+    try:
+        offset = max(0, int((query.get("offset") or ["0"])[0]))
+    except Exception:
+        offset = 0
+    where, args = "", []
+    if q:
+        where = " WHERE (name LIKE ? OR email LIKE ? OR phone LIKE ?)"
+        args = [f"%{q}%", f"%{q}%", f"%{q}%"]
+    c = db()
+    total = c.execute(f"SELECT COUNT(*) n FROM web_users{where}", args).fetchone()["n"]
+    rows = c.execute(f"SELECT * FROM web_users{where} ORDER BY id DESC LIMIT ? OFFSET ?",
+                     args + [limit, offset]).fetchall()
+    users = []
+    for w in rows:
+        n = c.execute("SELECT COUNT(*) n FROM orders WHERE channel='web' AND web_contact=?",
+                      (w["email"],)).fetchone()["n"]
+        users.append({"id": w["id"], "name": w["name"], "email": w["email"],
+                      "phone": w["phone"] or "", "created_at": w["created_at"] or "",
+                      "is_admin": bool(w["is_admin"]) if "is_admin" in w.keys() else False,
+                      "orders": n})
+    c.close()
+    return 200, {"ok": True, "users": users, "total": total,
+                 "limit": limit, "offset": offset}
+
 
 def ahm7_place_order(product_id, customer_ref, quantity=1):
     """AHM7 POST /v1/orders (currency pkr, Idempotency-Key = customer_ref —
