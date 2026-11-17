@@ -99,10 +99,13 @@ AHM7_API_KEY = os.getenv("AHM7_API_KEY", "")
 AHM7_BASE_URL = os.getenv("AHM7_BASE_URL", "https://api.ahm7.tech/v1").rstrip("/")
 
 # ---------- Web admin dashboard + OTP (admin login) ----------
-# Admin kaun hai: email ya phone env se match kare (Junaid). OTP do
-# channels se jata hai — Twilio SMS (phone) + Resend email. Keys kabhi
-# code me nahi — sirf env se (Botkeep .env me set karo). Dono me se koi
-# ek bhi missing ho to OTP send 503 deta hai (otp_not_configured).
+# Admin kaun hai: email ya phone env se match kare (Junaid). OTP teen
+# channels se ja sakta hai — Telegram (bot khud ADMIN_ID ko bhejta hai),
+# Twilio SMS (phone) + Resend email. Har channel best-effort aur alag hai:
+# Twilio sirf tab jab uski keys set hon, Resend sirf tab jab uski key set
+# ho, Telegram hamesha (admin ke liye). Koi bhi channel available na ho to
+# OTP send 503 deta hai (otp_not_configured). Keys kabhi code me nahi —
+# sirf env se (Botkeep .env me set karo).
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "raisjunaidnazeer@gmail.com").strip().lower()
 ADMIN_PHONE = os.getenv("ADMIN_PHONE", "+923706462990").strip()
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
@@ -338,6 +341,15 @@ def init_db():
         used INTEGER DEFAULT 0,
         created_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS user_email_otps(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        code_hash TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        attempts INTEGER DEFAULT 0,
+        used INTEGER DEFAULT 0,
+        created_at TEXT NOT NULL
+    );
     """)
     defaults = {
         "jazzcash_number": os.getenv("JAZZCASH_NUMBER", "03XX-XXXXXXX"),
@@ -380,6 +392,7 @@ def init_db():
     # admin session ka flag (admin endpoints sirf admin sessions se khulte hain).
     _add_col(c, "web_users", "phone", "TEXT DEFAULT ''")
     _add_col(c, "web_users", "is_admin", "INTEGER DEFAULT 0")
+    _add_col(c, "web_users", "email_verified", "INTEGER DEFAULT 0")
     _add_col(c, "web_sessions", "is_admin", "INTEGER DEFAULT 0")
     try:
         c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_web_users_phone "
@@ -704,7 +717,7 @@ def start_health_server():
                 self.end_headers()
                 self.wfile.write(msg.encode("utf-8", "ignore"))
                 return
-            if self.path.startswith("/api/web-checkout") or self.path.startswith("/api/ahm7-retry") or self.path.startswith("/api/review") or self.path.startswith("/api/auth/signup") or self.path.startswith("/api/auth/login") or self.path.startswith("/api/auth/logout") or self.path.startswith("/api/auth/delete") or self.path.startswith("/api/admin/otp/send") or self.path.startswith("/api/admin/otp/verify"):
+            if self.path.startswith("/api/web-checkout") or self.path.startswith("/api/ahm7-retry") or self.path.startswith("/api/review") or self.path.startswith("/api/auth/signup") or self.path.startswith("/api/auth/login") or self.path.startswith("/api/auth/logout") or self.path.startswith("/api/auth/delete") or self.path.startswith("/api/auth/verify-email/send") or self.path.startswith("/api/auth/verify-email/confirm") or self.path.startswith("/api/admin/otp/send") or self.path.startswith("/api/admin/otp/verify"):
                 # Site checkout / review (Cloudflare Worker se) — JSON in, JSON out.
                 try:
                     length = int(self.headers.get("Content-Length") or 0)
@@ -741,6 +754,10 @@ def start_health_server():
                         status, out = handle_auth_logout(self.headers)
                     elif self.path.startswith("/api/auth/delete"):
                         status, out = handle_auth_delete(self.headers)
+                    elif self.path.startswith("/api/auth/verify-email/send"):
+                        status, out = handle_auth_verify_email_send(self.headers)
+                    elif self.path.startswith("/api/auth/verify-email/confirm"):
+                        status, out = handle_auth_verify_email_confirm(data, self.headers)
                     elif self.path.startswith("/api/admin/otp/send"):
                         ip = self.client_address[0] if self.client_address else ""
                         status, out = handle_admin_otp_send(data, self.headers, ip)
@@ -2731,7 +2748,8 @@ def _auth_session_user(headers):
 
 def _public_web_user(u):
     """Site ko wapas dene wala user object — kabhi password hash ya
-    token nahi. Phone + is_admin admin dashboard / header ke liye."""
+    token nahi. Phone + is_admin admin dashboard / header ke liye;
+    email_verified profile banner ke liye."""
     try:
         phone = u["phone"] or ""
     except Exception:
@@ -2740,8 +2758,13 @@ def _public_web_user(u):
         is_admin = bool(u["is_admin"])
     except Exception:
         is_admin = False
+    try:
+        email_verified = bool(u["email_verified"])
+    except Exception:
+        email_verified = False
     return {"name": u["name"], "email": u["email"],
-            "phone": phone, "is_admin": is_admin}
+            "phone": phone, "is_admin": is_admin,
+            "email_verified": email_verified}
 
 def _normalize_phone(raw):
     """Phone normalize karo: spaces/dashes/parens hatao; '00' -> '+'.
@@ -2823,9 +2846,28 @@ def handle_auth_signup(data, headers=None, client_ip=""):
     uid = cur.lastrowid
     c.commit(); c.close()
     token = _create_web_session(uid)
-    log.info("Auth signup: email=%s result=ok", email)
+    # Email verification code — best-effort, signup kabhi block nahi karta:
+    # Resend free tier (ya key missing) ki wajah se send fail ho to bhi
+    # account banta hai (unverified), login chalta hai, profile me banner
+    # + resend button dikhta hai. Verification tab enforce hogi jab send
+    # theek se kaam karne lage.
+    verification_sent = False
+    if RESEND_API_KEY:
+        try:
+            _code = _issue_email_otp(uid)
+            if _code:
+                verification_sent = bool(_send_email_via_resend(
+                    email, "Pheonix Retail Shop — email verification code",
+                    ("Assalam-o-Alaikum,\n\nAapka Pheonix Retail Shop email verification code: "
+                     f"{_code}\nYe code 10 minute ke liye valid hai. Kisi ko na dein.\n\n"
+                     "— Pheonix Retail Shop")))
+        except Exception as e:
+            log.warning("Auth signup: verification email failed for %s: %s", email, e)
+            verification_sent = False
+    log.info("Auth signup: email=%s result=ok verification_sent=%s", email, verification_sent)
     return 200, {"ok": True, "token": token,
-                 "user": {"name": name, "email": email, "phone": phone, "is_admin": bool(is_admin)}}
+                 "user": {"name": name, "email": email, "phone": phone, "is_admin": bool(is_admin),
+                          "email_verified": False, "verification_sent": verification_sent}}
 
 def handle_auth_login(data, headers=None, client_ip=""):
     """POST /api/auth/login (Worker se, X-Web-Secret). Returns (status, dict).
@@ -2948,9 +2990,11 @@ def handle_auth_orders(headers=None):
 
 # ---------- Admin dashboard + OTP (admin login) ----------
 # Admin session: web_sessions row jis ka is_admin=1 HO aur user ka
-# is_admin bhi 1 ho. OTP: 6-digit code, Twilio SMS (ADMIN_PHONE) +
-# Resend email (ADMIN_EMAIL) dono pe — ek hi code dono channels pe.
-# Code kabhi log ya response me nahi aata (sirf SHA-256 hash DB me).
+# is_admin bhi 1 ho. OTP: 6-digit code, ek hi code teen channels pe —
+# Telegram DM (ADMIN_ID, bot khud bhejta hai), Twilio SMS (ADMIN_PHONE),
+# Resend email (ADMIN_EMAIL). Har channel best-effort: jo available ho
+# us pe jata hai, baaki skip. Code kabhi log ya response me nahi aata
+# (sirf SHA-256 hash DB me).
 
 _OTP_TTL_S = 600            # code 10 minute valid
 _OTP_MAX_SENDS_HOUR = 5     # per admin, per hour
@@ -2963,9 +3007,22 @@ _PAID_ORDER_STATUSES = ("zurva_processing", "ahm7_pending", "delivered", "out_of
 _ADMIN_GENERIC_ERROR = "admin verification available nahi hai"
 
 
+def _twilio_configured():
+    """Twilio SMS tab jab SID + token + from number teeno set hon."""
+    return bool(TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_FROM_NUMBER)
+
+
+def _resend_configured():
+    return bool(RESEND_API_KEY)
+
+
 def _otp_configured():
-    return bool(TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_FROM_NUMBER
-                and RESEND_API_KEY)
+    """Admin OTP tab jab koi ek channel available ho: Twilio (keys set),
+    Resend (key set), ya Telegram (ADMIN_ID set — bot khud bhejta hai).
+    Twilio Pakistan me trial nahi deta, is liye koi ek channel bhi
+    missing ho to 503 nahi — sirf tab 503 jab kuch bhi available na ho."""
+    return bool(_twilio_configured() or _resend_configured()
+                or (ADMIN_ID and BOT_TOKEN))
 
 
 def _otp_send_allowed(admin_id):
@@ -3008,25 +3065,54 @@ def _send_otp_sms(to_phone, code):
         return False
 
 
-def _send_otp_email(to_email, code):
-    """Resend email. Code kabhi log nahi hota. Returns True/False."""
+def _send_email_via_resend(to_email, subject, text):
+    """Resend se plain email bhejo. Koi code kabhi log nahi hota.
+    Returns True/False (HTTP status bhi log me, body kabhi nahi)."""
     try:
         r = requests.post(
             "https://api.resend.com/emails",
             headers={"Authorization": f"Bearer {RESEND_API_KEY}",
                      "Content-Type": "application/json"},
             json={"from": RESEND_FROM, "to": [to_email],
-                  "subject": "Pheonix Retail Shop — admin login code",
-                  "text": ("Assalam-o-Alaikum,\n\nAapka Pheonix Retail Shop admin code: "
-                           f"{code}\nYe code 10 minute ke liye valid hai. Kisi ko na dein.\n\n"
-                           "— Pheonix Retail Shop")},
+                  "subject": subject, "text": text},
             timeout=15)
         if r.status_code in (200, 201):
             return True
-        log.warning("Resend OTP email failed: HTTP %s", r.status_code)
+        log.warning("Resend email failed: HTTP %s", r.status_code)
         return False
     except Exception as e:
-        log.warning("Resend OTP email error: %s", e)
+        log.warning("Resend email error: %s", e)
+        return False
+
+
+def _send_otp_email(to_email, code):
+    """Resend email (admin OTP). Code kabhi log nahi hota. Returns True/False."""
+    return _send_email_via_resend(
+        to_email, "Pheonix Retail Shop — admin login code",
+        ("Assalam-o-Alaikum,\n\nAapka Pheonix Retail Shop admin code: "
+         f"{code}\nYe code 10 minute ke liye valid hai. Kisi ko na dein.\n\n"
+         "— Pheonix Retail Shop"))
+
+
+def _send_otp_telegram(code):
+    """Telegram DM (admin OTP) — bot khud ADMIN_ID ko bhejta hai, seedha
+    Bot API se (PTB loop ki zaroorat nahi — HTTP thread se bhi chalta hai).
+    Code kabhi log nahi hota. Returns True/False."""
+    if not BOT_TOKEN or not ADMIN_ID:
+        return False
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json={"chat_id": ADMIN_ID,
+                  "text": (f"Pheonix Retail Shop admin code: {code}. "
+                           "10 minute ke liye valid hai. Kisi ko na dein.")},
+            timeout=15)
+        if r.status_code == 200:
+            return True
+        log.warning("Telegram OTP send failed: HTTP %s", r.status_code)
+        return False
+    except Exception as e:
+        log.warning("Telegram OTP send error: %s", e)
         return False
 
 
@@ -3111,11 +3197,16 @@ def handle_admin_otp_send(data, headers=None, client_ip=""):
     c.execute("INSERT INTO admin_otps(admin_user_id, purpose, code_hash, expires_at, attempts, used, created_at) "
               "VALUES(?,?,?,?,0,0,?)", (admin_id, purpose, code_hash, expires, _now_str()))
     c.commit(); c.close()
+    # Har channel best-effort aur alag: Twilio sirf jab keys set hon
+    # (Pakistan me trial nahi — keys missing hon to skip, fail nahi),
+    # Resend sirf jab key set ho, Telegram hamesha (admin ke liye).
     channels = []
-    if _send_otp_sms(ADMIN_PHONE, code):
+    if _twilio_configured() and _send_otp_sms(ADMIN_PHONE, code):
         channels.append("sms")
-    if _send_otp_email(ADMIN_EMAIL, code):
+    if _resend_configured() and _send_otp_email(ADMIN_EMAIL, code):
         channels.append("email")
+    if _send_otp_telegram(code):
+        channels.append("telegram")
     if not channels:
         # Dono channels fail — code bekaar hai, delete kar do taake retry fresh ho.
         c = db()
@@ -3175,6 +3266,98 @@ def handle_admin_otp_verify(data, headers=None):
     token = _create_web_session(admin_id, is_admin=1)
     log.info("Admin OTP verify: purpose=%s result=ok", purpose)
     return 200, {"ok": True, "token": token, "user": _public_web_user(u)}
+
+
+# ---------- User email verification (Resend) ----------
+# Signup ke baad user ko 6-digit code email se jata hai. Resend free tier
+# reportedly sirf account owner ke apne email pe bhejta hai jab tak domain
+# verify na ho — is liye send fail hona signup/login ko KABHI block nahi
+# karta: account unverified banta hai, login chalta hai, profile me banner
+# + resend button dikhta hai. Verification enforce tab hogi jab send
+# theek se kaam karne lage (domain verify hone ke baad).
+_EMAIL_OTP_SUBJECT = "Pheonix Retail Shop — email verification code"
+
+
+def _issue_email_otp(user_id):
+    """User ke liye naya email OTP row banao (purane unused invalid).
+    Returns plaintext code (sirf caller ko — DB me sirf hash), ya None
+    jab rate limit (5/hour) khatam ho."""
+    if not _otp_send_allowed(f"email:{user_id}"):
+        return None
+    c = db()
+    c.execute("UPDATE user_email_otps SET used=1 WHERE user_id=? AND used=0", (user_id,))
+    code = str(secrets.randbelow(900000) + 100000)
+    code_hash = hashlib.sha256(code.encode("utf-8")).hexdigest()
+    expires = (datetime.now() + timedelta(seconds=_OTP_TTL_S)).strftime("%Y-%m-%d %H:%M:%S")
+    c.execute("INSERT INTO user_email_otps(user_id, code_hash, expires_at, attempts, used, created_at) "
+              "VALUES(?,?,?,0,0,?)", (user_id, code_hash, expires, _now_str()))
+    c.commit(); c.close()
+    return code
+
+
+def handle_auth_verify_email_send(headers=None):
+    """POST /api/auth/verify-email/send (Bearer session token).
+    Logged-in user ko uske apne email pe verification code bhejo."""
+    u, err = _auth_session_user(headers or {})
+    if err:
+        return err
+    try:
+        if u["email_verified"]:
+            return 200, {"ok": True, "already_verified": True}
+    except Exception:
+        pass
+    if not _resend_configured():
+        return 503, {"ok": False, "error": "email_not_configured"}
+    code = _issue_email_otp(u["id"])
+    if not code:
+        return 429, {"ok": False, "error": "bohat zyada koshishein — 1 ghante baad try karein"}
+    sent = _send_email_via_resend(
+        u["email"], _EMAIL_OTP_SUBJECT,
+        ("Assalam-o-Alaikum,\n\nAapka Pheonix Retail Shop email verification code: "
+         f"{code}\nYe code 10 minute ke liye valid hai. Kisi ko na dein.\n\n"
+         "— Pheonix Retail Shop"))
+    if not sent:
+        return 502, {"ok": False, "error": "email bheja nahi ja saka — dobara try karein"}
+    log.info("Email verify send: user_id=%s result=ok", u["id"])
+    return 200, {"ok": True, "channels": ["email"], "expires_in": _OTP_TTL_S}
+
+
+def handle_auth_verify_email_confirm(data, headers=None):
+    """POST /api/auth/verify-email/confirm {code} (Bearer session token).
+    Code theek ho to web_users.email_verified=1. Ghalat code pe generic
+    401; 10 ghalat koshishon ke baad 15 minute lock (429)."""
+    u, err = _auth_session_user(headers or {})
+    if err:
+        return err
+    data = data or {}
+    code = str(data.get("code") or "").strip()
+    if not re.match(r"^\d{6}$", code):
+        return 400, {"ok": False, "error": "6-digit code chahiye"}
+    user_id = u["id"]
+    lock_key = f"email:{user_id}"
+    if _otp_locked(lock_key):
+        return 429, {"ok": False, "error": "bohat zyada ghalat koshishein — 15 minute baad try karein"}
+    c = db()
+    row = c.execute(
+        "SELECT * FROM user_email_otps WHERE user_id=? AND used=0 "
+        "ORDER BY id DESC LIMIT 1", (user_id,)).fetchone()
+    if not row or (row["expires_at"] or "") <= _now_str():
+        c.close()
+        return 401, {"ok": False, "error": "code ghalat ya expire ho gaya hai"}
+    want = hashlib.sha256(code.encode("utf-8")).hexdigest()
+    if not hmac.compare_digest(want, row["code_hash"] or ""):
+        attempts = (row["attempts"] or 0) + 1
+        c.execute("UPDATE user_email_otps SET attempts=? WHERE id=?", (attempts, row["id"]))
+        c.commit()
+        if attempts >= _OTP_MAX_ATTEMPTS:
+            _OTP_LOCKS[lock_key] = time.time() + _OTP_LOCK_S
+        c.close()
+        return 401, {"ok": False, "error": "code ghalat ya expire ho gaya hai"}
+    c.execute("UPDATE user_email_otps SET used=1 WHERE id=?", (row["id"],))
+    c.execute("UPDATE web_users SET email_verified=1 WHERE id=?", (user_id,))
+    c.commit(); c.close()
+    log.info("Email verify confirm: user_id=%s result=ok", user_id)
+    return 200, {"ok": True, "email_verified": True}
 
 
 def _admin_order_buyer(c, o):

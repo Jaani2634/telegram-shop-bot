@@ -39,6 +39,9 @@ cols = [r[1] for r in c.execute("PRAGMA table_info(web_sessions)").fetchall()]
 check("migration: web_sessions has is_admin", "is_admin" in cols, str(cols))
 tabs = [r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
 check("migration: admin_otps table exists", "admin_otps" in tabs, str(tabs))
+check("migration: user_email_otps table exists", "user_email_otps" in tabs, str(tabs))
+wcols = [r[1] for r in c.execute("PRAGMA table_info(web_users)").fetchall()]
+check("migration: web_users has email_verified", "email_verified" in wcols, str(wcols))
 c.close()
 
 ADMIN_EMAIL = "raisjunaidnazeer@gmail.com"
@@ -292,6 +295,97 @@ s, out = bot.handle_admin_otp_send(
     {"identifier": ADMIN_EMAIL, "password": "adminpass123", "purpose": "login"}, H, fresh_ip())
 check("otp/send: 6th send in an hour -> 429", s == 429, f"got {s} {out}")
 
+bot._send_otp_sms = orig_sms
+bot._send_otp_email = orig_email
+
+# ---------- 8b. OTP Telegram channel + best-effort fallback ----------
+# Twilio Pakistan me trial nahi deta — admin OTP ko Telegram se bhi
+# chalna chahiye, aur koi ek channel missing ho to 503 nahi aana chahiye.
+bot._OTP_SEND_RL.clear()
+bot._OTP_LOCKS.clear()
+bot.ADMIN_ID = 7965730503
+bot.BOT_TOKEN = "123456:TESTTOKEN"
+bot.TWILIO_ACCOUNT_SID = "ACtest"
+bot.TWILIO_AUTH_TOKEN = "toktest"
+bot.TWILIO_FROM_NUMBER = "+15005550006"
+bot.RESEND_API_KEY = "re_test"
+tg_captured = []
+orig_tg = bot._send_otp_telegram
+bot._send_otp_sms = lambda to, code: (captured.append(("sms", to, code)), True)[1]
+bot._send_otp_email = lambda to, code: (captured.append(("email", to, code)), True)[1]
+bot._send_otp_telegram = lambda code: (tg_captured.append(("telegram", code)), True)[1]
+
+captured.clear(); tg_captured.clear()
+s, out = bot.handle_admin_otp_send(
+    {"identifier": ADMIN_EMAIL, "password": "adminpass123", "purpose": "login"}, H, fresh_ip())
+check("otp/send: telegram channel on -> channels [sms, email, telegram]",
+      s == 200 and out.get("channels") == ["sms", "email", "telegram"], f"got {s} {out}")
+check("otp/send: telegram code is the SAME code as sms/email",
+      bool(tg_captured) and tg_captured[0][1] == captured[0][2],
+      f"got {tg_captured} {captured}")
+
+# Twilio keys missing -> no 503, email + telegram still go
+bot.TWILIO_ACCOUNT_SID = ""
+bot.TWILIO_AUTH_TOKEN = ""
+bot.TWILIO_FROM_NUMBER = ""
+captured.clear(); tg_captured.clear()
+s, out = bot.handle_admin_otp_send(
+    {"identifier": ADMIN_EMAIL, "password": "adminpass123", "purpose": "login"}, H, fresh_ip())
+check("otp/send: no Twilio keys -> 200 via [email, telegram], no 503",
+      s == 200 and out.get("channels") == ["email", "telegram"], f"got {s} {out}")
+
+# Resend key missing too -> telegram only
+bot.RESEND_API_KEY = ""
+captured.clear(); tg_captured.clear()
+s, out = bot.handle_admin_otp_send(
+    {"identifier": ADMIN_EMAIL, "password": "adminpass123", "purpose": "login"}, H, fresh_ip())
+check("otp/send: no Twilio + no Resend -> 200 via [telegram] only",
+      s == 200 and out.get("channels") == ["telegram"], f"got {s} {out}")
+
+# sms + email fail, telegram ok -> 200 via telegram only
+bot.TWILIO_ACCOUNT_SID = "ACtest"
+bot.TWILIO_AUTH_TOKEN = "toktest"
+bot.TWILIO_FROM_NUMBER = "+15005550006"
+bot.RESEND_API_KEY = "re_test"
+bot._send_otp_sms = lambda to, code: False
+bot._send_otp_email = lambda to, code: False
+captured.clear(); tg_captured.clear()
+s, out = bot.handle_admin_otp_send(
+    {"identifier": ADMIN_EMAIL, "password": "adminpass123", "purpose": "login"}, H, fresh_ip())
+check("otp/send: sms+email fail, telegram ok -> 200 via [telegram]",
+      s == 200 and out.get("channels") == ["telegram"], f"got {s} {out}")
+
+# all three fail -> 502, code deleted (verify with it -> 401)
+bot._send_otp_telegram = lambda code: (tg_captured.append(("telegram", code)), False)[1]
+tg_captured.clear()
+s, out = bot.handle_admin_otp_send(
+    {"identifier": ADMIN_EMAIL, "password": "adminpass123", "purpose": "login"}, H, fresh_ip())
+check("otp/send: all channels fail -> 502", s == 502, f"got {s} {out}")
+dead_code = tg_captured[0][1] if tg_captured else "000000"
+s, out = bot.handle_admin_otp_verify(
+    {"identifier": ADMIN_EMAIL, "purpose": "login", "code": dead_code}, H)
+check("otp/send: 502 code is deleted (verify -> 401)", s == 401, f"got {s} {out}")
+
+# no channel at all (ADMIN_ID 0 + no keys) -> 503 otp_not_configured
+bot.ADMIN_ID = 0
+bot.TWILIO_ACCOUNT_SID = ""
+bot.TWILIO_AUTH_TOKEN = ""
+bot.TWILIO_FROM_NUMBER = ""
+bot.RESEND_API_KEY = ""
+s, out = bot.handle_admin_otp_send(
+    {"identifier": ADMIN_EMAIL, "password": "adminpass123", "purpose": "login"}, H, fresh_ip())
+check("otp/send: no channel at all -> 503 otp_not_configured",
+      s == 503 and out.get("error") == "otp_not_configured", f"got {s} {out}")
+
+# restore (HTTP section needs the real senders back; config state is
+# irrelevant there — it only checks 400/401 paths)
+bot.ADMIN_ID = 0
+bot.BOT_TOKEN = ""
+bot.TWILIO_ACCOUNT_SID = "ACtest"
+bot.TWILIO_AUTH_TOKEN = "toktest"
+bot.TWILIO_FROM_NUMBER = "+15005550006"
+bot.RESEND_API_KEY = "re_test"
+bot._send_otp_telegram = orig_tg
 bot._send_otp_sms = orig_sms
 bot._send_otp_email = orig_email
 
