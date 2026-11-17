@@ -529,6 +529,12 @@ bot._send_email_via_smtp = lambda to, subj, text: False
 s, out = bot.handle_auth_verify_email_send(bearer(TOK_SM))
 check("smtp: both senders fail -> send 502",
       s == 502, f"got {s} {out}")
+_c = bot.db()
+_er = _c.execute("SELECT COUNT(*) n FROM issues WHERE kind='email_otp_failed' "
+                 "AND user_email=?", ("smtponly@example.com",)).fetchone()["n"]
+_c.close()
+check("issues: verify-email send failure logged (kind email_otp_failed)",
+      _er == 1, f"got {_er}")
 s, out = bot.handle_auth_signup(
     {"name": "Both Fail", "email": "bothfail@example.com", "phone": "+92 300 1110015", "password": "secret123"}, H, fresh_ip())
 check("smtp: both fail -> signup still 200, sent=false",

@@ -39,7 +39,7 @@ import hmac
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from dotenv import load_dotenv
 
@@ -359,6 +359,21 @@ def init_db():
         used INTEGER DEFAULT 0,
         created_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS site_visits(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT,
+        page TEXT,
+        ts INTEGER
+    );
+    CREATE TABLE IF NOT EXISTS issues(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_email TEXT,
+        user_name TEXT,
+        kind TEXT,
+        detail TEXT,
+        ts INTEGER,
+        status TEXT DEFAULT 'open'
+    );
     """)
     defaults = {
         "jazzcash_number": os.getenv("JAZZCASH_NUMBER", "03XX-XXXXXXX"),
@@ -646,6 +661,10 @@ def start_health_server():
                     p = parsed.path
                     if p == "/api/admin/stats":
                         status, out = handle_admin_stats(self.headers)
+                    elif p == "/api/admin/visits":
+                        status, out = handle_admin_visits(self.headers)
+                    elif p == "/api/admin/issues":
+                        status, out = handle_admin_issues(self.headers, qs)
                     elif p == "/api/admin/orders":
                         status, out = handle_admin_orders(self.headers, qs)
                     elif p.startswith("/api/admin/order/"):
@@ -726,7 +745,7 @@ def start_health_server():
                 self.end_headers()
                 self.wfile.write(msg.encode("utf-8", "ignore"))
                 return
-            if self.path.startswith("/api/web-checkout") or self.path.startswith("/api/ahm7-retry") or self.path.startswith("/api/review") or self.path.startswith("/api/auth/signup") or self.path.startswith("/api/auth/login") or self.path.startswith("/api/auth/logout") or self.path.startswith("/api/auth/delete") or self.path.startswith("/api/auth/verify-email/send") or self.path.startswith("/api/auth/verify-email/confirm") or self.path.startswith("/api/admin/otp/send") or self.path.startswith("/api/admin/otp/verify"):
+            if self.path.startswith("/api/web-checkout") or self.path.startswith("/api/ahm7-retry") or self.path.startswith("/api/review") or self.path.startswith("/api/auth/signup") or self.path.startswith("/api/auth/login") or self.path.startswith("/api/auth/logout") or self.path.startswith("/api/auth/delete") or self.path.startswith("/api/auth/verify-email/send") or self.path.startswith("/api/auth/verify-email/confirm") or self.path.startswith("/api/admin/otp/send") or self.path.startswith("/api/admin/otp/verify") or self.path.startswith("/api/track/visit") or self.path.startswith("/api/admin/issues/"):
                 # Site checkout / review (Cloudflare Worker se) — JSON in, JSON out.
                 try:
                     length = int(self.headers.get("Content-Length") or 0)
@@ -772,6 +791,14 @@ def start_health_server():
                         status, out = handle_admin_otp_send(data, self.headers, ip)
                     elif self.path.startswith("/api/admin/otp/verify"):
                         status, out = handle_admin_otp_verify(data, self.headers)
+                    elif self.path.startswith("/api/track/visit"):
+                        ip = self.client_address[0] if self.client_address else ""
+                        status, out = handle_track_visit(data, self.headers, ip)
+                    elif self.path.startswith("/api/admin/issues/"):
+                        # POST /api/admin/issues/:id/resolve
+                        _pp = urlparse(self.path).path.strip("/").split("/")
+                        _iid = _pp[3] if len(_pp) >= 5 and _pp[4] == "resolve" else ""
+                        status, out = handle_admin_issue_resolve(self.headers, _iid)
                     else:
                         status, out = handle_ahm7_retry(data, self.headers)
                 except Exception as e:
@@ -2897,6 +2924,7 @@ def handle_auth_login(data, headers=None, client_ip=""):
     if not u or not _verify_password(password, u["password_hash"]):
         c.close()
         log.info("Auth login: identifier=%s result=fail", ident)
+        _log_issue(ident, "", "login_failed", "Failed login attempt")
         return 401, {"ok": False, "error": _AUTH_GENERIC_ERROR}
     # Admin flag dobara check karo (env badla ho to flag bhi badle).
     is_admin = 1 if _is_admin_identity(u["email"], u["phone"] if "phone" in u.keys() else "") else 0
@@ -3265,6 +3293,8 @@ def handle_admin_otp_send(data, headers=None, client_ip=""):
         channels.append("telegram")
     if not channels:
         # Dono channels fail — code bekaar hai, delete kar do taake retry fresh ho.
+        _log_issue(ident, u["name"] if u else "", "admin_otp_failed",
+                   "Admin OTP could not be sent via any channel")
         c = db()
         c.execute("DELETE FROM admin_otps WHERE admin_user_id=? AND purpose=? AND code_hash=? AND used=0",
                   (admin_id, purpose, code_hash))
@@ -3373,6 +3403,8 @@ def handle_auth_verify_email_send(headers=None):
          f"{code}\nYe code 10 minute ke liye valid hai. Kisi ko na dein.\n\n"
          "— Pheonix Retail Shop"))
     if not sent:
+        _log_issue(u["email"], u["name"], "email_otp_failed",
+                   "Email verification code could not be sent")
         return 502, {"ok": False, "error": "email bheja nahi ja saka — dobara try karein"}
     log.info("Email verify send: user_id=%s result=ok", u["id"])
     return 200, {"ok": True, "channels": ["email"], "expires_in": _OTP_TTL_S}
@@ -3501,11 +3533,25 @@ def handle_admin_stats(headers=None):
     today = datetime.now().strftime("%Y-%m-%d")
     today_n = c.execute("SELECT COUNT(*) n FROM orders WHERE substr(created_at,1,10)=?",
                         (today,)).fetchone()["n"]
+    # Dashboard v2: visits + open issues (stored open + computed stuck).
+    _now_utc = datetime.now(timezone.utc)
+    _today_start = int(datetime(_now_utc.year, _now_utc.month, _now_utc.day,
+                                tzinfo=timezone.utc).timestamp())
+    _now_ts = int(time.time())
+    visits_today = c.execute("SELECT COUNT(*) n FROM site_visits WHERE ts>=?",
+                             (_today_start,)).fetchone()["n"]
+    visits_7d = c.execute("SELECT COUNT(*) n FROM site_visits WHERE ts>=?",
+                          (_now_ts - 7 * 86400,)).fetchone()["n"]
+    stored_open = c.execute("SELECT COUNT(*) n FROM issues WHERE status='open'").fetchone()["n"]
+    open_issues = stored_open + len(_computed_stuck_issues(c))
     c.close()
     return 200, {"ok": True, "stats": {"total_orders": total, "paid_orders": paid,
                                         "pending_orders": pending,
                                         "total_revenue_pkr": rev,
-                                        "total_users": users, "today_orders": today_n}}
+                                        "total_users": users, "today_orders": today_n,
+                                        "visits_today": visits_today,
+                                        "visits_7d": visits_7d,
+                                        "open_issues": open_issues}}
 
 
 def handle_admin_orders(headers=None, query=None):
@@ -3635,6 +3681,196 @@ def handle_admin_users(headers=None, query=None):
     c.close()
     return 200, {"ok": True, "users": users, "total": total,
                  "limit": limit, "offset": offset}
+
+
+# ---------- Dashboard v2: site visits + issues ----------
+# site_visits: public page-view counter (no auth, no IP stored).
+# issues: best-effort failure log (email/admin OTP, payment, login) +
+# computed "order_stuck" rows derived from orders at read time.
+
+_VISIT_RL = {}
+_VISIT_SESSION_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_STUCK_ORDER_STATUSES = ("zurva_processing", "paid_pending")
+
+
+def _log_issue(user_email, user_name, kind, detail):
+    """Best-effort insert into issues — kabhi main flow nahi torta.
+    Kabhi OTP/code/password log nahi karta (callers sirf safe detail bhejte hain)."""
+    try:
+        c = db()
+        c.execute("INSERT INTO issues(user_email, user_name, kind, detail, ts, status) "
+                  "VALUES(?,?,?,?,?, 'open')",
+                  (str(user_email or "")[:120], str(user_name or "")[:120],
+                   str(kind or "")[:64], str(detail or "")[:500], int(time.time())))
+        c.commit(); c.close()
+    except Exception:
+        pass
+
+
+def _computed_stuck_issues(c):
+    """Orders zurva_processing / paid_pending me 1 ghante se zyada —
+    read time pe derive hote hain, store NAHI hote. id = -order_id."""
+    cutoff = (datetime.now() - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        rows = c.execute(
+            "SELECT * FROM orders WHERE status IN (?,?) AND created_at <> '' "
+            "AND created_at < ? ORDER BY id DESC",
+            (_STUCK_ORDER_STATUSES[0], _STUCK_ORDER_STATUSES[1], cutoff)).fetchall()
+    except Exception:
+        return []
+    out = []
+    for o in rows:
+        try:
+            ts = int(datetime.strptime(o["created_at"], "%Y-%m-%d %H:%M:%S").timestamp())
+        except Exception:
+            ts = int(time.time()) - 3600
+        try:
+            ch = (o["channel"] or "telegram") if "channel" in o.keys() else "telegram"
+        except Exception:
+            ch = "telegram"
+        email = (o["web_contact"] or "") if ch == "web" else ""
+        try:
+            name = o["username"] or ""
+        except Exception:
+            name = ""
+        out.append({"id": -o["id"], "user_email": email, "user_name": name,
+                    "kind": "order_stuck",
+                    "detail": f"Order {o['code']} stuck in status {o['status']} "
+                              f"for over 1 hour (Rs {o['amount_pkr'] or 0})",
+                    "ts": ts, "status": "open", "source": "computed"})
+    return out
+
+
+def handle_track_visit(data, headers=None, client_ip=""):
+    """POST /api/track/visit {page, session} — public, no auth.
+    Rate limit 60/hour per client IP (in-memory). IP store NAHI hota."""
+    if _auth_rate_limited(_VISIT_RL, client_ip, 3600, 60):
+        return 429, {"ok": False, "error": "too many visits — thodi der me dobara try karein"}
+    data = data or {}
+    page = data.get("page")
+    session = data.get("session")
+    if not isinstance(page, str) or not page.startswith("/") or len(page) > 200:
+        return 400, {"ok": False, "error": "page '/' se shuru hona chahiye (max 200 chars)"}
+    if not isinstance(session, str) or not _VISIT_SESSION_RE.match(session):
+        return 400, {"ok": False, "error": "session token ghalat hai"}
+    c = db()
+    c.execute("INSERT INTO site_visits(session_id, page, ts) VALUES(?,?,?)",
+              (session, page, int(time.time())))
+    c.commit(); c.close()
+    return 200, {"ok": True}
+
+
+def handle_admin_visits(headers=None):
+    """GET /api/admin/visits — Bearer admin token. 'Today' = current UTC day;
+    uniques = distinct session_id. by_page = top 10 (last 30d)."""
+    u, err = _admin_session_user(headers or {})
+    if err:
+        return err
+    now_utc = datetime.now(timezone.utc)
+    now_ts = int(time.time())
+    today_start = int(datetime(now_utc.year, now_utc.month, now_utc.day,
+                               tzinfo=timezone.utc).timestamp())
+    start_7d = now_ts - 7 * 86400
+    start_30d = now_ts - 30 * 86400
+    c = db()
+    today = c.execute("SELECT COUNT(*) n FROM site_visits WHERE ts>=?",
+                      (today_start,)).fetchone()["n"]
+    last7d = c.execute("SELECT COUNT(*) n FROM site_visits WHERE ts>=?",
+                       (start_7d,)).fetchone()["n"]
+    last30d = c.execute("SELECT COUNT(*) n FROM site_visits WHERE ts>=?",
+                        (start_30d,)).fetchone()["n"]
+    unique_today = c.execute("SELECT COUNT(DISTINCT session_id) n FROM site_visits "
+                             "WHERE ts>=?", (today_start,)).fetchone()["n"]
+    unique_7d = c.execute("SELECT COUNT(DISTINCT session_id) n FROM site_visits "
+                          "WHERE ts>=?", (start_7d,)).fetchone()["n"]
+    unique_30d = c.execute("SELECT COUNT(DISTINCT session_id) n FROM site_visits "
+                           "WHERE ts>=?", (start_30d,)).fetchone()["n"]
+    by_page = [{"page": r["page"], "count": r["c"]} for r in c.execute(
+        "SELECT page, COUNT(*) c FROM site_visits WHERE ts>=? "
+        "GROUP BY page ORDER BY c DESC, page ASC LIMIT 10", (start_30d,)).fetchall()]
+    # hourly24: last 24 hour-buckets, oldest -> newest.
+    cur_hour = (now_ts // 3600) * 3600
+    hour_counts = {}
+    for r in c.execute("SELECT ts FROM site_visits WHERE ts>=?",
+                       (now_ts - 24 * 3600,)).fetchall():
+        b = (r["ts"] // 3600) * 3600
+        hour_counts[b] = hour_counts.get(b, 0) + 1
+    hourly24 = [hour_counts.get(cur_hour - (23 - i) * 3600, 0) for i in range(24)]
+    # daily30: last 30 UTC days, oldest -> newest.
+    day_counts = {}
+    for r in c.execute("SELECT ts FROM site_visits WHERE ts>=?",
+                       (start_30d,)).fetchall():
+        b = (r["ts"] // 86400) * 86400
+        day_counts[b] = day_counts.get(b, 0) + 1
+    daily30 = [day_counts.get(today_start - (29 - i) * 86400, 0) for i in range(30)]
+    c.close()
+    return 200, {"ok": True, "today": today, "last7d": last7d, "last30d": last30d,
+                 "unique_today": unique_today, "unique_7d": unique_7d,
+                 "unique_30d": unique_30d, "by_page": by_page,
+                 "hourly24": hourly24, "daily30": daily30}
+
+
+def handle_admin_issues(headers=None, query=None):
+    """GET /api/admin/issues?kind=&status=&q= — Bearer admin token.
+    Stored rows + computed order_stuck rows, newest first. counts/open
+    poori (unfiltered) list pe hain; filters sirf list pe lagte hain."""
+    u, err = _admin_session_user(headers or {})
+    if err:
+        return err
+    query = query or {}
+    kind_f = (query.get("kind") or [""])[0].strip()
+    status_f = (query.get("status") or [""])[0].strip()
+    q_f = (query.get("q") or [""])[0].strip().lower()
+    c = db()
+    merged = []
+    for r in c.execute("SELECT * FROM issues ORDER BY id DESC").fetchall():
+        merged.append({"id": r["id"], "user_email": r["user_email"] or "",
+                       "user_name": r["user_name"] or "", "kind": r["kind"] or "",
+                       "detail": r["detail"] or "", "ts": r["ts"] or 0,
+                       "status": r["status"] or "open", "source": "stored"})
+    merged += _computed_stuck_issues(c)
+    c.close()
+    counts = {}
+    open_n = 0
+    for it in merged:
+        counts[it["kind"]] = counts.get(it["kind"], 0) + 1
+        if it["status"] == "open":
+            open_n += 1
+    if kind_f:
+        merged = [it for it in merged if it["kind"] == kind_f]
+    if status_f:
+        merged = [it for it in merged if it["status"] == status_f]
+    if q_f:
+        merged = [it for it in merged
+                  if q_f in (it["user_email"] or "").lower()
+                  or q_f in (it["user_name"] or "").lower()
+                  or q_f in (it["detail"] or "").lower()]
+    merged.sort(key=lambda it: (it["ts"], it["id"]), reverse=True)
+    return 200, {"ok": True, "issues": merged, "counts": counts, "open": open_n}
+
+
+def handle_admin_issue_resolve(headers=None, issue_id=""):
+    """POST /api/admin/issues/:id/resolve — Bearer admin token.
+    Sirf stored rows resolve hote hain; computed rows (id < 0) -> 400."""
+    u, err = _admin_session_user(headers or {})
+    if err:
+        return err
+    try:
+        iid = int(str(issue_id or "").strip())
+    except Exception:
+        return 400, {"ok": False, "error": "issue id ghalat hai"}
+    if iid < 0:
+        return 400, {"ok": False, "error": "computed issue resolve nahi ho sakta"}
+    if iid == 0:
+        return 400, {"ok": False, "error": "issue id ghalat hai"}
+    c = db()
+    cur = c.execute("UPDATE issues SET status='resolved' WHERE id=?", (iid,))
+    c.commit()
+    if cur.rowcount == 0:
+        c.close()
+        return 404, {"ok": False, "error": "issue nahi mila"}
+    c.close()
+    return 200, {"ok": True}
 
 
 def ahm7_place_order(product_id, customer_ref, quantity=1):
@@ -3885,6 +4121,8 @@ def handle_web_checkout(data, headers=None):
                                  success_url=zp_success, cancel_url=zp_cancel)
     if err:
         log.warning("Web checkout %s: Zurvapay initiate failed: %s", code, err)
+        _log_issue(contact if "@" in contact else "", "", "payment_failed",
+                   f"Zurvapay initiate failed for order {code}: {err}")
         return 502, {"ok": False, "error": f"Payment start nahi ho saki: {err}",
                      "order_code": code, "delivery_token": token, "order_url": order_url}
     # Checkout URL store karo — order page ka "Pay now" button isi se

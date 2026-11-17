@@ -87,6 +87,12 @@ s, out = bot.handle_auth_login({"identifier": "Ali Khan", "password": "secret123
 check("login: by username identifier", s == 200, f"got {s} {out}")
 s, out = bot.handle_auth_login({"identifier": "Ali Khan", "password": "wrongpass"}, H, fresh_ip())
 check("login: wrong password -> 401 generic", s == 401, f"got {s} {out}")
+_c = bot.db()
+_lr = _c.execute("SELECT detail FROM issues WHERE kind='login_failed' AND user_email=?",
+                 ("Ali Khan",)).fetchall()
+_c.close()
+check("issues: failed login logged (kind login_failed, password never stored)",
+      len(_lr) == 1 and "wrongpass" not in (_lr[0]["detail"] or ""), f"got {[dict(r) for r in _lr]}")
 s, out = bot.handle_auth_login({"identifier": "nobody@example.com", "password": "secret123"}, H, fresh_ip())
 check("login: unknown identifier -> 401 generic", s == 401, f"got {s} {out}")
 
@@ -365,6 +371,12 @@ dead_code = tg_captured[0][1] if tg_captured else "000000"
 s, out = bot.handle_admin_otp_verify(
     {"identifier": ADMIN_EMAIL, "purpose": "login", "code": dead_code}, H)
 check("otp/send: 502 code is deleted (verify -> 401)", s == 401, f"got {s} {out}")
+_c = bot.db()
+_ar = _c.execute("SELECT COUNT(*) n FROM issues WHERE kind='admin_otp_failed' "
+                 "AND user_email=?", (ADMIN_EMAIL,)).fetchone()["n"]
+_c.close()
+check("issues: admin OTP all-channels failure logged (kind admin_otp_failed)",
+      _ar == 1, f"got {_ar}")
 
 # no channel at all (ADMIN_ID 0 + no keys) -> 503 otp_not_configured
 bot.ADMIN_ID = 0
@@ -496,6 +508,232 @@ try:
           r.status_code == 400, f"got {r.status_code} {r.text[:160]}")
 except Exception as e:
     check("HTTP admin layer reachable", False, str(e))
+
+# ---------- 10. Dashboard v2: visits + issues ----------
+from datetime import datetime as _dt, timedelta as _td
+c = bot.db()
+_tabs10 = [r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+check("v2: site_visits + issues tables exist",
+      "site_visits" in _tabs10 and "issues" in _tabs10, str(_tabs10))
+c.execute("DELETE FROM site_visits")
+c.execute("DELETE FROM issues")
+c.commit(); c.close()
+
+# --- visits aggregates (seeded directly, deterministic) ---
+_now10 = int(time.time())
+_today_start = (_now10 // 86400) * 86400  # UTC midnight
+c = bot.db()
+for sess, page, ts in [
+        ("sess-a", "/", _now10 - 100), ("sess-a", "/products", _now10 - 200),
+        ("sess-b", "/", _now10 - 300), ("sess-c", "/pricing", _now10 - 86400),
+        ("sess-d", "/", _now10 - 8 * 86400), ("sess-e", "/", _now10 - 31 * 86400)]:
+    c.execute("INSERT INTO site_visits(session_id, page, ts) VALUES(?,?,?)", (sess, page, ts))
+c.commit(); c.close()
+
+s, out = bot.handle_admin_visits()
+check("visits: no token -> 401", s == 401, f"got {s} {out}")
+s, out = bot.handle_admin_visits(bearer(TOK_ALI))
+check("visits: normal user token -> 403", s == 403, f"got {s} {out}")
+s, out = bot.handle_admin_visits(bearer(TOK_ADMIN))
+check("visits: counts (today 3, 7d 4, 30d 5)",
+      s == 200 and out.get("today") == 3 and out.get("last7d") == 4
+      and out.get("last30d") == 5, f"got {s} {out}")
+check("visits: uniques (today 2, 7d 3, 30d 4)",
+      out.get("unique_today") == 2 and out.get("unique_7d") == 3
+      and out.get("unique_30d") == 4, f"got {out}")
+check("visits: by_page top 10, '/' first with 3",
+      out.get("by_page") and out["by_page"][0] == {"page": "/", "count": 3}
+      and len(out["by_page"]) == 3, f"got {out.get('by_page')}")
+check("visits: hourly24 = 24 ints, sum 3 (last 24h)",
+      len(out.get("hourly24", [])) == 24 and sum(out["hourly24"]) == 3,
+      f"got {out.get('hourly24')}")
+check("visits: daily30 = 30 ints, sum 5, today bucket 3, yesterday 1",
+      len(out.get("daily30", [])) == 30 and sum(out["daily30"]) == 5
+      and out["daily30"][-1] == 3 and out["daily30"][-2] == 1,
+      f"got {out.get('daily30')}")
+
+# --- track endpoint: stores, no auth, bad input rejected ---
+s, out = bot.handle_track_visit({"page": "/home", "session": "sess-home"}, {}, "203.0.113.50")
+check("track: happy path 200 + no auth needed",
+      s == 200 and out.get("ok") is True, f"got {s} {out}")
+c = bot.db()
+_tr = c.execute("SELECT COUNT(*) n FROM site_visits WHERE page='/home' AND session_id='sess-home'").fetchone()["n"]
+check("track: row stored in site_visits, no IP stored",
+      _tr == 1 and "session_id" in [r[1] for r in c.execute("PRAGMA table_info(site_visits)").fetchall()]
+      and "ip" not in [r[1] for r in c.execute("PRAGMA table_info(site_visits)").fetchall()],
+      f"got {_tr}")
+c.close()
+for label, body in [
+        ("page without leading slash", {"page": "home", "session": "sess-x"}),
+        ("page too long", {"page": "/" + "x" * 200, "session": "sess-x"}),
+        ("session with bad chars", {"page": "/home", "session": "sess x!"}),
+        ("session too long", {"page": "/home", "session": "s" * 65}),
+        ("missing session", {"page": "/home"}),
+        ("missing page", {"session": "sess-x"}),
+        ("non-string page", {"page": 123, "session": "sess-x"})]:
+    s, out = bot.handle_track_visit(body, {}, "203.0.113.51")
+    check(f"track: {label} -> 400", s == 400, f"got {s} {out}")
+
+# --- track rate limit: 60/hour per IP ---
+bot._VISIT_RL.clear()
+_rl_ip = "203.0.113.99"
+_results = []
+for _i in range(61):
+    s, _ = bot.handle_track_visit({"page": "/rl", "session": "sess-rl"}, {}, _rl_ip)
+    _results.append(s)
+check("track: rate limit 60/hour per IP (61st -> 429)",
+      _results[:60] == [200] * 60 and _results[60] == 429, f"got {_results[-3:]}")
+s, _ = bot.handle_track_visit({"page": "/rl", "session": "sess-rl"}, {}, "203.0.113.100")
+check("track: rate limit is per IP (other IP still 200)", s == 200, f"got {s}")
+
+# --- issues: stored + computed stuck orders ---
+c = bot.db()
+c.execute("DELETE FROM issues")
+_now_i = int(time.time())
+for email, name, kind, detail, ts, status in [
+        ("a@example.com", "Ann", "login_failed", "Failed login attempt", _now_i - 60, "open"),
+        ("b@example.com", "Bob", "email_otp_failed", "Email verification code could not be sent", _now_i - 120, "open"),
+        ("a@example.com", "Ann", "login_failed", "Failed login attempt", _now_i - 30, "resolved")]:
+    c.execute("INSERT INTO issues(user_email, user_name, kind, detail, ts, status) VALUES(?,?,?,?,?,?)",
+              (email, name, kind, detail, ts, status))
+_cutoff = (_dt.now() - _td(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+_old2h = (_dt.now() - _td(hours=2)).strftime("%Y-%m-%d %H:%M:%S")
+_old3h = (_dt.now() - _td(hours=3)).strftime("%Y-%m-%d %H:%M:%S")
+_new10m = (_dt.now() - _td(minutes=10)).strftime("%Y-%m-%d %H:%M:%S")
+_new30m = (_dt.now() - _td(minutes=30)).strftime("%Y-%m-%d %H:%M:%S")
+_pid10 = c.execute("SELECT id FROM products LIMIT 1").fetchone()["id"]
+_stuck_ids = {}
+for code, status, created, ch, contact, uname in [
+        ("RS-STUCK1", "zurva_processing", _old2h, "web", "stuck@example.com", ""),
+        ("RS-STUCK2", "paid_pending", _old3h, "telegram", "", "TGUser"),
+        ("RS-FRESH1", "zurva_processing", _new10m, "web", "fresh@example.com", ""),
+        ("RS-FRESH2", "paid_pending", _new30m, "web", "fresh2@example.com", "")]:
+    cur = c.execute("INSERT INTO orders(user_id, username, product_id, payment_method, amount_text, "
+                    "proof, status, account_id, created_at, code, items_json, qty, amount_pkr, channel, web_contact) "
+                    "VALUES(0,?,?,'Zurvapay','Rs 100','', ?, NULL, ?, ?, '[]', 1, 100, ?, ?)",
+                    (uname, _pid10, status, created, code, ch, contact))
+    _stuck_ids[code] = cur.lastrowid
+c.commit(); c.close()
+
+s, out = bot.handle_admin_issues()
+check("issues: no token -> 401", s == 401, f"got {s} {out}")
+s, out = bot.handle_admin_issues(bearer(TOK_ALI), {})
+check("issues: normal user token -> 403", s == 403, f"got {s} {out}")
+s, out = bot.handle_admin_issues(bearer(TOK_ADMIN), {})
+_iss = out.get("issues", [])
+check("issues: 3 stored + 2 computed stuck = 5, newest first",
+      s == 200 and len(_iss) == 5 and _iss[0]["kind"] == "login_failed"
+      and _iss[0]["status"] == "resolved", f"got {s} {out}")
+_comp = [i for i in _iss if i["source"] == "computed"]
+check("issues: computed rows have negative ids, kind order_stuck, status open",
+      len(_comp) == 2 and all(i["id"] < 0 and i["kind"] == "order_stuck"
+                              and i["status"] == "open" for i in _comp)
+      and sorted(i["id"] for i in _comp) == sorted(-_stuck_ids[c] for c in ("RS-STUCK1", "RS-STUCK2")),
+      f"got {_comp}")
+check("issues: computed detail names the order code",
+      all(("RS-STUCK1" in i["detail"] or "RS-STUCK2" in i["detail"]) for i in _comp),
+      f"got {_comp}")
+check("issues: counts per kind (login 2, email 1, stuck 2) + open 4",
+      out.get("counts") == {"login_failed": 2, "email_otp_failed": 1, "order_stuck": 2}
+      and out.get("open") == 4, f"got {out.get('counts')} open={out.get('open')}")
+check("issues: fresh (<1h) paid-pending orders are NOT stuck",
+      not any("RS-FRESH" in i["detail"] for i in _iss), f"got {_iss}")
+s, out = bot.handle_admin_issues(bearer(TOK_ADMIN), {"kind": ["login_failed"]})
+check("issues: kind filter", s == 200 and len(out["issues"]) == 2
+      and all(i["kind"] == "login_failed" for i in out["issues"]), f"got {s} {out}")
+s, out = bot.handle_admin_issues(bearer(TOK_ADMIN), {"kind": ["order_stuck"]})
+check("issues: kind=order_stuck filter -> only computed",
+      s == 200 and len(out["issues"]) == 2
+      and all(i["source"] == "computed" for i in out["issues"]), f"got {s} {out}")
+s, out = bot.handle_admin_issues(bearer(TOK_ADMIN), {"status": ["resolved"]})
+check("issues: status filter", s == 200 and len(out["issues"]) == 1
+      and out["issues"][0]["status"] == "resolved", f"got {s} {out}")
+s, out = bot.handle_admin_issues(bearer(TOK_ADMIN), {"q": ["a@example"]})
+check("issues: q filter matches email", s == 200 and len(out["issues"]) == 2, f"got {s} {out}")
+s, out = bot.handle_admin_issues(bearer(TOK_ADMIN), {"q": ["RS-STUCK1"]})
+check("issues: q filter matches detail (order code)",
+      s == 200 and len(out["issues"]) == 1 and out["issues"][0]["id"] == -_stuck_ids["RS-STUCK1"],
+      f"got {s} {out}")
+
+# --- resolve ---
+_open_id = [i["id"] for i in _iss if i["source"] == "stored" and i["status"] == "open"][0]
+s, out = bot.handle_admin_issue_resolve(None, str(_open_id))
+check("issues/resolve: no token -> 401", s == 401, f"got {s} {out}")
+s, out = bot.handle_admin_issue_resolve(bearer(TOK_ALI), str(_open_id))
+check("issues/resolve: normal user token -> 403", s == 403, f"got {s} {out}")
+s, out = bot.handle_admin_issue_resolve(bearer(TOK_ADMIN), str(-_stuck_ids["RS-STUCK1"]))
+check("issues/resolve: computed row -> 400", s == 400, f"got {s} {out}")
+s, out = bot.handle_admin_issue_resolve(bearer(TOK_ADMIN), "999999")
+check("issues/resolve: unknown id -> 404", s == 404, f"got {s} {out}")
+s, out = bot.handle_admin_issue_resolve(bearer(TOK_ADMIN), str(_open_id))
+check("issues/resolve: stored row -> 200", s == 200 and out.get("ok") is True, f"got {s} {out}")
+c = bot.db()
+_rst = c.execute("SELECT status FROM issues WHERE id=?", (_open_id,)).fetchone()["status"]
+c.close()
+check("issues/resolve: DB row now resolved", _rst == "resolved", f"got {_rst}")
+
+# --- stats new fields (expected values read live from the DB) ---
+c = bot.db()
+_exp_today = c.execute("SELECT COUNT(*) n FROM site_visits WHERE ts>=?", (_today_start,)).fetchone()["n"]
+_exp_7d = c.execute("SELECT COUNT(*) n FROM site_visits WHERE ts>=?", (_now10 - 7 * 86400,)).fetchone()["n"]
+_exp_open = c.execute("SELECT COUNT(*) n FROM issues WHERE status='open'").fetchone()["n"] + 2
+c.close()
+s, out = bot.handle_admin_stats(bearer(TOK_ADMIN))
+_st = out.get("stats", {})
+check("stats: visits_today / visits_7d / open_issues present and match DB",
+      s == 200 and _st.get("visits_today") == _exp_today and _st.get("visits_7d") == _exp_7d
+      and _st.get("open_issues") == _exp_open,
+      f"got {_st} expected today={_exp_today} 7d={_exp_7d} open={_exp_open}")
+
+# --- HTTP: new admin + track routes ---
+try:
+    r = rq.get("http://127.0.0.1:18099/api/admin/visits", timeout=5)
+    check("HTTP: GET /api/admin/visits no token -> 401", r.status_code == 401, f"got {r.status_code}")
+    r = rq.get("http://127.0.0.1:18099/api/admin/visits",
+               headers={"Authorization": f"Bearer {TOK_ADMIN}"}, timeout=5)
+    check("HTTP: GET /api/admin/visits admin -> 200 with aggregates",
+          r.status_code == 200 and r.json().get("today") == _exp_today
+          and len(r.json().get("hourly24", [])) == 24 and len(r.json().get("daily30", [])) == 30,
+          f"got {r.status_code} {r.text[:160]}")
+    r = rq.get("http://127.0.0.1:18099/api/admin/issues",
+               headers={"Authorization": f"Bearer {TOK_ADMIN}"}, timeout=5)
+    check("HTTP: GET /api/admin/issues admin -> 200 with issues",
+          r.status_code == 200 and len(r.json().get("issues", [])) == 5
+          and r.json().get("counts", {}).get("order_stuck") == 2,
+          f"got {r.status_code} {r.text[:160]}")
+    r = rq.get("http://127.0.0.1:18099/api/admin/issues?kind=order_stuck",
+               headers={"Authorization": f"Bearer {TOK_ADMIN}"}, timeout=5)
+    check("HTTP: GET /api/admin/issues?kind=order_stuck -> 2 computed",
+          r.status_code == 200 and len(r.json().get("issues", [])) == 2,
+          f"got {r.status_code} {r.text[:160]}")
+    r = rq.post("http://127.0.0.1:18099/api/track/visit",
+                json={"page": "/http-test", "session": "sess-http"}, timeout=5)
+    check("HTTP: POST /api/track/visit no auth -> 200",
+          r.status_code == 200 and r.json().get("ok") is True,
+          f"got {r.status_code} {r.text[:160]}")
+    r = rq.post("http://127.0.0.1:18099/api/track/visit",
+                json={"page": "no-slash", "session": "sess-http"}, timeout=5)
+    check("HTTP: POST /api/track/visit bad page -> 400", r.status_code == 400, f"got {r.status_code}")
+    # resolve over HTTP: fresh stored row
+    c = bot.db()
+    cur = c.execute("INSERT INTO issues(user_email, user_name, kind, detail, ts, status) "
+                    "VALUES('http@example.com','H','login_failed','Failed login attempt',?, 'open')",
+                    (int(time.time()),))
+    _http_issue = cur.lastrowid
+    c.commit(); c.close()
+    r = rq.post(f"http://127.0.0.1:18099/api/admin/issues/{_http_issue}/resolve",
+                headers={"Authorization": f"Bearer {TOK_ALI}"}, timeout=5)
+    check("HTTP: POST resolve normal token -> 403", r.status_code == 403, f"got {r.status_code}")
+    r = rq.post(f"http://127.0.0.1:18099/api/admin/issues/{_http_issue}/resolve",
+                headers={"Authorization": f"Bearer {TOK_ADMIN}"}, timeout=5)
+    check("HTTP: POST resolve admin -> 200",
+          r.status_code == 200 and r.json().get("ok") is True,
+          f"got {r.status_code} {r.text[:160]}")
+    r = rq.post("http://127.0.0.1:18099/api/admin/issues/-123/resolve",
+                headers={"Authorization": f"Bearer {TOK_ADMIN}"}, timeout=5)
+    check("HTTP: POST resolve computed id -> 400", r.status_code == 400, f"got {r.status_code}")
+except Exception as e:
+    check("HTTP v2 layer reachable", False, str(e))
 
 print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
 if FAIL:

@@ -117,6 +117,25 @@ c.close()
 s2, out2 = bot.handle_web_checkout({"product_id": gem_pid}, H)
 check("checkout: no contact field still works", s2 == 200 and out2.get("order_code"), f"got {s2} {out2}")
 
+# Zurvapay initiate failure -> 502 + payment_failed issue (order code in
+# detail, no credentials anywhere in the issue row).
+bot.zurvapay_initiate = lambda *a, **k: (None, "Zurvapay error: test gateway down")
+s, out = bot.handle_web_checkout(
+    {"product_id": gem_pid, "contact": "buyer2@example.com"}, H)
+check("checkout: initiate failure -> 502 + order_code",
+      s == 502 and out.get("order_code"), f"got {s} {out}")
+fail_code = out.get("order_code", "")
+c = bot.db()
+_pr = c.execute("SELECT * FROM issues WHERE kind='payment_failed' AND user_email=?",
+                ("buyer2@example.com",)).fetchall()
+c.close()
+check("issues: payment failure logged (order code in detail, no secrets)",
+      len(_pr) == 1 and fail_code in (_pr[0]["detail"] or "")
+      and "secret" not in json.dumps(dict(_pr[0])).lower()
+      and "password" not in json.dumps(dict(_pr[0])).lower(),
+      f"got {[dict(r) for r in _pr]}")
+bot.zurvapay_initiate = _initiate_mock
+
 # ---------- 4b. Zurvapay redirect targets (bot-server -> order page) ----------
 tgt = bot.zurvapay_redirect_target("success", code)
 check("redirect: success -> order page with code+token",
