@@ -684,6 +684,32 @@ def start_health_server():
                 self.end_headers()
                 self.wfile.write(body)
                 return
+            if self.path.startswith("/api/stock"):
+                # Public stock counts (site badges) — no auth, rate-limited.
+                # X-Forwarded-For sirf X-Web-Secret (Worker) wali requests pe
+                # mana jata hai — warna koi bhi IP spoof karke rate limit se
+                # bach sakta hai (reviews wali pattern).
+                try:
+                    parsed = urlparse(self.path)
+                    if parsed.path.rstrip("/") != "/api/stock":
+                        status, out = 404, {"ok": False, "error": "not found"}
+                    else:
+                        ip = ""
+                        if _web_auth(self.headers):
+                            ip = (self.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+                        if not ip:
+                            ip = self.client_address[0] if self.client_address else ""
+                        status, out = handle_stock(ip)
+                except Exception as e:
+                    log.exception("Stock handler crashed")
+                    status, out = 500, {"ok": False, "error": f"handler error: {e}"}
+                body = json.dumps(out, ensure_ascii=False).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             if self.path.startswith("/api/order/"):
                 # Website order status (Worker se, X-Web-Secret + delivery token).
                 try:
@@ -2409,6 +2435,26 @@ def load_ahm7_mapping():
             _AHM7_MAPPING = {}
     return _AHM7_MAPPING
 
+def _site_price_pkr(prod, mapping):
+    """Web product ki charged (site) price, PKR me.
+    Source of truth products.price_pkr hai (products.csv se seed/sync
+    hota hai — site == CSV rule). ahm7-mapping.json ka site_price_pkr
+    sirf fallback hai jab DB price 0/missing ho: mapping file me abhi bhi
+    11 products ki pre-sync (purani) prices hain, is liye us se charge
+    karna un 11 ko CSV se kam charge karta tha. Margin guard bhi yahi
+    helper use karta hai, taake guard AHM7 cost ko asal charged price se
+    compare kare. Dono me price na ho to 0."""
+    try:
+        p = int(prod["price_pkr"] or 0)
+    except Exception:
+        p = 0
+    if p > 0:
+        return p
+    try:
+        return int((mapping or {}).get("site_price_pkr") or 0)
+    except Exception:
+        return 0
+
 def _web_auth(headers):
     """X-Web-Secret check (constant-time). Returns True ya False.
     Secret set hi nahi hai to har request reject (fail-closed)."""
@@ -2500,6 +2546,45 @@ def _review_rate_limited(ip):
         return count > 5
 
 
+# GET /api/stock rate limit: 30 requests / 60s per IP (in-memory,
+# _order_status_rate_limited jaisa pattern).
+_STOCK_RL = {}
+_STOCK_RL_LOCK = threading.Lock()
+
+def _stock_rate_limited(ip):
+    now = time.time()
+    ip = ip or "unknown"
+    with _STOCK_RL_LOCK:
+        if len(_STOCK_RL) > 2000:
+            _STOCK_RL.clear()
+        start, count = _STOCK_RL.get(ip, (now, 0))
+        if now - start >= 60:
+            start, count = now, 0
+        count += 1
+        _STOCK_RL[ip] = (start, count)
+        return count > 30
+
+def handle_stock(client_ip=""):
+    """GET /api/stock (public, no auth). Returns (http_status, dict):
+    {"ok": True, "stock": {"<product_id>": <available count>, ...}} —
+    accounts table me status='available' wali rows ki count, har product
+    ke liye (0 jahan koi available account nahi). Ye Telegram bot ka
+    local stock hai — web orders is se fulfill NAHI hote (web fulfillment
+    AHM7 se hoti hai), is liye ye counts sirf site display ke liye hain.
+    Malformed: is handler ke koi params nahi — galat path/method pe HTTP
+    layer 404 deta hai (neeche do_GET dekhein)."""
+    if _stock_rate_limited(client_ip):
+        return 429, {"ok": False, "error": "too many requests — thodi der me dobara try karein"}
+    c = db()
+    rows = c.execute("SELECT product_id, COUNT(*) n FROM accounts "
+                     "WHERE status='available' GROUP BY product_id").fetchall()
+    ids = [r["id"] for r in c.execute("SELECT id FROM products").fetchall()]
+    c.close()
+    counts = {str(r["product_id"]): r["n"] for r in rows}
+    stock = {str(pid): counts.get(str(pid), 0) for pid in ids}
+    return 200, {"ok": True, "stock": stock}
+
+
 def handle_submit_review(data, headers=None, client_ip=""):
     """POST /api/review (Worker se, X-Web-Secret). Stores a real customer
     review — koi fake/seeded review nahi. Returns (http_status, dict)."""
@@ -2520,13 +2605,23 @@ def handle_submit_review(data, headers=None, client_ip=""):
         return 400, {"ok": False, "error": "rating 1 se 5 tak honi chahiye"}
     name = str(data.get("name") or "").strip()
     text = str(data.get("text") or "").strip()
-    if not name or len(name) > 40:
+    if not name:
         return 400, {"ok": False, "error": "naam 1 se 40 characters tak ho"}
-    if not text or len(text) > 500:
+    if len(name) > 40:
+        # Overlong: reject with a machine-readable code + readable message
+        # (Worker pehle silently slice kar deta tha — ab slice nahi hota,
+        # is liye overlong yahan tak aata hai aur 400 milta hai).
+        return 400, {"ok": False, "error": "name_too_long",
+                     "message": "Name must be 40 characters or fewer."}
+    if not text:
         return 400, {"ok": False, "error": "review 1 se 500 characters tak ho"}
+    if len(text) > 500:
+        return 400, {"ok": False, "error": "text_too_long",
+                     "message": "Review must be 500 characters or fewer."}
     low = (name + " " + text).lower()
     if "http://" in low or "https://" in low or "www." in low:
-        return 400, {"ok": False, "error": "review me link nahi ho sakta"}
+        return 400, {"ok": False, "error": "link_not_allowed",
+                     "message": "Reviews cannot contain links."}
     c = db()
     prod = c.execute("SELECT id FROM products WHERE id=?", (product_id,)).fetchone()
     c.close()
@@ -2544,11 +2639,16 @@ def handle_submit_review(data, headers=None, client_ip=""):
 
 
 def handle_delete_review(data, headers=None):
-    """POST /api/review/delete (Worker se, X-Web-Secret). Test reviews
-    hatane ke liye — site par koi delete button nahi hai. Returns
-    (http_status, dict)."""
-    if not _web_auth(headers or {}):
-        return 401, {"ok": False, "error": "unauthorized"}
+    """POST /api/review/delete (Worker se, admin Bearer <redacted> token).
+    Sirf admin delete kar sakta hai. Pehle ye sirf X-Web-Secret (Worker
+    secret) pe khula tha — Worker endpoint public hai, is liye web se koi
+    bhi kisi bhi review ko delete kar sakta tha (agent 1 ne live test
+    review isi se delete ki). Koi UI isay call nahi karta — sirf
+    test-review cleanup ke liye hai, jo ab admin dashboard session se
+    hota hai. Returns (http_status, dict)."""
+    u, err = _admin_session_user(headers or {})
+    if err:
+        return err
     data = data or {}
     try:
         rid = int(data.get("id"))
@@ -3016,6 +3116,7 @@ def handle_auth_orders(headers=None):
         orders.append({
             "code": o["code"],
             "product": pname,
+            "product_id": o["product_id"],
             "amount_pkr": o["amount_pkr"],
             "status": o["status"],
             "created": created,
@@ -3616,7 +3717,9 @@ def handle_admin_order_detail(headers=None, code=""):
     items = []
     for ln in lines:
         try:
-            pid = int((ln or {}).get("product_id") or 0)
+            # items_json lines store {"pid", "qty"} (create_order) — "pid"
+            # pehle, purani "product_id" key fallback ke tor pe.
+            pid = int((ln or {}).get("pid") or (ln or {}).get("product_id") or 0)
             qty = int((ln or {}).get("qty") or 1)
         except Exception:
             continue
@@ -3994,7 +4097,7 @@ def fulfill_web_order(order_id):
             failures.append(f"AHM7 mapping nahi hai ({prod['name']})")
             continue
         cost = mapping.get("cost_pkr")
-        site_price = mapping.get("site_price_pkr") or 0
+        site_price = _site_price_pkr(prod, mapping)
         if cost is None or cost * qty >= site_price * qty:
             failures.append(
                 f"margin guard: {prod['name']} cost Rs {cost} >= site price Rs {site_price} — auto-buy nahi hua")
@@ -4086,7 +4189,7 @@ def handle_web_checkout(data, headers=None):
         mapping = mapping_all.get(prod["name"])
         if not mapping:
             return 400, {"ok": False, "error": f"ye product web checkout pe available nahi hai ({prod['name']})"}
-        site_price = mapping.get("site_price_pkr") or 0
+        site_price = _site_price_pkr(prod, mapping)
         if site_price <= 0:
             return 400, {"ok": False, "error": "product ki price set nahi hai"}
         ln["name"] = prod["name"]

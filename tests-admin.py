@@ -191,6 +191,29 @@ TOK_ADMIN = out.get("token", "")
 s, out = bot.handle_admin_otp_verify(
     {"identifier": ADMIN_EMAIL, "purpose": "signup", "code": CODE}, H)
 check("otp/verify: same code twice -> 401 (single-use)", s == 401, f"got {s} {out}")
+# wrong code vs expired code: BOTH return the same generic 401 string by
+# design (no oracle for attackers) — the site must map them identically.
+# (Row is inserted directly so this test does not consume the 5/hour OTP
+# send budget that section 8 counts on.)
+_ADMIN_ROW = bot.db().execute("SELECT id FROM web_users WHERE email=?", (ADMIN_EMAIL,)).fetchone()
+_ADMIN_ID = _ADMIN_ROW["id"]
+CODE2 = "123456"
+_cc = bot.db()
+_cc.execute("INSERT INTO admin_otps(admin_user_id, purpose, code_hash, expires_at, attempts, used, created_at) "
+            "VALUES(?, 'login', ?, '2099-01-01 00:00:00', 0, 0, ?)",
+            (_ADMIN_ID, hashlib.sha256(CODE2.encode()).hexdigest(), bot._now_str()))
+_cc.commit(); _cc.close()
+s, out = bot.handle_admin_otp_verify(
+    {"identifier": ADMIN_EMAIL, "purpose": "login", "code": "000000"}, H)
+check("otp/verify: wrong code error string",
+      s == 401 and out.get("error") == "code ghalat ya expire ho gaya hai", f"got {s} {out}")
+cc = bot.db()
+cc.execute("UPDATE admin_otps SET expires_at='2000-01-01 00:00:00' WHERE used=0 AND purpose='login'")
+cc.commit(); cc.close()
+s, out = bot.handle_admin_otp_verify(
+    {"identifier": ADMIN_EMAIL, "purpose": "login", "code": CODE2}, H)
+check("otp/verify: expired code -> same 401 string as wrong code (indistinguishable)",
+      s == 401 and out.get("error") == "code ghalat ya expire ho gaya hai", f"got {s} {out}")
 
 # ---------- 6. admin endpoints: auth ----------
 s, out = bot.handle_admin_stats()
@@ -259,6 +282,30 @@ check("admin/order detail: full row + items + no delivery token",
       and out["order"].get("buyer", {}).get("email") == "ali@example.com", f"got {s} {out}")
 s, out = bot.handle_admin_order_detail(bearer(TOK_ADMIN), "RS-NOPE")
 check("admin/order detail: unknown code -> 404", s == 404, f"got {s} {out}")
+# detail items carry real product_ids: items_json lines store {"pid", "qty"}
+# (create_order) — the detail reader used to look for "product_id" and
+# returned 0 for every line. Admin list rows already had product_id.
+_c = bot.db()
+_pid = _c.execute("SELECT id FROM products WHERE name='Gemini Plus 6m Links (No Card Required)'").fetchone()["id"]
+_apid = _c.execute("SELECT id FROM products WHERE name='Amazon Prime 6 Months'").fetchone()["id"]
+_c.close()
+_cart_code = bot.gen_order_code()
+bot.create_order(0, "ali@example.com", [{"pid": _pid, "qty": 1}, {"pid": _apid, "qty": 2}],
+                 "zurvapay", "Rs 2077 via Zurvapay (web)", "zurvapay", 2077,
+                 _cart_code, "", 0, channel="web")
+s, out = bot.handle_admin_order_detail(bearer(TOK_ADMIN), _cart_code)
+_items = (out.get("order") or {}).get("items", [])
+check("admin/order detail: items carry real product_ids (pid key)",
+      s == 200 and len(_items) == 2
+      and _items[0].get("product_id") == _pid and _items[0].get("qty") == 1
+      and _items[1].get("product_id") == _apid and _items[1].get("qty") == 2,
+      f"got {s} {_items}")
+check("admin/order detail: top-level product_id is the first line",
+      (out.get("order") or {}).get("product_id") == _pid, f"got {out.get('order')}")
+# Test order hata do — baad wali HTTP checks total == 3 expect karti hain.
+_c = bot.db()
+_c.execute("DELETE FROM orders WHERE code=?", (_cart_code,))
+_c.commit(); _c.close()
 
 s, out = bot.handle_admin_users(bearer(TOK_ADMIN), {})
 check("admin/users: lists users with order counts",

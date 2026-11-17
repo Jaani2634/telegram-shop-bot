@@ -218,6 +218,8 @@ check("orders: single-item product name + amount + status + created",
       o1["product"] == "Gemini Plus 6m Links (No Card Required)"
       and o1["amount_pkr"] == 479 and o1["status"] == "delivered" and o1["created"],
       f"got {o1}")
+check("orders: product_id present and correct (single-item)",
+      o1.get("product_id") == gem_pid, f"got {o1}")
 check("orders: order_url has code + delivery token",
       o1["order_url"] == f"https://retailshop.pages.dev/order.html?code={code_a1}&token={tok_a1}",
       f"got {o1['order_url']!r}")
@@ -225,12 +227,16 @@ o2 = next(o for o in out["orders"] if o["code"] == code_a2)
 check("orders: multi-item shows (+1 more)",
       o2["product"] == "Gemini Plus 6m Links (No Card Required) (+1 more)"
       and o2["amount_pkr"] == 2077 and o2["status"] == "pending", f"got {o2}")
+check("orders: product_id is the first cart line (multi-item)",
+      o2.get("product_id") == gem_pid, f"got {o2}")
 check("orders: telegram order with same contact NOT listed",
       tg_code not in codes, f"got {codes}")
 s, out = bot.handle_auth_orders(bearer(TOK_BILAL))
 check("orders: Bilal sees only his own order",
       s == 200 and [o["code"] for o in out.get("orders", [])] == [code_b1],
       f"got {s} {out}")
+check("orders: Bilal order product_id correct (Amazon)",
+      (out.get("orders") or [{}])[0].get("product_id") == ama_pid, f"got {out}")
 s, out = bot.handle_auth_orders(bearer("00" * 16))
 check("orders: invalid token -> 401", s == 401, f"got {s} {out}")
 s, out = bot.handle_auth_orders({})
@@ -381,6 +387,26 @@ bot._OTP_LOCKS.pop(f"email:{_nm_id}", None)
 s, out = bot.handle_auth_verify_email_confirm({"code": NMCODE}, bearer(TOK_NM))
 check("email-verify: after lock expiry right code -> 200",
       s == 200 and out.get("email_verified") is True, f"got {s} {out}")
+# wrong code vs expired code: BOTH return the same generic 401 string by
+# design (no oracle for attackers) — the site must map them identically.
+s, out = bot.handle_auth_signup(
+    {"name": "Exp Test", "email": "exp@example.com", "phone": "+92 300 1110099", "password": "secret123"}, H, fresh_ip())
+TOK_EX = out.get("token", "")
+email_captured.clear()
+s, out = bot.handle_auth_verify_email_send(bearer(TOK_EX))
+check("email-verify: send for expiry test -> 200", s == 200, f"got {s} {out}")
+_m = _re.search(r"(\d{6})", email_captured[0][2]) if email_captured else None
+EXCODE = _m.group(1) if _m else ""
+s, out = bot.handle_auth_verify_email_confirm({"code": "000000"}, bearer(TOK_EX))
+check("email-verify: wrong code error string",
+      s == 401 and out.get("error") == "code ghalat ya expire ho gaya hai", f"got {s} {out}")
+_c = bot.db()
+_ex_id = _c.execute("SELECT id FROM web_users WHERE email='exp@example.com'").fetchone()["id"]
+_c.execute("UPDATE user_email_otps SET expires_at='2000-01-01 00:00:00' WHERE user_id=? AND used=0", (_ex_id,))
+_c.commit(); _c.close()
+s, out = bot.handle_auth_verify_email_confirm({"code": EXCODE}, bearer(TOK_EX))
+check("email-verify: expired code -> same 401 string as wrong code (indistinguishable)",
+      s == 401 and out.get("error") == "code ghalat ya expire ho gaya hai", f"got {s} {out}")
 
 # rate limit: 5 sends/hour per user (fresh user; clear the counter first
 # so the signup auto-send does not count toward this user's endpoint limit)
