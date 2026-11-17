@@ -344,7 +344,8 @@ def init_db():
                      ("ahm7_note", "TEXT DEFAULT ''"),
                      ("delivery_token", "TEXT DEFAULT ''"),
                      ("web_contact", "TEXT DEFAULT ''"),
-                     ("success_base", "TEXT DEFAULT ''")):
+                     ("success_base", "TEXT DEFAULT ''"),
+                     ("checkout_url", "TEXT DEFAULT ''")):
         _add_col(c, "orders", col, ddl)
     # Reviews: purani DB me reviews table purane schema (user_name, verified,
     # source) se bani hoti hai — web reviews ko `name` + `created_at` chahiye.
@@ -2548,6 +2549,15 @@ def handle_order_status(code, token, headers=None, client_ip=""):
         return 200, out
     out["status"] = "processing"
     out["message"] = "Payment confirm ho rahi hai — order process ho raha hai."
+    if status == "pending":
+        # Payment abhi start nahi hui — order page "Pay now" dikhaye.
+        # (zurva_processing = payment mil gayi, dobara pay nahi karwana.)
+        try:
+            _cu = o["checkout_url"] or ""
+        except Exception:
+            _cu = ""
+        if _cu:
+            out["checkout_url"] = _cu
     return 200, out
 
 # ---------- Web accounts (site signup/login — REAL accounts) ----------
@@ -3045,6 +3055,11 @@ def handle_web_checkout(data, headers=None):
         log.warning("Web checkout %s: Zurvapay initiate failed: %s", code, err)
         return 502, {"ok": False, "error": f"Payment start nahi ho saki: {err}",
                      "order_code": code, "delivery_token": token, "order_url": order_url}
+    # Checkout URL store karo — order page ka "Pay now" button isi se
+    # payment dobara kholta hai (popup block hone par safety net).
+    c = db()
+    c.execute("UPDATE orders SET checkout_url=? WHERE id=?", (url, oid))
+    c.commit(); c.close()
     log.info("Web checkout %s: total Rs %s, checkout_url ok", code, total)
     return 200, {"ok": True, "checkout_url": url, "order_code": code,
                  "delivery_token": token, "order_url": order_url}

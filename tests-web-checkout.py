@@ -108,6 +108,9 @@ check("checkout: delivery_token + web_contact stored",
       o and o["delivery_token"] == tok and o["web_contact"] == "buyer@example.com",
       f"got {dict(o) if o else None}")
 check("checkout: order status pending", o and o["status"] == "pending")
+check("checkout: checkout_url stored in DB (Pay-now safety net)",
+      o and o["checkout_url"] == "https://checkout.test/pay/xyz",
+      f"got {dict(o) if o else None}")
 c.close()
 
 # contact optional: checkout with no contact at all must also work
@@ -202,15 +205,22 @@ s, out = bot.handle_order_status(code, tok, H, "1.2.3.4")
 check("status: pending web order -> processing, no credentials",
       s == 200 and out.get("status") == "processing" and "credentials" not in out,
       f"got {s} {out}")
+check("status: pending web order -> checkout_url returned (Pay-now safety net)",
+      s == 200 and out.get("checkout_url") == "https://checkout.test/pay/xyz",
+      f"got {s} {out}")
 s, out = bot.handle_order_status(grow, GEM_TOKEN, H, "1.2.3.4")
 check("status: delivered order -> credentials returned",
       s == 200 and out.get("status") == "delivered"
       and any("Pass123" in str(x) for x in out.get("credentials", [])),
       f"got {s} {out}")
+check("status: delivered order -> no checkout_url (already paid)",
+      "checkout_url" not in out, f"got {out}")
 s, out = bot.handle_order_status(bolt_code, BOLT_TOKEN, H, "1.2.3.4")
 check("status: ahm7_pending order -> manual (honest message)",
       s == 200 and out.get("status") == "manual" and "manual" in (out.get("message") or ""),
       f"got {s} {out}")
+check("status: ahm7_pending order -> no checkout_url (already paid)",
+      "checkout_url" not in out, f"got {out}")
 s, out = bot.handle_order_status(code, "00" * 16, H, "1.2.3.4")
 check("status: wrong token -> 404, no leak", s == 404 and out.get("error") == "not found", f"got {s} {out}")
 s, out = bot.handle_order_status(code, "", H, "1.2.3.4")
