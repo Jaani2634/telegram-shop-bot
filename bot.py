@@ -115,7 +115,7 @@ TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
 TWILIO_FROM_NUMBER = os.getenv("TWILIO_FROM_NUMBER", "")
 RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
-RESEND_FROM = os.getenv("RESEND_FROM", "onboarding@resend.dev")
+RESEND_FROM = os.getenv("RESEND_FROM", "Pheonix Retail Shop <onboarding@resend.dev>")
 # Gmail SMTP fallback — Resend free tier sirf owner email ko bhej sakta
 # hai (403 domain restriction), is liye SMTP_USER ek Gmail address aur
 # SMTP_PASS uska app password hai (16 chars; spaces hon to hata diye
@@ -3112,7 +3112,7 @@ def _send_email_via_smtp(to_email, subject, text):
         return False
     try:
         msg = EmailMessage()
-        msg["From"] = SMTP_USER
+        msg["From"] = f"Pheonix Retail Shop <{SMTP_USER}>"
         msg["To"] = to_email
         msg["Subject"] = subject
         msg.set_content(text)

@@ -482,8 +482,8 @@ check("smtp: host smtp.gmail.com:587 + starttls",
 check("smtp: login with user + password spaces removed",
       _f is not None and ("login", "shop@gmail.com", "abcdefghijklmnop") in _f.calls,
       f"got {_f.calls if _f else None}")
-check("smtp: send_message from SMTP_USER to recipient",
-      _f is not None and ("send", "shop@gmail.com", "u@example.com", "Code") in _f.calls,
+check("smtp: send_message from 'Pheonix Retail Shop <SMTP_USER>' to recipient",
+      _f is not None and ("send", "Pheonix Retail Shop <shop@gmail.com>", "u@example.com", "Code") in _f.calls,
       f"got {_f.calls if _f else None}")
 bot.smtplib.SMTP = orig_smtplib_smtp
 # SMTP not configured -> real sender returns False, no SMTP object made
