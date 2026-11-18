@@ -782,6 +782,648 @@ try:
 except Exception as e:
     check("HTTP v2 layer reachable", False, str(e))
 
+# ---------- 11. Global promo coupons (admin dashboard) ----------
+# Tables + validate_promo edge cases + admin CRUD + uses + TG buy_totals.
+_c = bot.db()
+_tabs = [r[0] for r in _c.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+check("promo: promo_codes + promo_uses + stock_events tables exist",
+      all(t in _tabs for t in ("promo_codes", "promo_uses", "stock_events")), str(_tabs))
+_c.close()
+
+# validate_promo direct: har error code, isi order me.
+_c = bot.db()
+_c.execute("INSERT INTO promo_codes(code,pct_off,max_uses,used_count,expires_at,min_order_pkr,first_order_only,active,created_at) "
+           "VALUES('SAVE10',10,NULL,0,NULL,0,0,1,'2026-11-17 10:00')")
+_c.execute("INSERT INTO promo_codes(code,pct_off,max_uses,used_count,expires_at,min_order_pkr,first_order_only,active,created_at) "
+           "VALUES('OFF20',20,2,2,NULL,0,0,1,'2026-11-17 10:00')")
+_c.execute("INSERT INTO promo_codes(code,pct_off,max_uses,used_count,expires_at,min_order_pkr,first_order_only,active,created_at) "
+           "VALUES('OLD5',5,NULL,0,'2020-01-01 00:00',0,0,1,'2026-11-17 10:00')")
+_c.execute("INSERT INTO promo_codes(code,pct_off,max_uses,used_count,expires_at,min_order_pkr,first_order_only,active,created_at) "
+           "VALUES('MIN50',10,NULL,0,NULL,500,0,1,'2026-11-17 10:00')")
+_c.execute("INSERT INTO promo_codes(code,pct_off,max_uses,used_count,expires_at,min_order_pkr,first_order_only,active,created_at) "
+           "VALUES('FIRST15',15,NULL,0,NULL,0,1,1,'2026-11-17 10:00')")
+_c.execute("INSERT INTO promo_codes(code,pct_off,max_uses,used_count,expires_at,min_order_pkr,first_order_only,active,created_at) "
+           "VALUES('BAND25',25,NULL,0,NULL,0,0,0,'2026-11-17 10:00')")
+_c.commit(); _c.close()
+check("promo: validate SAVE10 10% of 1000 = 100",
+      bot.validate_promo(" save10 ", 1000, False) == (True, 10, 100, None),
+      f"got {bot.validate_promo('save10', 1000, False)}")
+check("promo: unknown -> coupon_not_found",
+      bot.validate_promo("NOPE99", 1000, False)[3] == "coupon_not_found")
+check("promo: inactive -> coupon_inactive",
+      bot.validate_promo("BAND25", 1000, False)[3] == "coupon_inactive")
+check("promo: expired -> coupon_expired",
+      bot.validate_promo("OLD5", 1000, False)[3] == "coupon_expired")
+check("promo: exhausted (used==max) -> coupon_exhausted",
+      bot.validate_promo("OFF20", 1000, False)[3] == "coupon_exhausted")
+check("promo: below min order -> coupon_min_order",
+      bot.validate_promo("MIN50", 499, False)[3] == "coupon_min_order")
+check("promo: min order met -> ok",
+      bot.validate_promo("MIN50", 500, False)[0] is True)
+check("promo: first-only, not first order -> coupon_first_only",
+      bot.validate_promo("FIRST15", 1000, False)[3] == "coupon_first_only")
+check("promo: first-only, first order -> ok 15%",
+      bot.validate_promo("FIRST15", 1000, True) == (True, 15, 150, None))
+check("promo: discount capped at amount (100% of 50)",
+      bot.validate_promo("SAVE10", 0, False) == (True, 10, 0, None))
+check("promo: failed payment does NOT consume a use (validate only)",
+      bot.db().execute("SELECT used_count FROM promo_codes WHERE code='SAVE10'").fetchone()["used_count"] == 0)
+
+# Double-use guard: ek hi order_code pe do dafa record -> ek row, count 1.
+_c = bot.db()
+_first = bot._record_promo_use_conn(_c, "SAVE10", "RS-GUARD1", "Test", "t@example.com")
+_second = bot._record_promo_use_conn(_c, "SAVE10", "RS-GUARD1", "Test", "t@example.com")
+_c.commit()
+_rows = _c.execute("SELECT COUNT(*) n FROM promo_uses WHERE code='SAVE10' AND order_code='RS-GUARD1'").fetchone()["n"]
+_cnt = _c.execute("SELECT used_count FROM promo_codes WHERE code='SAVE10'").fetchone()["used_count"]
+_c.close()
+check("promo: double-use guard (record twice -> 1 row, used_count 1)",
+      _first is True and _second is False and _rows == 1 and _cnt == 1,
+      f"first={_first} second={_second} rows={_rows} count={_cnt}")
+# FIRST-ORDER code global table me nahi — record helper use nahi karta.
+_c = bot.db()
+check("promo: FIRST-ORDER is not a global code (record returns False)",
+      bot._record_promo_use_conn(_c, "FIRST-ORDER", "RS-GUARD2") is False)
+_c.close()
+
+# ---------- 11b. coupon admin endpoints: auth + CRUD ----------
+s, out = bot.handle_admin_coupons()
+check("admin/coupons: no token -> 401", s == 401, f"got {s} {out}")
+s, out = bot.handle_admin_coupons(bearer(TOK_ALI))
+check("admin/coupons: normal user token -> 403", s == 403, f"got {s} {out}")
+s, out = bot.handle_admin_coupons(bearer(TOK_ADMIN))
+check("admin/coupons: list has seeded codes, newest first",
+      s == 200 and len(out.get("coupons", [])) == 6, f"got {s} {out}")
+s, out = bot.handle_admin_coupon_create(
+    {"code": "save20", "pct_off": 20, "max_uses": 5, "expires_at": "2099-01-01",
+     "min_order_pkr": 100, "first_order_only": 0}, bearer(TOK_ADMIN))
+check("admin/coupons: create lower-case code -> 201, stored upper, date normalised",
+      s == 201 and out.get("coupon", {}).get("code") == "SAVE20"
+      and out["coupon"]["expires_at"] == "2099-01-01 23:59"
+      and out["coupon"]["pct_off"] == 20, f"got {s} {out}")
+s, out = bot.handle_admin_coupon_create(
+    {"code": "SAVE20", "pct_off": 10}, bearer(TOK_ADMIN))
+check("admin/coupons: duplicate code -> 400 coupon_exists",
+      s == 400 and out.get("error") == "coupon_exists", f"got {s} {out}")
+for _bad, _field in [({"code": "ab", "pct_off": 10}, "code"),
+                     ({"code": "BAD CODE!", "pct_off": 10}, "code"),
+                     ({"code": "OK10", "pct_off": 0}, "pct_off"),
+                     ({"code": "OK10", "pct_off": 101}, "pct_off"),
+                     ({"code": "OK10", "pct_off": 10, "max_uses": 0}, "max_uses"),
+                     ({"code": "OK10", "pct_off": 10, "expires_at": "2020-01-01"}, "expires_at"),
+                     ({"code": "OK10", "pct_off": 10, "expires_at": "not-a-date"}, "expires_at"),
+                     ({"code": "OK10", "pct_off": 10, "min_order_pkr": -1}, "min_order_pkr")]:
+    s, out = bot.handle_admin_coupon_create(_bad, bearer(TOK_ADMIN))
+    check(f"admin/coupons: invalid {_field} -> 400 coupon_invalid",
+          s == 400 and out.get("error") == "coupon_invalid" and out.get("field") == _field,
+          f"got {s} {out}")
+s, out = bot.handle_admin_coupon_create({"code": "OK10", "pct_off": 10}, {})
+check("admin/coupons: create no token -> 401", s == 401, f"got {s} {out}")
+s, out = bot.handle_admin_coupon_create({"code": "OK10", "pct_off": 10}, bearer(TOK_ALI))
+check("admin/coupons: create normal token -> 403", s == 403, f"got {s} {out}")
+s, out = bot.handle_admin_coupon_toggle(bearer(TOK_ADMIN), "SAVE20")
+check("admin/coupons: toggle -> active 0",
+      s == 200 and out.get("active") == 0, f"got {s} {out}")
+s, out = bot.handle_coupon_validate({"code": "SAVE20", "amount_pkr": 1000}, fresh_ip())
+check("admin/coupons: toggled-off code validates coupon_inactive",
+      s == 400 and out.get("error") == "coupon_inactive", f"got {s} {out}")
+s, out = bot.handle_admin_coupon_toggle(bearer(TOK_ADMIN), "SAVE20")
+check("admin/coupons: toggle back -> active 1",
+      s == 200 and out.get("active") == 1, f"got {s} {out}")
+s, out = bot.handle_admin_coupon_toggle(bearer(TOK_ADMIN), "GHOST99")
+check("admin/coupons: toggle unknown -> 404", s == 404, f"got {s} {out}")
+s, out = bot.handle_admin_coupon_uses(bearer(TOK_ADMIN), "SAVE10")
+check("admin/coupons: uses list has the guard row",
+      s == 200 and len(out.get("uses", [])) == 1
+      and out["uses"][0]["order_code"] == "RS-GUARD1", f"got {s} {out}")
+s, out = bot.handle_admin_coupon_uses(bearer(TOK_ADMIN), "GHOST99")
+check("admin/coupons: uses unknown -> 404", s == 404, f"got {s} {out}")
+s, out = bot.handle_admin_coupon_delete({}, bearer(TOK_ADMIN), "SAVE10")
+check("admin/coupons: delete with uses, no force -> 400 coupon_has_uses",
+      s == 400 and out.get("error") == "coupon_has_uses", f"got {s} {out}")
+s, out = bot.handle_admin_coupon_delete({"force": True}, bearer(TOK_ADMIN), "SAVE10")
+check("admin/coupons: delete with force -> 200 + uses rows gone",
+      s == 200 and out.get("deleted") is True
+      and bot.db().execute("SELECT COUNT(*) n FROM promo_uses WHERE code='SAVE10'").fetchone()["n"] == 0,
+      f"got {s} {out}")
+s, out = bot.handle_admin_coupon_delete({}, bearer(TOK_ADMIN), "SAVE10")
+check("admin/coupons: delete unknown -> 404", s == 404, f"got {s} {out}")
+s, out = bot.handle_admin_coupon_delete({}, bearer(TOK_ALI), "SAVE20")
+check("admin/coupons: delete normal token -> 403", s == 403, f"got {s} {out}")
+s, out = bot.handle_admin_coupon_delete({}, {}, "SAVE20")
+check("admin/coupons: delete no token -> 401", s == 401, f"got {s} {out}")
+# Unused code deletes without force.
+s, out = bot.handle_admin_coupon_delete({}, bearer(TOK_ADMIN), "BAND25")
+check("admin/coupons: delete unused code (no force) -> 200",
+      s == 200 and out.get("deleted") is True, f"got {s} {out}")
+
+# ---------- 11c. POST /api/coupon/validate (public) ----------
+s, out = bot.handle_coupon_validate({"code": "SAVE20", "amount_pkr": 1000, "is_first_order": False}, fresh_ip())
+check("coupon/validate: happy path 20% of 1000 = 200",
+      s == 200 and out == {"ok": True, "pct": 20, "discount": 200}, f"got {s} {out}")
+s, out = bot.handle_coupon_validate({"code": "NOPE99", "amount_pkr": 1000}, fresh_ip())
+check("coupon/validate: unknown -> 400 coupon_not_found",
+      s == 400 and out.get("error") == "coupon_not_found", f"got {s} {out}")
+s, out = bot.handle_coupon_validate({"code": "FIRST15", "amount_pkr": 1000, "is_first_order": False}, fresh_ip())
+check("coupon/validate: first-only, not first -> 400 coupon_first_only",
+      s == 400 and out.get("error") == "coupon_first_only", f"got {s} {out}")
+s, out = bot.handle_coupon_validate({"code": "SAVE20", "amount_pkr": -5}, fresh_ip())
+check("coupon/validate: negative amount -> 400", s == 400, f"got {s} {out}")
+s, out = bot.handle_coupon_validate({"code": "SAVE20"}, fresh_ip())
+check("coupon/validate: missing amount -> 400", s == 400, f"got {s} {out}")
+_rl_ip = fresh_ip()
+_rl = [bot.handle_coupon_validate({"code": "SAVE20", "amount_pkr": 100}, _rl_ip)[0] for _ in range(31)]
+check("coupon/validate: rate limit 31st call -> 429",
+      _rl[:30] == [200] * 30 and _rl[30] == 429, f"got {_rl[-3:]}")
+
+# ---------- 11d. Telegram buy_totals: global first, FIRST-ORDER fallback ----------
+from types import SimpleNamespace as _NS
+_prod1 = bot.db().execute("SELECT id, price_pkr FROM products ORDER BY id LIMIT 1").fetchone()
+_P1 = _prod1["id"]
+_P1_PRICE = _prod1["price_pkr"]
+def _ctx(code):
+    return _NS(user_data={"buy_mode": "single", "buy_pid": _P1, "buy_qty": 1,
+                          "buy_coupon_code": code})
+_lines, _sub, _disc, _tot = bot.buy_totals(_ctx("SAVE20"), 555001)
+check("buy_totals: global SAVE20 gives 20% (not FIRST-ORDER 7%)",
+      _sub == _P1_PRICE and _disc == round(_P1_PRICE * 20 / 100)
+      and _tot == _sub - _disc, f"got sub={_sub} disc={_disc}")
+bot.ensure_first_coupon(555001)
+_lines, _sub, _disc, _tot = bot.buy_totals(_ctx("FIRST-ORDER"), 555001)
+check("buy_totals: FIRST-ORDER fallback still 7%",
+      _disc == round(_P1_PRICE * 7 / 100), f"got disc={_disc}")
+_c = bot.db()
+_c.execute("INSERT INTO orders(user_id, username, product_id, payment_method, amount_text, proof, "
+           "status, created_at, code, items_json, qty, amount_pkr, channel) "
+           "VALUES(555002,'u',?,'Easypaisa','Rs 100','', 'delivered', ?, 'RS-FIRSTDONE', '[]', 1, 100, 'telegram')",
+           (_P1, bot._now_str()))
+_c.commit(); _c.close()
+_lines, _sub, _disc, _tot = bot.buy_totals(_ctx("FIRST15"), 555002)
+check("buy_totals: first-only global code, already ordered -> discount 0",
+      _disc == 0, f"got disc={_disc}")
+
+# ---------- 11e. TG deliver_order records global promo use (not per-user table) ----------
+import asyncio as _asyncio
+class _FakeBot:
+    def __init__(self):
+        self.sent = []
+    async def send_message(self, chat_id, text, parse_mode=None, reply_markup=None):
+        self.sent.append((chat_id, text))
+        return None
+_c = bot.db()
+_c.execute("INSERT INTO accounts(product_id, login, password, extra, status) VALUES(?, 'tg@login.com', 'tgpass', '', 'available')", (_P1,))
+_c.commit(); _c.close()
+_tg_oid = bot.create_order(555003, "tgbuyer", [{"pid": _P1, "qty": 1}], "Easypaisa",
+                           f"Rs {_P1}", "proof", _P1, bot.gen_order_code(), "SAVE20", 0, channel="telegram")
+_fake_ctx = _NS(bot=_FakeBot())
+_ok = _asyncio.run(bot.deliver_order(_fake_ctx, _tg_oid))
+_c = bot.db()
+_o = _c.execute("SELECT status, code FROM orders WHERE id=?", (_tg_oid,)).fetchone()
+_uses = _c.execute("SELECT COUNT(*) n FROM promo_uses WHERE code='SAVE20' AND order_code=?", (_o["code"],)).fetchone()["n"]
+_cnt20 = _c.execute("SELECT used_count FROM promo_codes WHERE code='SAVE20'").fetchone()["used_count"]
+_c.close()
+check("deliver_order: global coupon -> delivered + promo_uses row + used_count 1",
+      _ok is True and _o["status"] == "delivered" and _uses == 1 and _cnt20 == 1,
+      f"ok={_ok} status={_o['status'] if _o else None} uses={_uses} count={_cnt20}")
+# FIRST-ORDER delivery: per-user coupons.used=1, promo_uses me kuch nahi.
+_c = bot.db()
+_c.execute("INSERT INTO accounts(product_id, login, password, extra, status) VALUES(?, 'tg2@login.com', 'tgpass2', '', 'available')", (_P1,))
+_c.commit(); _c.close()
+bot.ensure_first_coupon(555004)
+_fo_oid = bot.create_order(555004, "tgbuyer2", [{"pid": _P1, "qty": 1}], "Easypaisa",
+                           f"Rs {_P1}", "proof", _P1, bot.gen_order_code(), "FIRST-ORDER", 0, channel="telegram")
+_ok2 = _asyncio.run(bot.deliver_order(_NS(bot=_FakeBot()), _fo_oid))
+_c = bot.db()
+_used = _c.execute("SELECT used FROM coupons WHERE user_id=555004 AND code='FIRST-ORDER'").fetchone()["used"]
+_pu = _c.execute("SELECT COUNT(*) n FROM promo_uses WHERE code='FIRST-ORDER'").fetchone()["n"]
+_c.close()
+check("deliver_order: FIRST-ORDER -> per-user used=1, no promo_uses row",
+      _ok2 is True and _used == 1 and _pu == 0, f"ok={_ok2} used={_used} promo_uses={_pu}")
+
+# ---------- 12. Products admin endpoints ----------
+s, out = bot.handle_admin_products()
+check("admin/products: no token -> 401", s == 401, f"got {s} {out}")
+s, out = bot.handle_admin_products(bearer(TOK_ALI))
+check("admin/products: normal token -> 403", s == 403, f"got {s} {out}")
+s, out = bot.handle_admin_products(bearer(TOK_ADMIN))
+_plist = out.get("products", [])
+check("admin/products: list has all products with stock/sold/ahm7 fields",
+      s == 200 and len(_plist) >= 42
+      and all(set(("id", "name", "price_pkr", "price_usdt", "kind", "category", "active",
+                    "description", "terms",
+                    "local_stock", "sold", "ahm7_mapped", "ahm7_product_id",
+                    "ahm7_price_pkr", "margin_pkr")) <= set(p.keys()) for p in _plist),
+      f"got {s} len={len(_plist)}")
+_ama = [p for p in _plist if p["name"] == "Amazon Prime 6 Months"][0]
+check("admin/products: Amazon mapped, cost 668, margin = price - cost",
+      _ama["ahm7_mapped"] is True and _ama["ahm7_price_pkr"] == 668
+      and _ama["margin_pkr"] == _ama["price_pkr"] - 668, f"got {_ama}")
+_unmapped = [p for p in _plist if not p["ahm7_mapped"]]
+check("admin/products: unmapped products have null margin",
+      len(_unmapped) >= 1 and all(p["margin_pkr"] is None for p in _unmapped),
+      f"got {len(_unmapped)}")
+s, out = bot.handle_admin_product_create(
+    {"name": "Test Product Alpha", "price_pkr": 560, "kind": "account",
+     "category": "TestCat", "description": "d", "terms": "t"}, bearer(TOK_ADMIN))
+check("admin/products: create -> 201 + id",
+      s == 201 and isinstance(out.get("id"), int), f"got {s} {out}")
+_TPID = out.get("id")
+_c = bot.db()
+_tp = _c.execute("SELECT price_usdt, kind, category FROM products WHERE id=?", (_TPID,)).fetchone()
+_c.close()
+check("admin/products: price_usdt derived like seed (560/280 = 2.0)",
+      _tp["price_usdt"] == 2.0 and _tp["kind"] == "account" and _tp["category"] == "TestCat",
+      f"got {dict(_tp)}")
+s, out = bot.handle_admin_product_create(
+    {"name": "test product alpha", "price_pkr": 100, "kind": "account", "category": "X"},
+    bearer(TOK_ADMIN))
+check("admin/products: duplicate name (case-insensitive) -> 400 product_exists",
+      s == 400 and out.get("error") == "product_exists", f"got {s} {out}")
+for _bad, _field in [({"name": "", "price_pkr": 100, "kind": "account", "category": "X"}, "name"),
+                     ({"name": "B", "price_pkr": 0, "kind": "account", "category": "X"}, "price_pkr"),
+                     ({"name": "B", "price_pkr": 100, "kind": "weird", "category": "X"}, "kind"),
+                     ({"name": "B", "price_pkr": 100, "kind": "account", "category": ""}, "category")]:
+    s, out = bot.handle_admin_product_create(_bad, bearer(TOK_ADMIN))
+    check(f"admin/products: invalid {_field} -> 400",
+          s == 400 and out.get("error") == "product_invalid", f"got {s} {out}")
+# Price change reflects in _site_price_pkr (future checkouts).
+s, out = bot.handle_admin_product_price({"price_pkr": 700}, bearer(TOK_ADMIN), _TPID)
+check("admin/products: price change -> 200 + new price",
+      s == 200 and out.get("price_pkr") == 700, f"got {s} {out}")
+_c = bot.db()
+_tp2 = _c.execute("SELECT * FROM products WHERE id=?", (_TPID,)).fetchone()
+_c.close()
+check("admin/products: _site_price_pkr follows new DB price (700)",
+      bot._site_price_pkr(_tp2, {}) == 700 and _tp2["price_usdt"] == 2.5,
+      f"got {dict(_tp2)}")
+s, out = bot.handle_admin_product_price({"price_pkr": 700}, bearer(TOK_ADMIN), 999999)
+check("admin/products: price unknown id -> 404", s == 404, f"got {s} {out}")
+s, out = bot.handle_admin_product_price({"price_pkr": -1}, bearer(TOK_ADMIN), _TPID)
+check("admin/products: price <= 0 -> 400", s == 400, f"got {s} {out}")
+s, out = bot.handle_admin_product_toggle(bearer(TOK_ADMIN), _TPID)
+check("admin/products: toggle -> active 0",
+      s == 200 and out.get("active") == 0, f"got {s} {out}")
+s, out = bot.handle_admin_product_toggle(bearer(TOK_ADMIN), _TPID)
+check("admin/products: toggle back -> active 1",
+      s == 200 and out.get("active") == 1, f"got {s} {out}")
+s, out = bot.handle_admin_product_toggle(bearer(TOK_ADMIN), 999999)
+check("admin/products: toggle unknown -> 404", s == 404, f"got {s} {out}")
+s, out = bot.handle_admin_product_details(
+    {"description": "new desc", "terms": "new terms"}, bearer(TOK_ADMIN), _TPID)
+check("admin/products: details -> 200 + stored",
+      s == 200 and out.get("ok") is True
+      and bot.db().execute("SELECT description FROM products WHERE id=?", (_TPID,)).fetchone()["description"] == "new desc",
+      f"got {s} {out}")
+s, out = bot.handle_admin_product_details({"description": "x" * 2001}, bearer(TOK_ADMIN), _TPID)
+check("admin/products: details overlong -> 400", s == 400, f"got {s} {out}")
+s, out = bot.handle_admin_product_details({"description": "x"}, bearer(TOK_ADMIN), 999999)
+check("admin/products: details unknown -> 404", s == 404, f"got {s} {out}")
+
+# ---------- 12b. Admin-edited price lock: CSV sync respects admin edits ----------
+# "Amazon Prime 6 Months" CSV me hai (CSV price 799, desc "Limited Deal -
+# was PKR 850"); init_db ka sync iski DB price 799 pe la chuka hai.
+_c = bot.db()
+_ama_id = _c.execute("SELECT id FROM products WHERE name='Amazon Prime 6 Months'").fetchone()["id"]
+_ama0 = _c.execute("SELECT price_pkr, price_usdt, description, terms, admin_edited FROM products WHERE id=?", (_ama_id,)).fetchone()
+_ama_terms0 = _ama0["terms"]
+_c.close()
+check("price lock: migration adds admin_edited=0, CSV price 799 after init sync",
+      _ama0["admin_edited"] == 0 and _ama0["price_pkr"] == 799, f"got {dict(_ama0)}")
+# 1) Non-edited product: sync changed price ko CSV price pe wapas lata hai.
+_c = bot.db()
+_c.execute("UPDATE products SET price_pkr=100 WHERE id=?", (_ama_id,))
+_c.commit()
+bot._sync_products_from_csv(_c)
+_c.commit()
+_p = _c.execute("SELECT price_pkr FROM products WHERE id=?", (_ama_id,)).fetchone()
+_c.close()
+check("price lock: non-edited product syncs back to CSV price 799",
+      _p["price_pkr"] == 799, f"got {_p['price_pkr']}")
+# 2) Admin price edit (API) flag lagata hai; sync phir price ko chhoo nahi sakta.
+s, out = bot.handle_admin_product_price({"price_pkr": 750}, bearer(TOK_ADMIN), _ama_id)
+_c = bot.db()
+_p = _c.execute("SELECT price_pkr, admin_edited FROM products WHERE id=?", (_ama_id,)).fetchone()
+check("price lock: admin price edit sets admin_edited=1",
+      s == 200 and _p["admin_edited"] == 1 and _p["price_pkr"] == 750, f"got {s} {dict(_p)}")
+bot._sync_products_from_csv(_c)
+_c.commit()
+_p = _c.execute("SELECT price_pkr, description FROM products WHERE id=?", (_ama_id,)).fetchone()
+_c.close()
+check("price lock: admin-edited price (750) survives CSV sync",
+      _p["price_pkr"] == 750, f"got {dict(_p)}")
+# 3) Description edit (API) bhi lock karta hai; terms-only edit nahi.
+_c = bot.db()
+_c.execute("UPDATE products SET price_pkr=799, price_usdt=2.85, description='Limited Deal - was PKR 850', admin_edited=0 WHERE id=?", (_ama_id,))
+_c.commit(); _c.close()
+s, out = bot.handle_admin_product_details({"description": "admin wali description"}, bearer(TOK_ADMIN), _ama_id)
+_c = bot.db()
+_p = _c.execute("SELECT description, admin_edited FROM products WHERE id=?", (_ama_id,)).fetchone()
+check("price lock: admin description edit sets admin_edited=1",
+      s == 200 and _p["admin_edited"] == 1 and _p["description"] == "admin wali description", f"got {s} {dict(_p)}")
+bot._sync_products_from_csv(_c)
+_c.commit()
+_p = _c.execute("SELECT description FROM products WHERE id=?", (_ama_id,)).fetchone()
+_c.close()
+check("price lock: admin-edited description survives CSV sync",
+      _p["description"] == "admin wali description", f"got {dict(_p)}")
+_c = bot.db()
+_c.execute("UPDATE products SET description='Limited Deal - was PKR 850', admin_edited=0 WHERE id=?", (_ama_id,))
+_c.commit(); _c.close()
+s, out = bot.handle_admin_product_details({"terms": "sirf terms badle"}, bearer(TOK_ADMIN), _ama_id)
+_c = bot.db()
+_p = _c.execute("SELECT admin_edited FROM products WHERE id=?", (_ama_id,)).fetchone()
+check("price lock: terms-only edit does NOT set admin_edited",
+      s == 200 and _p["admin_edited"] == 0, f"got {s} {dict(_p)}")
+bot._sync_products_from_csv(_c)
+_c.commit()
+_p = _c.execute("SELECT price_pkr FROM products WHERE id=?", (_ama_id,)).fetchone()
+_c.close()
+check("price lock: terms-only row still syncs (price 799)",
+      _p["price_pkr"] == 799, f"got {_p['price_pkr']}")
+# 4) GET /api/admin/products flag expose karta hai; phir row wapas CSV jaisi.
+s, out = bot.handle_admin_products(bearer(TOK_ADMIN))
+_ama = [p for p in out.get("products", []) if p["name"] == "Amazon Prime 6 Months"][0]
+check("price lock: GET /api/admin/products exposes admin_edited=false",
+      s == 200 and "admin_edited" in _ama and _ama["admin_edited"] is False, f"got {_ama}")
+_c = bot.db()
+_c.execute("UPDATE products SET price_pkr=799, price_usdt=2.85, description='Limited Deal - was PKR 850', terms=?, admin_edited=0 WHERE id=?", (_ama_terms0, _ama_id))
+_c.commit(); _c.close()
+
+# ---------- 13. Stock admin endpoints ----------
+s, out = bot.handle_admin_stock_add(
+    {"lines": ["stock1@login.com | pass1",
+               "CODE9 | mail@login.com | https://mailbox.example",
+               "badline-no-separator",
+               "   ",
+               "onlylogin | ",
+               "comma@login.com,commapass"]},
+    bearer(TOK_ADMIN), _TPID)
+check("stock/add: 3 valid added, 2 malformed skipped, blank silent",
+      s == 200 and out.get("added") == 3 and len(out.get("skipped", [])) == 2
+      and all(x["reason"] == "format_ghalat_hai" for x in out["skipped"]),
+      f"got {s} {out}")
+_c = bot.db()
+_accs = _c.execute("SELECT login, password, extra, status FROM accounts WHERE product_id=? ORDER BY id", (_TPID,)).fetchall()
+_ev = _c.execute("SELECT action, count, by_admin FROM stock_events WHERE product_id=? ORDER BY id DESC LIMIT 1", (_TPID,)).fetchone()
+_c.close()
+check("stock/add: mail line stored extra=code, login=email, password=url",
+      any(a["login"] == "mail@login.com" and a["extra"] == "CODE9"
+          and a["password"] == "https://mailbox.example" for a in _accs),
+      f"got {[dict(a) for a in _accs]}")
+check("stock/add: stock_events row logged (add, count 3, admin email)",
+      _ev["action"] == "add" and _ev["count"] == 3 and _ev["by_admin"] == ADMIN_EMAIL,
+      f"got {dict(_ev)}")
+s, out = bot.handle_admin_stock_add({"lines": []}, bearer(TOK_ADMIN), _TPID)
+check("stock/add: empty lines -> 400", s == 400, f"got {s} {out}")
+s, out = bot.handle_admin_stock_add({"lines": ["a@b.com | p"]}, bearer(TOK_ADMIN), 999999)
+check("stock/add: unknown product -> 404", s == 404, f"got {s} {out}")
+s, out = bot.handle_admin_stock_add({"lines": ["a@b.com | p"]}, {}, _TPID)
+check("stock/add: no token -> 401", s == 401, f"got {s} {out}")
+# Mark one account sold, then remove: sold rows never touched.
+_c = bot.db()
+_sold_id = _c.execute("SELECT id FROM accounts WHERE product_id=? ORDER BY id LIMIT 1", (_TPID,)).fetchone()["id"]
+_c.execute("UPDATE accounts SET status='sold', sold_to=1 WHERE id=?", (_sold_id,))
+_c.commit(); _c.close()
+s, out = bot.handle_admin_stock_remove({"count": 99}, bearer(TOK_ADMIN), _TPID)
+check("stock/remove: more than available -> 400 stock_kam_hai + available",
+      s == 400 and out.get("error") == "stock_kam_hai" and out.get("available") == 2,
+      f"got {s} {out}")
+s, out = bot.handle_admin_stock_remove({"count": 2}, bearer(TOK_ADMIN), _TPID)
+check("stock/remove: removes 2 oldest available only",
+      s == 200 and out.get("removed") == 2, f"got {s} {out}")
+_c = bot.db()
+_left = _c.execute("SELECT id, status FROM accounts WHERE product_id=?", (_TPID,)).fetchall()
+_ev2 = _c.execute("SELECT action, count FROM stock_events WHERE product_id=? ORDER BY id DESC LIMIT 1", (_TPID,)).fetchone()
+_c.close()
+check("stock/remove: sold row survives, available all gone",
+      len(_left) == 1 and _left[0]["id"] == _sold_id and _left[0]["status"] == "sold",
+      f"got {[dict(a) for a in _left]}")
+check("stock/remove: stock_events row logged (remove, count 2)",
+      _ev2["action"] == "remove" and _ev2["count"] == 2, f"got {dict(_ev2)}")
+s, out = bot.handle_admin_stock_remove({"count": 0}, bearer(TOK_ADMIN), _TPID)
+check("stock/remove: count 0 -> 400", s == 400, f"got {s} {out}")
+s, out = bot.handle_admin_stock_remove({"count": 1}, bearer(TOK_ADMIN), 999999)
+check("stock/remove: unknown product -> 404", s == 404, f"got {s} {out}")
+s, out = bot.handle_admin_stock_events(bearer(TOK_ADMIN), {"product_id": [str(_TPID)], "limit": ["50"]})
+check("stock-events: filtered by product, newest first",
+      s == 200 and len(out.get("events", [])) == 2
+      and out["events"][0]["action"] == "remove"
+      and out["events"][0]["product_name"] == "Test Product Alpha", f"got {s} {out}")
+s, out = bot.handle_admin_stock_events(bearer(TOK_ADMIN), {"limit": ["500"]})
+check("stock-events: limit clamps to 200",
+      s == 200 and len(out.get("events", [])) <= 200, f"got {s} {out}")
+s, out = bot.handle_admin_stock_events({}, {})
+check("stock-events: no token -> 401", s == 401, f"got {s} {out}")
+
+# ---------- 13b. Product delete guards ----------
+# _TPID has an order? No — but it HAS a sold account (not available), so
+# delete must succeed only after... wait: sold accounts are not "available
+# stock" and no order references it, so delete is allowed. Use a fresh
+# product for the guards instead.
+s, out = bot.handle_admin_product_create(
+    {"name": "Test Product Beta", "price_pkr": 100, "kind": "account", "category": "TestCat"},
+    bearer(TOK_ADMIN))
+_BPID = out.get("id")
+_c = bot.db()
+_c.execute("INSERT INTO accounts(product_id, login, password, status) VALUES(?, 'b@login.com', 'bp', 'available')", (_BPID,))
+_c.execute("INSERT INTO orders(user_id, username, product_id, payment_method, amount_text, proof, status, created_at, code, items_json, qty, amount_pkr, channel) "
+           "VALUES(1,'u',?,'Easypaisa','Rs 100','', 'pending', ?, 'RS-BETA1', '[]', 1, 100, 'telegram')",
+           (_BPID, bot._now_str()))
+_c.commit(); _c.close()
+s, out = bot.handle_admin_product_delete(bearer(TOK_ADMIN), _BPID)
+check("admin/products: delete refused with orders -> 400 product_has_orders",
+      s == 400 and out.get("error") == "product_has_orders", f"got {s} {out}")
+_c = bot.db()
+_c.execute("DELETE FROM orders WHERE code='RS-BETA1'")
+_c.commit(); _c.close()
+s, out = bot.handle_admin_product_delete(bearer(TOK_ADMIN), _BPID)
+check("admin/products: delete refused with available stock -> 400 product_has_stock",
+      s == 400 and out.get("error") == "product_has_stock", f"got {s} {out}")
+_c = bot.db()
+_c.execute("DELETE FROM accounts WHERE product_id=?", (_BPID,))
+_c.commit(); _c.close()
+s, out = bot.handle_admin_product_delete(bearer(TOK_ADMIN), _BPID)
+check("admin/products: delete clean product -> 200",
+      s == 200 and out.get("deleted") is True, f"got {s} {out}")
+s, out = bot.handle_admin_product_delete(bearer(TOK_ADMIN), _BPID)
+check("admin/products: delete unknown -> 404", s == 404, f"got {s} {out}")
+s, out = bot.handle_admin_product_delete(bearer(TOK_ALI), _TPID)
+check("admin/products: delete normal token -> 403", s == 403, f"got {s} {out}")
+# Cart items_json reference also blocks delete.
+_c = bot.db()
+_c.execute("INSERT INTO orders(user_id, username, product_id, payment_method, amount_text, proof, status, created_at, code, items_json, qty, amount_pkr, channel) "
+           "VALUES(1,'u',1,'Easypaisa','Rs 100','', 'pending', ?, 'RS-CARTREF', ?, 1, 100, 'telegram')",
+           (bot._now_str(), json.dumps([{"pid": _TPID, "qty": 1}])))
+_c.commit(); _c.close()
+s, out = bot.handle_admin_product_delete(bearer(TOK_ADMIN), _TPID)
+check("admin/products: delete refused when cart items_json references it",
+      s == 400 and out.get("error") == "product_has_orders", f"got {s} {out}")
+_c = bot.db()
+_c.execute("DELETE FROM orders WHERE code='RS-CARTREF'")
+_c.commit(); _c.close()
+
+# ---------- 13c. Product create with AHM7 mapping (file backup/restore) ----------
+import os as _os
+_MAP_PATH = _os.path.join(_os.path.dirname(_os.path.abspath(bot.__file__)), "ahm7-mapping.json")
+_MAP_BAK = open(_MAP_PATH, "rb").read() if _os.path.isfile(_MAP_PATH) else None
+_BAK_PATH = _MAP_PATH + ".bak"
+_BAK_BAK = open(_BAK_PATH, "rb").read() if _os.path.isfile(_BAK_PATH) else None
+try:
+    s, out = bot.handle_admin_product_create(
+        {"name": "Test Product Gamma", "price_pkr": 450, "kind": "mail",
+         "category": "TestCat", "ahm7_product_id": "test-ahm7-id-1"}, bearer(TOK_ADMIN))
+    _GPID = out.get("id")
+    check("admin/products: create with ahm7_product_id -> 201",
+          s == 201 and isinstance(_GPID, int), f"got {s} {out}")
+    _m = bot.load_ahm7_mapping()
+    check("admin/products: mapping entry written (cost null, site price set)",
+          _m.get("Test Product Gamma", {}).get("ahm7_product_id") == "test-ahm7-id-1"
+          and _m["Test Product Gamma"].get("cost_pkr") is None
+          and _m["Test Product Gamma"].get("site_price_pkr") == 450,
+          f"got {_m.get('Test Product Gamma')}")
+    s, out = bot.handle_admin_products(bearer(TOK_ADMIN))
+    _g = [p for p in out["products"] if p["id"] == _GPID][0]
+    check("admin/products: mapped product shows ahm7_mapped + null margin",
+          _g["ahm7_mapped"] is True and _g["ahm7_price_pkr"] is None and _g["margin_pkr"] is None,
+          f"got {_g}")
+finally:
+    # Mapping file shared hai (doosri suites 26 products expect karti hain) —
+    # test ke baad bilkul wapas lao.
+    if _MAP_BAK is not None:
+        open(_MAP_PATH, "wb").write(_MAP_BAK)
+    if _BAK_BAK is not None:
+        open(_BAK_PATH, "wb").write(_BAK_BAK)
+    elif _os.path.isfile(_BAK_PATH):
+        _os.remove(_BAK_PATH)
+    bot._AHM7_MAPPING = None
+    _c = bot.db()
+    _c.execute("DELETE FROM products WHERE name='Test Product Gamma'")
+    _c.commit(); _c.close()
+check("admin/products: mapping file restored to 26 products after test",
+      len(bot.load_ahm7_mapping()) == 26, f"got {len(bot.load_ahm7_mapping())}")
+
+# ---------- 14. Public catalogue ----------
+s, out = bot.handle_products_public(fresh_ip())
+check("products: public, no auth, includes inactive + sold",
+      s == 200 and len(out.get("products", [])) >= 42
+      and any(p["name"] == "Test Product Alpha" and p["active"] == 1 for p in out["products"]),
+      f"got {s} len={len(out.get('products', []))}")
+_prl_ip = fresh_ip()
+_prl = [bot.handle_products_public(_prl_ip)[0] for _ in range(61)]
+check("products: rate limit 61st call -> 429",
+      _prl[:60] == [200] * 60 and _prl[60] == 429, f"got {_prl[-3:]}")
+
+# ---------- 15. AHM7 live endpoints (mocked requests.get — live API kabhi nahi) ----------
+class _FakeResp:
+    def __init__(self, status, payload):
+        self.status_code = status
+        self._p = payload
+    def json(self):
+        return self._p
+_orig_get = bot.requests.get
+_orig_key = bot.AHM7_API_KEY
+try:
+    bot.AHM7_API_KEY = ""
+    s, out = bot.handle_admin_ahm7_products(bearer(TOK_ADMIN))
+    check("ahm7/products: key missing -> 503 ahm7_key_missing",
+          s == 503 and out.get("error") == "ahm7_key_missing", f"got {s} {out}")
+    s, out = bot.handle_admin_ahm7_balance(bearer(TOK_ADMIN))
+    check("ahm7/balance: key missing -> 503 ahm7_key_missing",
+          s == 503 and out.get("error") == "ahm7_key_missing", f"got {s} {out}")
+    s, out = bot.handle_admin_ahm7_products()
+    check("ahm7/products: no token -> 401 (key check se pehle auth)",
+          s == 401, f"got {s} {out}")
+    bot.AHM7_API_KEY = "test-key"
+    bot.requests.get = lambda url, headers=None, timeout=None: _FakeResp(401, {"error": "unauthorized"})
+    s, out = bot.handle_admin_ahm7_products(bearer(TOK_ADMIN))
+    check("ahm7/products: AHM7 401 -> 502 ahm7_error",
+          s == 502 and out.get("error") == "ahm7_error", f"got {s} {out}")
+    def _boom(url, headers=None, timeout=None):
+        raise Exception("network down")
+    bot.requests.get = _boom
+    s, out = bot.handle_admin_ahm7_balance(bearer(TOK_ADMIN))
+    check("ahm7/balance: timeout/exception -> 502 ahm7_error",
+          s == 502 and out.get("error") == "ahm7_error", f"got {s} {out}")
+    bot.requests.get = lambda url, headers=None, timeout=None: _FakeResp(200, {
+        "ok": True, "products": [
+            {"id": "6ad26662f22317997032fe0c", "name": "Amazon Prime 6 Month",
+             "prices": {"pkr": 700}, "discountedPrices": {"pkr": 668},
+             "inStock": True, "stock": 5},
+            {"id": "unmapped-1", "name": "Something New",
+             "prices": {"pkr": 100}, "inStock": False}]})
+    s, out = bot.handle_admin_ahm7_products(bearer(TOK_ADMIN))
+    _ap = out.get("products", [])
+    check("ahm7/products: mapped row joins site (price 668, margin = site - 668)",
+          s == 200 and len(_ap) == 2 and _ap[0]["ahm7_id"] == "6ad26662f22317997032fe0c"
+          and _ap[0]["price_pkr"] == 668 and _ap[0]["stock"] == 5
+          and _ap[0]["site_price_pkr"] == 799 and _ap[0]["margin_pkr"] == 131
+          and isinstance(_ap[0]["site_id"], int) and out.get("fetched_at"),
+          f"got {s} {out}")
+    check("ahm7/products: unmapped row -> site_id/margin null",
+          _ap[1]["site_id"] is None and _ap[1]["margin_pkr"] is None
+          and _ap[1]["price_pkr"] == 100, f"got {_ap[1]}")
+    bot.requests.get = lambda url, headers=None, timeout=None: _FakeResp(200, {
+        "balances": {"crypto": 10.5, "pkr": 2000, "inr": 0}})
+    s, out = bot.handle_admin_ahm7_balance(bearer(TOK_ADMIN))
+    check("ahm7/balance: balances object pass-through",
+          s == 200 and out.get("balances") == {"crypto": 10.5, "pkr": 2000, "inr": 0},
+          f"got {s} {out}")
+finally:
+    bot.requests.get = _orig_get
+    bot.AHM7_API_KEY = _orig_key
+
+# ---------- 16. HTTP dispatch for the new routes ----------
+try:
+    r = rq.get("http://127.0.0.1:18099/api/products", timeout=5)
+    check("HTTP: GET /api/products -> 200 public",
+          r.status_code == 200 and r.json().get("ok") is True
+          and len(r.json().get("products", [])) >= 42, f"got {r.status_code} {r.text[:120]}")
+    r = rq.post("http://127.0.0.1:18099/api/coupon/validate",
+                json={"code": "SAVE20", "amount_pkr": 1000}, timeout=5)
+    check("HTTP: POST /api/coupon/validate -> 200 with discount",
+          r.status_code == 200 and r.json().get("discount") == 200,
+          f"got {r.status_code} {r.text[:120]}")
+    r = rq.get("http://127.0.0.1:18099/api/admin/coupons", timeout=5)
+    check("HTTP: GET /api/admin/coupons no token -> 401", r.status_code == 401, f"got {r.status_code}")
+    r = rq.get("http://127.0.0.1:18099/api/admin/coupons",
+               headers={"Authorization": f"Bearer {TOK_ADMIN}"}, timeout=5)
+    check("HTTP: GET /api/admin/coupons admin -> 200",
+          r.status_code == 200 and isinstance(r.json().get("coupons"), list),
+          f"got {r.status_code} {r.text[:120]}")
+    r = rq.post("http://127.0.0.1:18099/api/admin/coupons",
+                json={"code": "HTTP10", "pct_off": 10},
+                headers={"Authorization": f"Bearer {TOK_ADMIN}"}, timeout=5)
+    check("HTTP: POST /api/admin/coupons admin -> 201",
+          r.status_code == 201 and r.json().get("coupon", {}).get("code") == "HTTP10",
+          f"got {r.status_code} {r.text[:120]}")
+    r = rq.post("http://127.0.0.1:18099/api/admin/coupons",
+                json={"code": "HTTP11", "pct_off": 10}, timeout=5)
+    check("HTTP: POST /api/admin/coupons no token -> 401", r.status_code == 401, f"got {r.status_code}")
+    r = rq.post("http://127.0.0.1:18099/api/admin/coupons/HTTP10/toggle",
+                json={}, headers={"Authorization": f"Bearer {TOK_ADMIN}"}, timeout=5)
+    check("HTTP: POST /api/admin/coupons/:code/toggle admin -> 200",
+          r.status_code == 200 and r.json().get("active") == 0,
+          f"got {r.status_code} {r.text[:120]}")
+    r = rq.delete("http://127.0.0.1:18099/api/admin/coupons/HTTP10",
+                  json={}, headers={"Authorization": f"Bearer {TOK_ADMIN}"}, timeout=5)
+    check("HTTP: DELETE /api/admin/coupons/:code admin -> 200",
+          r.status_code == 200 and r.json().get("deleted") is True,
+          f"got {r.status_code} {r.text[:120]}")
+    r = rq.delete("http://127.0.0.1:18099/api/admin/coupons/HTTP10",
+                  json={}, headers={"Authorization": f"Bearer {TOK_ADMIN}"}, timeout=5)
+    check("HTTP: DELETE unknown coupon -> 404", r.status_code == 404, f"got {r.status_code}")
+    r = rq.get("http://127.0.0.1:18099/api/admin/ahm7/products",
+               headers={"Authorization": f"Bearer {TOK_ADMIN}"}, timeout=5)
+    check("HTTP: GET /api/admin/ahm7/products (no key in env) -> 503",
+          r.status_code == 503 and r.json().get("error") == "ahm7_key_missing",
+          f"got {r.status_code} {r.text[:120]}")
+    r = rq.post("http://127.0.0.1:18099/api/admin/products",
+                json={"name": "HTTP Product", "price_pkr": 123, "kind": "account", "category": "T"},
+                headers={"Authorization": f"Bearer {TOK_ALI}"}, timeout=5)
+    check("HTTP: POST /api/admin/products normal token -> 403", r.status_code == 403, f"got {r.status_code}")
+except Exception as e:
+    check("HTTP new-routes layer reachable", False, str(e))
+
 print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
 if FAIL:
     print("FAILED:", FAIL)

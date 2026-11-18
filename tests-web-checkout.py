@@ -422,8 +422,11 @@ check("review: unknown product -> 404", s == 404, f"got {s} {out}")
 s, out = bot.handle_get_reviews(gem_pid)
 # sold for Gemini here: delivered gem order (1) + delivered cart (1) +
 # ahm7_pending cart2 (1) + ahm7_pending IPN order (1) = 4 real orders.
+rev_id = (out.get("reviews") or [{}])[0].get("id")
 check("reviews GET: 1 review, sold counts real orders",
       s == 200 and len(out.get("reviews", [])) == 1 and out.get("sold") == 4, f"got {s} {out}")
+check("reviews GET: review carries its id (admin delete needs it)",
+      isinstance(rev_id, int), f"got {out}")
 s, out = bot.handle_get_reviews(99999)
 check("reviews GET: unknown product -> 404", s == 404, f"got {s} {out}")
 # rate limit: 5/hour per IP
@@ -539,6 +542,20 @@ check("stock: all 26 mapped products present",
 check("stock: keys are strings, values are ints",
       all(isinstance(k, str) and isinstance(v, int) for k, v in _st.items()),
       f"got {list(_st.items())[:3]}")
+# source: "ahm7" jahan mapping me truthy ahm7_product_id hai (web
+# checkout wala hi predicate), "local" jahan koi AHM7 mapping nahi.
+_src = out.get("source", {})
+check("stock: source present for all products",
+      all(str(pid_by_name(n)) in _src for n in m),
+      f"missing={[n for n in m if str(pid_by_name(n)) not in _src]}")
+check("stock: AHM7-mapped product source is 'ahm7' (Amazon)",
+      _src.get(str(ama_pid)) == "ahm7", f"got {_src.get(str(ama_pid))}")
+_unmapped_name = next(n for n, v in m.items() if not v.get("ahm7_product_id"))
+_unmapped_pid = pid_by_name(_unmapped_name)
+check("stock: unmapped product source is 'local' (%s)" % _unmapped_name,
+      _src.get(str(_unmapped_pid)) == "local", f"got {_src.get(str(_unmapped_pid))}")
+check("stock: source values only 'ahm7'/'local'",
+      set(_src.values()) <= {"ahm7", "local"}, f"got {set(_src.values())}")
 # rate limit: 30/min per IP
 _rl = [bot.handle_stock("7.7.7.2")[0] for _ in range(31)]
 check("stock: rate limit 31st call -> 429", _rl[:30] == [200] * 30 and _rl[30] == 429,
@@ -624,6 +641,9 @@ try:
           and r.json()["stock"].get(str(gem_pid)) == 3
           and r.json()["stock"].get(str(muse_pid)) == 0,
           f"got {r.status_code} {r.text[:160]}")
+    check("HTTP: GET /api/stock -> source map present (ahm7/local)",
+          r.status_code == 200 and r.json().get("source", {}).get(str(ama_pid)) == "ahm7",
+          f"got {r.status_code} {r.text[:160]}")
     r = rq.get("http://127.0.0.1:18099/api/stock/extra", timeout=5)
     check("HTTP: GET /api/stock/extra -> 404 (malformed)", r.status_code == 404,
           f"got {r.status_code}")
@@ -636,6 +656,97 @@ try:
           r.status_code == 401, f"got {r.status_code} {r.text[:120]}")
 except Exception as e:
     check("HTTP layer reachable", False, str(e))
+
+# ---------- 15. Global promo at web checkout + IPN use recording ----------
+# Promo rows seedhe DB me (admin handler ka test tests-admin.py me hai).
+_c = bot.db()
+_c.execute("INSERT INTO promo_codes(code,pct_off,max_uses,used_count,expires_at,min_order_pkr,first_order_only,active,created_at) "
+           "VALUES('WEB10',10,NULL,0,NULL,0,0,1,'2026-11-17 10:00')")
+_c.execute("INSERT INTO promo_codes(code,pct_off,max_uses,used_count,expires_at,min_order_pkr,first_order_only,active,created_at) "
+           "VALUES('WEBOLD',10,NULL,0,'2020-01-01 00:00',0,0,1,'2026-11-17 10:00')")
+_c.execute("INSERT INTO promo_codes(code,pct_off,max_uses,used_count,expires_at,min_order_pkr,first_order_only,active,created_at) "
+           "VALUES('WEBFIRST',15,NULL,0,NULL,0,1,1,'2026-11-17 10:00')")
+_c.commit(); _c.close()
+# Initiate mock jo total bhi capture kare (discounted total check).
+_cap = {}
+def _initiate_cap(code, total, details, name="", email="", success_url=None, cancel_url=None):
+    _cap["code"] = code
+    _cap["total"] = total
+    return "https://checkout.test/pay/xyz", None
+bot.zurvapay_initiate = _initiate_cap
+# Gemini 479, WEB10 10% -> discount 48, charged 431.
+s, out = bot.handle_web_checkout({"product_id": gem_pid, "coupon": " web10 "}, H)
+check("checkout+coupon: 200, discounted total charged (479 - 48 = 431)",
+      s == 200 and _cap.get("total") == 431, f"got {s} {out} cap={_cap}")
+_c = bot.db()
+_o = _c.execute("SELECT amount_pkr, discount_pkr, coupon_code FROM orders WHERE code=?",
+                (out.get("order_code"),)).fetchone()
+_c.close()
+check("checkout+coupon: order stores coupon + discount + discounted amount",
+      _o and _o["amount_pkr"] == 431 and _o["discount_pkr"] == 48 and _o["coupon_code"] == "WEB10",
+      f"got {dict(_o) if _o else None}")
+check("checkout+coupon: validate-only — used_count still 0 before payment",
+      bot.db().execute("SELECT used_count FROM promo_codes WHERE code='WEB10'").fetchone()["used_count"] == 0)
+_coupon_code = out.get("order_code", "")
+s, out = bot.handle_web_checkout({"product_id": gem_pid, "coupon": "NOPE99"}, H)
+check("checkout+coupon: unknown code -> 400 coupon_not_found",
+      s == 400 and out.get("error") == "coupon_not_found", f"got {s} {out}")
+s, out = bot.handle_web_checkout({"product_id": gem_pid, "coupon": "WEBOLD"}, H)
+check("checkout+coupon: expired code -> 400 coupon_expired",
+      s == 400 and out.get("error") == "coupon_expired", f"got {s} {out}")
+s, out = bot.handle_web_checkout({"product_id": gem_pid, "coupon": "WEBFIRST"}, H)
+check("checkout+coupon: first-only code on web -> 400 coupon_first_only (by design, web has no identity)",
+      s == 400 and out.get("error") == "coupon_first_only", f"got {s} {out}")
+# Cart + coupon: Bolt x2 = 2006, 10% = 201 (round), charged 1805.
+s, out = bot.handle_web_checkout({"items": [{"product_id": _bolt_pid, "qty": 2}], "coupon": "WEB10"}, H)
+check("checkout+coupon: cart total discounted (2006 - 201 = 1805)",
+      s == 200 and _cap.get("total") == 1805, f"got {s} {out} cap={_cap}")
+# IPN paid transition records the use (web order — deliver_order kabhi nahi chalta).
+bot.ahm7_place_order = _place_402
+bot.verify_zurvapay_ipn = lambda data, raw_body=b"", headers=None: (True, "test")
+_f = {"identifier": _coupon_code, "amount": "431", "status": "success",
+      "signature": "x", "signatures": ["x"], "txid": "TESTTX-COUPON"}
+ok, msg = bot._zurva_handle_order_ipn(_coupon_code, _f)
+_c = bot.db()
+_uses = _c.execute("SELECT COUNT(*) n FROM promo_uses WHERE code='WEB10' AND order_code=?", (_coupon_code,)).fetchone()["n"]
+_cnt = _c.execute("SELECT used_count FROM promo_codes WHERE code='WEB10'").fetchone()["used_count"]
+_c.close()
+check("IPN+coupon: paid transition records 1 promo use",
+      ok is True and _uses == 1 and _cnt == 1, f"ok={ok} msg={msg} uses={_uses} count={_cnt}")
+ok2, msg2 = bot._zurva_handle_order_ipn(_coupon_code, _f)
+_c = bot.db()
+_cnt2 = _c.execute("SELECT used_count FROM promo_codes WHERE code='WEB10'").fetchone()["used_count"]
+_c.close()
+check("IPN+coupon: duplicate IPN does not double-count the use",
+      ok2 is True and _cnt2 == 1, f"ok={ok2} msg={msg2} count={_cnt2}")
+bot.verify_zurvapay_ipn = real_verify
+bot.zurvapay_initiate = real_initiate
+bot.ahm7_place_order = real_place
+
+# ---------- 16. HTTP: new public routes ----------
+try:
+    r = rq.get("http://127.0.0.1:18099/api/products", timeout=5)
+    check("HTTP: GET /api/products -> 200 public catalogue",
+          r.status_code == 200 and r.json().get("ok") is True
+          and len(r.json().get("products", [])) >= 26
+          and all("sold" in p for p in r.json()["products"]),
+          f"got {r.status_code} {r.text[:160]}")
+    r = rq.post("http://127.0.0.1:18099/api/coupon/validate",
+                json={"code": "WEB10", "amount_pkr": 1000}, timeout=5)
+    check("HTTP: POST /api/coupon/validate -> 200 discount 100",
+          r.status_code == 200 and r.json().get("discount") == 100,
+          f"got {r.status_code} {r.text[:160]}")
+    r = rq.post("http://127.0.0.1:18099/api/coupon/validate",
+                json={"code": "NOPE99", "amount_pkr": 1000}, timeout=5)
+    check("HTTP: POST /api/coupon/validate unknown -> 400 coupon_not_found",
+          r.status_code == 400 and r.json().get("error") == "coupon_not_found",
+          f"got {r.status_code} {r.text[:160]}")
+    r = rq.get("http://127.0.0.1:18099/api/admin/coupons", timeout=5)
+    check("HTTP: GET /api/admin/coupons no token -> 401", r.status_code == 401, f"got {r.status_code}")
+    r = rq.post("http://127.0.0.1:18099/api/products/extra", json={}, timeout=5)
+    check("HTTP: POST /api/products/extra -> 404", r.status_code == 404, f"got {r.status_code}")
+except Exception as e:
+    check("HTTP new-routes layer reachable", False, str(e))
 
 print(f"\n==== {len(PASS)} passed, {len(FAIL)} failed ====")
 if FAIL:

@@ -171,7 +171,9 @@ def _add_col(c, table, col, ddl):
 def _sync_products_from_csv(c):
     """products.csv (bot.py ke saath wali directory) se products upsert karo:
     naam se match karke price_pkr/price_usdt/description UPDATE, naye INSERT.
-    Stock aur active flags ko haath nahi lagata. CSV na mile to skip."""
+    Stock aur active flags ko haath nahi lagata. CSV na mile to skip.
+    Admin-edited rows (admin_edited=1 — admin ne price/description badli)
+    ko sync overwrite NAHI karta: unki price admin ki marzi se rehti hai."""
     csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "products.csv")
     if not os.path.isfile(csv_path):
         return
@@ -187,8 +189,12 @@ def _sync_products_from_csv(c):
             except ValueError:
                 continue
             desc = (row.get("description") or "").strip()
-            cur = c.execute("SELECT id, price_pkr, price_usdt, description FROM products WHERE name=?", (name,)).fetchone()
+            cur = c.execute("SELECT id, price_pkr, price_usdt, description, admin_edited FROM products WHERE name=?", (name,)).fetchone()
             if cur:
+                if cur["admin_edited"]:
+                    # Admin ne price/description badli hai — CSV sync is row
+                    # ko chhoo nahi sakta (price lock, 18 Nov 2026).
+                    continue
                 if cur["price_pkr"] != pkr or cur["price_usdt"] != usdt or (cur["description"] or "") != desc:
                     c.execute("UPDATE products SET description=?, price_pkr=?, price_usdt=? WHERE id=?",
                               (desc, pkr, usdt, cur["id"]))
@@ -214,7 +220,8 @@ def init_db():
         category TEXT DEFAULT '',
         bulk TEXT DEFAULT '',
         terms TEXT DEFAULT '',
-        unlimited INTEGER DEFAULT 0
+        unlimited INTEGER DEFAULT 0,
+        admin_edited INTEGER DEFAULT 0
     );
     CREATE TABLE IF NOT EXISTS accounts(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -374,6 +381,33 @@ def init_db():
         ts INTEGER,
         status TEXT DEFAULT 'open'
     );
+    CREATE TABLE IF NOT EXISTS promo_codes(
+        code TEXT PRIMARY KEY,
+        pct_off INTEGER NOT NULL,
+        max_uses INTEGER,
+        used_count INTEGER NOT NULL DEFAULT 0,
+        expires_at TEXT,
+        min_order_pkr INTEGER NOT NULL DEFAULT 0,
+        first_order_only INTEGER NOT NULL DEFAULT 0,
+        active INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS promo_uses(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        code TEXT NOT NULL,
+        order_code TEXT NOT NULL,
+        buyer_name TEXT DEFAULT '',
+        buyer_email TEXT DEFAULT '',
+        used_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS stock_events(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_id INTEGER NOT NULL,
+        action TEXT NOT NULL,
+        count INTEGER NOT NULL,
+        by_admin TEXT DEFAULT '',
+        at TEXT NOT NULL
+    );
     """)
     defaults = {
         "jazzcash_number": os.getenv("JAZZCASH_NUMBER", "03XX-XXXXXXX"),
@@ -391,7 +425,8 @@ def init_db():
     # Migrations for DBs created before these columns existed.
     for col, ddl in (("kind", "TEXT DEFAULT 'account'"), ("category", "TEXT DEFAULT ''"),
                      ("bulk", "TEXT DEFAULT ''"), ("terms", "TEXT DEFAULT ''"),
-                     ("unlimited", "INTEGER DEFAULT 0")):
+                     ("unlimited", "INTEGER DEFAULT 0"),
+                     ("admin_edited", "INTEGER DEFAULT 0")):
         _add_col(c, "products", col, ddl)
     _add_col(c, "accounts", "extra", "TEXT DEFAULT ''")
     for col, ddl in (("code", "TEXT DEFAULT ''"), ("items_json", "TEXT DEFAULT ''"),
@@ -453,7 +488,8 @@ def init_db():
             c.execute("UPDATE products SET terms=? WHERE id=?", (terms, row["id"]))
     # products.csv se auto-sync (16 Nov 2026): har restart pe CSV ki prices
     # aur naye products DB me aa jate hain — stock/active flags ko haath
-    # nahi lagata. CSV na mile to khamoshi se skip (crash nahi hota).
+    # nahi lagata. Admin-edited rows (admin_edited=1) ko overwrite nahi
+    # karta (price lock, 18 Nov 2026). CSV na mile to khamoshi se skip.
     try:
         _sync_products_from_csv(c)
     except Exception:
@@ -672,6 +708,19 @@ def start_health_server():
                             self.headers, p[len("/api/admin/order/"):].strip("/"))
                     elif p == "/api/admin/users":
                         status, out = handle_admin_users(self.headers, qs)
+                    elif p == "/api/admin/coupons":
+                        status, out = handle_admin_coupons(self.headers)
+                    elif p.startswith("/api/admin/coupons/") and p.endswith("/uses"):
+                        status, out = handle_admin_coupon_uses(
+                            self.headers, p[len("/api/admin/coupons/"):-len("/uses")].strip("/"))
+                    elif p == "/api/admin/products":
+                        status, out = handle_admin_products(self.headers)
+                    elif p == "/api/admin/stock-events":
+                        status, out = handle_admin_stock_events(self.headers, qs)
+                    elif p == "/api/admin/ahm7/products":
+                        status, out = handle_admin_ahm7_products(self.headers)
+                    elif p == "/api/admin/ahm7/balance":
+                        status, out = handle_admin_ahm7_balance(self.headers)
                     else:
                         status, out = 404, {"ok": False, "error": "not found"}
                 except Exception as e:
@@ -702,6 +751,31 @@ def start_health_server():
                         status, out = handle_stock(ip)
                 except Exception as e:
                     log.exception("Stock handler crashed")
+                    status, out = 500, {"ok": False, "error": f"handler error: {e}"}
+                body = json.dumps(out, ensure_ascii=False).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if self.path.startswith("/api/products"):
+                # Public catalogue (site product list) — no auth, rate-limited.
+                # X-Forwarded-For sirf X-Web-Secret (Worker) wali requests pe
+                # mana jata hai (stock wali pattern).
+                try:
+                    parsed = urlparse(self.path)
+                    if parsed.path.rstrip("/") != "/api/products":
+                        status, out = 404, {"ok": False, "error": "not found"}
+                    else:
+                        ip = ""
+                        if _web_auth(self.headers):
+                            ip = (self.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+                        if not ip:
+                            ip = self.client_address[0] if self.client_address else ""
+                        status, out = handle_products_public(ip)
+                except Exception as e:
+                    log.exception("Products handler crashed")
                     status, out = 500, {"ok": False, "error": f"handler error: {e}"}
                 body = json.dumps(out, ensure_ascii=False).encode("utf-8")
                 self.send_response(status)
@@ -771,7 +845,7 @@ def start_health_server():
                 self.end_headers()
                 self.wfile.write(msg.encode("utf-8", "ignore"))
                 return
-            if self.path.startswith("/api/web-checkout") or self.path.startswith("/api/ahm7-retry") or self.path.startswith("/api/review") or self.path.startswith("/api/auth/signup") or self.path.startswith("/api/auth/login") or self.path.startswith("/api/auth/logout") or self.path.startswith("/api/auth/delete") or self.path.startswith("/api/auth/verify-email/send") or self.path.startswith("/api/auth/verify-email/confirm") or self.path.startswith("/api/admin/otp/send") or self.path.startswith("/api/admin/otp/verify") or self.path.startswith("/api/track/visit") or self.path.startswith("/api/admin/issues/"):
+            if self.path.startswith("/api/web-checkout") or self.path.startswith("/api/ahm7-retry") or self.path.startswith("/api/review") or self.path.startswith("/api/auth/signup") or self.path.startswith("/api/auth/login") or self.path.startswith("/api/auth/logout") or self.path.startswith("/api/auth/delete") or self.path.startswith("/api/auth/verify-email/send") or self.path.startswith("/api/auth/verify-email/confirm") or self.path.startswith("/api/admin/otp/send") or self.path.startswith("/api/admin/otp/verify") or self.path.startswith("/api/track/visit") or self.path.startswith("/api/admin/issues/") or self.path.startswith("/api/coupon/validate") or self.path.startswith("/api/admin/coupons") or self.path.startswith("/api/admin/products"):
                 # Site checkout / review (Cloudflare Worker se) — JSON in, JSON out.
                 try:
                     length = int(self.headers.get("Content-Length") or 0)
@@ -820,6 +894,42 @@ def start_health_server():
                     elif self.path.startswith("/api/track/visit"):
                         ip = self.client_address[0] if self.client_address else ""
                         status, out = handle_track_visit(data, self.headers, ip)
+                    elif self.path.startswith("/api/coupon/validate"):
+                        # Public coupon check — Worker X-Forwarded-For sirf
+                        # X-Web-Secret wali requests pe mana jata hai.
+                        ip = (self.headers.get("X-Forwarded-For") or "").split(",")[0].strip() if _web_auth(self.headers) else ""
+                        if not ip:
+                            ip = self.client_address[0] if self.client_address else ""
+                        status, out = handle_coupon_validate(data, ip)
+                    elif self.path.startswith("/api/admin/coupons"):
+                        # POST /api/admin/coupons (create)
+                        # POST /api/admin/coupons/:code/toggle
+                        _pp = urlparse(self.path).path.strip("/").split("/")
+                        if len(_pp) == 3:
+                            status, out = handle_admin_coupon_create(data, self.headers)
+                        elif len(_pp) == 5 and _pp[4] == "toggle":
+                            status, out = handle_admin_coupon_toggle(self.headers, _pp[3])
+                        else:
+                            status, out = 404, {"ok": False, "error": "not found"}
+                    elif self.path.startswith("/api/admin/products"):
+                        # POST /api/admin/products (create)
+                        # POST /api/admin/products/:id/price|toggle|details
+                        # POST /api/admin/products/:id/stock/add|remove
+                        _pp = urlparse(self.path).path.strip("/").split("/")
+                        if len(_pp) == 3:
+                            status, out = handle_admin_product_create(data, self.headers)
+                        elif len(_pp) == 5 and _pp[4] == "price":
+                            status, out = handle_admin_product_price(data, self.headers, _pp[3])
+                        elif len(_pp) == 5 and _pp[4] == "toggle":
+                            status, out = handle_admin_product_toggle(self.headers, _pp[3])
+                        elif len(_pp) == 5 and _pp[4] == "details":
+                            status, out = handle_admin_product_details(data, self.headers, _pp[3])
+                        elif len(_pp) == 6 and _pp[4] == "stock" and _pp[5] == "add":
+                            status, out = handle_admin_stock_add(data, self.headers, _pp[3])
+                        elif len(_pp) == 6 and _pp[4] == "stock" and _pp[5] == "remove":
+                            status, out = handle_admin_stock_remove(data, self.headers, _pp[3])
+                        else:
+                            status, out = 404, {"ok": False, "error": "not found"}
                     elif self.path.startswith("/api/admin/issues/"):
                         # POST /api/admin/issues/:id/resolve
                         _pp = urlparse(self.path).path.strip("/").split("/")
@@ -827,6 +937,43 @@ def start_health_server():
                         status, out = handle_admin_issue_resolve(self.headers, _iid)
                     else:
                         status, out = handle_ahm7_retry(data, self.headers)
+                except Exception as e:
+                    log.exception("Web API handler crashed")
+                    status, out = 500, {"ok": False, "error": f"handler error: {e}"}
+                body = json.dumps(out, ensure_ascii=False).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            self.send_response(404)
+            self.end_headers()
+        def do_DELETE(self):
+            # Admin deletes (Worker se, Bearer admin token):
+            # DELETE /api/admin/coupons/:code (body me {force:true} ho sakta hai)
+            # DELETE /api/admin/products/:id
+            _p = urlparse(self.path).path
+            if _p.startswith("/api/admin/coupons/") or _p.startswith("/api/admin/products/"):
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                except ValueError:
+                    length = 0
+                raw = self.rfile.read(length) if length > 0 else b""
+                try:
+                    data = json.loads(raw.decode("utf-8") or "{}")
+                    if not isinstance(data, dict):
+                        data = {}
+                except Exception:
+                    data = {}
+                try:
+                    _pp = _p.strip("/").split("/")
+                    if _p.startswith("/api/admin/coupons/") and len(_pp) == 4:
+                        status, out = handle_admin_coupon_delete(data, self.headers, _pp[3])
+                    elif _p.startswith("/api/admin/products/") and len(_pp) == 4:
+                        status, out = handle_admin_product_delete(self.headers, _pp[3])
+                    else:
+                        status, out = 404, {"ok": False, "error": "not found"}
                 except Exception as e:
                     log.exception("Web API handler crashed")
                     status, out = 500, {"ok": False, "error": f"handler error: {e}"}
@@ -1390,6 +1537,211 @@ def coupon_valid(uid, code):
         return False, t(uid, "coupon_first_only")
     return True, "OK"
 
+# ---------- Global promo codes (admin dashboard) ----------
+# Per-user FIRST-ORDER coupon (coupons table) se alag: ye codes admin
+# banata hai, koi bhi buyer use kar sakta hai (web + Telegram dono).
+# Use KABHI apply-time consume nahi hota — sirf paid/delivered transition
+# pe record hota hai (_record_promo_use_conn), taake failed payment pe
+# coupon zaya na ho.
+
+_PROMO_CODE_RE = re.compile(r"^[A-Z0-9-]{3,20}$")
+_PROMO_ERR_TEXT = {
+    "coupon_inactive": "Ye coupon ab band hai.",
+    "coupon_expired": "Is coupon ki expiry ho gayi hai.",
+    "coupon_exhausted": "Is coupon ki limit khatam ho gayi hai.",
+    "coupon_min_order": "Is coupon ke liye order amount kam hai (minimum order poora karein).",
+    "coupon_first_only": "Ye coupon sirf pehli order ke liye hai.",
+}
+
+def _as_int(v):
+    """JSON number -> int (bool kabhi int nahi). Float sirf integral ho to.
+    Warna None."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, int):
+        return v
+    if isinstance(v, float) and v.is_integer():
+        return int(v)
+    return None
+
+def _normalize_expires_at(raw):
+    """'YYYY-MM-DD' ya 'YYYY-MM-DD HH:MM' validate + normalize karo
+    ('YYYY-MM-DD HH:MM'; date-only -> us din 23:59). Invalid -> None."""
+    s = str(raw or "").strip()
+    try:
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", s):
+            d = datetime.strptime(s, "%Y-%m-%d")
+            return d.strftime("%Y-%m-%d") + " 23:59"
+        if re.match(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$", s):
+            d = datetime.strptime(s, "%Y-%m-%d %H:%M")
+            return d.strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return None
+    return None
+
+def validate_promo(code, amount_pkr, is_first_order):
+    """Global promo code validate karo.
+    Returns (ok, pct_or_None, discount, error_code_or_None).
+    Checks isi order me: exists -> active -> not expired (expires_at NULL
+    = kabhi expire nahi; 'YYYY-MM-DD HH:MM' text compare) -> uses baaki
+    hain (max_uses NULL = unlimited) -> amount >= min_order_pkr ->
+    first_order_only ko is_first_order chahiye.
+    Discount = round(amount * pct / 100), amount se zyada nahi.
+    Error codes: coupon_not_found / coupon_inactive / coupon_expired /
+    coupon_exhausted / coupon_min_order / coupon_first_only.
+    Ye sirf validate karta hai — use record nahi karta."""
+    code = (code or "").strip().upper()
+    amount = _as_int(amount_pkr)
+    if amount is None or amount < 0:
+        return False, None, 0, "coupon_invalid"
+    c = db()
+    r = c.execute("SELECT * FROM promo_codes WHERE code=?", (code,)).fetchone()
+    c.close()
+    if not r:
+        return False, None, 0, "coupon_not_found"
+    if not r["active"]:
+        return False, None, 0, "coupon_inactive"
+    exp = (r["expires_at"] or "").strip()
+    if exp and exp < datetime.now().strftime("%Y-%m-%d %H:%M"):
+        return False, None, 0, "coupon_expired"
+    if r["max_uses"] is not None and (r["used_count"] or 0) >= r["max_uses"]:
+        return False, None, 0, "coupon_exhausted"
+    if amount < (r["min_order_pkr"] or 0):
+        return False, None, 0, "coupon_min_order"
+    if r["first_order_only"] and not is_first_order:
+        return False, None, 0, "coupon_first_only"
+    pct = int(r["pct_off"])
+    discount = min(round(amount * pct / 100), amount)
+    return True, pct, discount, None
+
+def _record_promo_use_conn(c, code, order_code, buyer_name="", buyer_email=""):
+    """Caller ki connection/transaction me promo use record karo (caller
+    commit karta hai). Idempotency guard: is order_code ke liye pehle se
+    row ho to dobara kuch nahi hota (used_count bhi nahi badhta) — IPN
+    retry + deliver_order dono jagah se call hone par bhi ek hi use.
+    Per-user FIRST-ORDER code (promo_codes me nahi) yahan skip hota hai.
+    Returns True jab naya use record hua."""
+    code = (code or "").strip().upper()
+    if not code or not order_code:
+        return False
+    try:
+        r = c.execute("SELECT code FROM promo_codes WHERE code=?", (code,)).fetchone()
+        if not r:
+            return False
+        ex = c.execute("SELECT id FROM promo_uses WHERE code=? AND order_code=?",
+                       (code, order_code)).fetchone()
+        if ex:
+            return False
+        c.execute("INSERT INTO promo_uses(code, order_code, buyer_name, buyer_email, used_at) "
+                  "VALUES(?,?,?,?,?)",
+                  (code, order_code, buyer_name or "", buyer_email or "",
+                   datetime.now().strftime("%Y-%m-%d %H:%M")))
+        c.execute("UPDATE promo_codes SET used_count = used_count + 1 WHERE code=?", (code,))
+        return True
+    except Exception:
+        log.exception("promo use record fail (%s / %s)", code, order_code)
+        return False
+
+def _promo_dict(r):
+    return {"code": r["code"], "pct_off": r["pct_off"], "max_uses": r["max_uses"],
+            "used_count": r["used_count"], "expires_at": r["expires_at"],
+            "min_order_pkr": r["min_order_pkr"], "first_order_only": r["first_order_only"],
+            "active": r["active"], "created_at": r["created_at"]}
+
+def _price_usdt(pkr):
+    """Seed/sync wala derivation: 1 USDT = 280 PKR (USDT_RATE), 2 decimals.
+    Seed check: 799 -> 2.85, 171 -> 0.61."""
+    try:
+        return round(int(pkr) / USDT_RATE, 2)
+    except Exception:
+        return 0.0
+
+def _parse_stock_line(line):
+    """TG /addstock (stock_lines) wali parsing, bilkul waisi hi.
+    Returns (login, password, extra) ya None jab line malformed ho
+    (login ya password khaali). Blank lines caller skip karta hai.
+    '|' wali: 3+ parts -> code | email | mailbox_url (extra=code);
+    2 parts -> login | password. ',' wali: login,password. Warna
+    whitespace split (pehle 2 parts)."""
+    line = (line or "").strip()
+    if not line:
+        return None
+    extra = ""
+    if "|" in line:
+        parts = [x.strip() for x in line.split("|")]
+        if len(parts) >= 3:
+            extra, login, pwd = parts[0], parts[1], "|".join(parts[2:])
+        else:
+            login, pwd = parts[0], parts[1] if len(parts) > 1 else ""
+    elif "," in line:
+        login, pwd = [x.strip() for x in line.split(",", 1)]
+    else:
+        parts = line.split()
+        if len(parts) < 2:
+            return None
+        login, pwd = parts[0], parts[1]
+    if login and pwd:
+        return login, pwd, extra
+    return None
+
+def _ahm7_mapping_path():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "ahm7-mapping.json")
+
+def _save_ahm7_mapping(mapping):
+    """ahm7-mapping.json atomic likho (temp file + rename) + .bak copy.
+    File ki baaki top-level keys (generated/currency/source/note) mehfooz
+    rehti hain — sirf "products" badalta hai. In-memory cache bhi update
+    karo. Returns True/False."""
+    global _AHM7_MAPPING
+    path = _ahm7_mapping_path()
+    try:
+        try:
+            if os.path.isfile(path):
+                import shutil
+                shutil.copyfile(path, path + ".bak")
+        except Exception:
+            pass
+        try:
+            with open(path, encoding="utf-8") as f:
+                full = json.load(f)
+            if not isinstance(full, dict):
+                full = {}
+        except Exception:
+            full = {}
+        full["products"] = mapping
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(full, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+        _AHM7_MAPPING = dict(mapping)
+        return True
+    except Exception as e:
+        log.exception("ahm7-mapping.json save fail: %s", e)
+        return False
+
+def _ahm7_get(path):
+    """AHM7 OLD host GET — X-Api-Key, timeout 30s (ahm7.py wala shape).
+    Returns (status, payload_dict_or_None, error_str_or_None).
+    Key missing ho to (None, None, 'ahm7_key_missing')."""
+    if not AHM7_API_KEY:
+        return None, None, "ahm7_key_missing"
+    try:
+        r = requests.get(f"{AHM7_BASE_URL}{path}",
+                         headers={"X-Api-Key": AHM7_API_KEY}, timeout=30)
+    except Exception as e:
+        return None, None, f"AHM7 se rabta nahi ho saka: {e}"[:200]
+    try:
+        d = r.json()
+    except Exception:
+        return r.status_code, None, f"AHM7 ka jawab samajh nahi aaya (HTTP {r.status_code})"[:200]
+    if r.status_code != 200 or not isinstance(d, dict):
+        msg = ""
+        if isinstance(d, dict):
+            msg = str(d.get("message") or d.get("error") or "")
+        return r.status_code, None, (f"AHM7 error HTTP {r.status_code}: {msg}"[:200]
+                                     or f"AHM7 error HTTP {r.status_code}")
+    return r.status_code, d, None
+
 # ---------- Orders ----------
 
 def gen_order_code():
@@ -1513,9 +1865,21 @@ def buy_totals(context, uid):
     discount = 0
     code = context.user_data.get("buy_coupon_code")
     if code:
-        ok, _ = coupon_valid(uid, code)
+        code = str(code).strip().upper()
+        # Global promo pehle: us ka pct lagta hai (FIRST-ORDER ka 7% nahi).
+        # Code global table me na ho (coupon_not_found) to FIRST-ORDER
+        # fallback — purana behaviour bilkul waisa hi.
+        c = db()
+        done = c.execute("SELECT COUNT(*) n FROM orders WHERE user_id=? AND status='delivered'",
+                         (uid,)).fetchone()["n"]
+        c.close()
+        ok, _pct, disc, err = validate_promo(code, subtotal, done == 0)
         if ok:
-            discount = round(subtotal * FIRST_COUPON_PCT / 100)
+            discount = disc
+        elif err == "coupon_not_found":
+            ok2, _ = coupon_valid(uid, code)
+            if ok2:
+                discount = round(subtotal * FIRST_COUPON_PCT / 100)
     return lines, subtotal, discount, subtotal - discount
 
 def clear_buy_state(context):
@@ -1896,7 +2260,15 @@ async def deliver_order(context: ContextTypes.DEFAULT_TYPE, order_id: int):
                       (order["user_id"], now, order_id, acc["id"]))
     c.execute("UPDATE orders SET status='delivered', account_id=? WHERE id=?", (plan[0][1][0]["id"], order_id))
     if order["coupon_code"]:
-        c.execute("UPDATE coupons SET used=1 WHERE user_id=? AND code=?", (order["user_id"], order["coupon_code"]))
+        # Global promo ho to us ka use isi transaction me record karo
+        # (promo_uses + used_count); FIRST-ORDER ho to purana per-user
+        # path (coupons.used=1) — dono kabhi mix nahi hote.
+        _ccode = (order["coupon_code"] or "").strip().upper()
+        _is_global = c.execute("SELECT 1 FROM promo_codes WHERE code=?", (_ccode,)).fetchone()
+        if _is_global:
+            _record_promo_use_conn(c, _ccode, order["code"], order["username"] or "", "")
+        else:
+            c.execute("UPDATE coupons SET used=1 WHERE user_id=? AND code=?", (order["user_id"], order["coupon_code"]))
     c.commit()
     n_delivered = c.execute("SELECT COUNT(*) n FROM orders WHERE user_id=? AND status='delivered'", (order["user_id"],)).fetchone()["n"]
     c.close()
@@ -2316,7 +2688,21 @@ def _zurva_handle_order_ipn(code, f):
     c = db()
     cur = c.execute("UPDATE orders SET status='zurva_processing', proof=? WHERE id=? AND status='pending'",
                     (f"zurvapay:{f['txid'] or code}", o["id"]))
-    claimed = cur.rowcount; c.commit(); c.close()
+    claimed = cur.rowcount
+    if claimed:
+        # Paid transition — global promo use ISI transaction me record karo
+        # (web orders ke liye yahi jagah hai: web delivery deliver_order
+        # se nahi hoti). Idempotency guard _record_promo_use_conn me hai.
+        try:
+            _bname = o["username"] or ""
+        except Exception:
+            _bname = ""
+        try:
+            _bemail = (o["web_contact"] or "") if "web_contact" in o.keys() else ""
+        except Exception:
+            _bemail = ""
+        _record_promo_use_conn(c, o["coupon_code"], o["code"], _bname, _bemail)
+    c.commit(); c.close()
     if not claimed:
         return True, "order pehle hi process ho rahi hai / ho chuki"
     try:
@@ -2566,11 +2952,17 @@ def _stock_rate_limited(ip):
 
 def handle_stock(client_ip=""):
     """GET /api/stock (public, no auth). Returns (http_status, dict):
-    {"ok": True, "stock": {"<product_id>": <available count>, ...}} —
+    {"ok": True, "stock": {"<product_id>": <available count>, ...},
+     "source": {"<product_id>": "ahm7" | "local", ...}} —
     accounts table me status='available' wali rows ki count, har product
     ke liye (0 jahan koi available account nahi). Ye Telegram bot ka
     local stock hai — web orders is se fulfill NAHI hote (web fulfillment
     AHM7 se hoti hai), is liye ye counts sirf site display ke liye hain.
+    "source" batata hai kaunsa product AHM7 se fulfill hota hai (mapping
+    me truthy ahm7_product_id — web checkout wala hi predicate) aur
+    kaunsa local stock se (koi AHM7 mapping nahi): site sirf "local"
+    products ko local count 0 par block kare — "ahm7" products ko kabhi
+    nahi (bot test 14d: zero local stock par bhi checkout chalta hai).
     Malformed: is handler ke koi params nahi — galat path/method pe HTTP
     layer 404 deta hai (neeche do_GET dekhein)."""
     if _stock_rate_limited(client_ip):
@@ -2578,11 +2970,16 @@ def handle_stock(client_ip=""):
     c = db()
     rows = c.execute("SELECT product_id, COUNT(*) n FROM accounts "
                      "WHERE status='available' GROUP BY product_id").fetchall()
-    ids = [r["id"] for r in c.execute("SELECT id FROM products").fetchall()]
+    prods = c.execute("SELECT id, name FROM products").fetchall()
     c.close()
     counts = {str(r["product_id"]): r["n"] for r in rows}
-    stock = {str(pid): counts.get(str(pid), 0) for pid in ids}
-    return 200, {"ok": True, "stock": stock}
+    stock = {str(p["id"]): counts.get(str(p["id"]), 0) for p in prods}
+    mapping = load_ahm7_mapping()
+    source = {}
+    for p in prods:
+        m = mapping.get(p["name"] or "")
+        source[str(p["id"])] = "ahm7" if (m and m.get("ahm7_product_id")) else "local"
+    return 200, {"ok": True, "stock": stock, "source": source}
 
 
 def handle_submit_review(data, headers=None, client_ip=""):
@@ -2642,10 +3039,8 @@ def handle_delete_review(data, headers=None):
     """POST /api/review/delete (Worker se, admin Bearer <redacted> token).
     Sirf admin delete kar sakta hai. Pehle ye sirf X-Web-Secret (Worker
     secret) pe khula tha — Worker endpoint public hai, is liye web se koi
-    bhi kisi bhi review ko delete kar sakta tha (agent 1 ne live test
-    review isi se delete ki). Koi UI isay call nahi karta — sirf
-    test-review cleanup ke liye hai, jo ab admin dashboard session se
-    hota hai. Returns (http_status, dict)."""
+    bhi kisi bhi review ko delete kar sakta tha. Admin dashboard ka Reviews
+    tab isay call karta hai (admin session se). Returns (http_status, dict)."""
     u, err = _admin_session_user(headers or {})
     if err:
         return err
@@ -2702,12 +3097,12 @@ def handle_get_reviews(product_id):
         c.close()
         return 404, {"ok": False, "error": "product nahi mila"}
     rows = c.execute(
-        "SELECT name, rating, text, created_at FROM reviews "
+        "SELECT id, name, rating, text, created_at FROM reviews "
         "WHERE product_id=? ORDER BY id DESC LIMIT 50", (product_id,)).fetchall()
     sold = _sold_count(c, product_id)
     c.close()
     return 200, {"ok": True, "product_id": product_id, "sold": sold,
-                 "reviews": [{"name": r["name"], "rating": r["rating"],
+                 "reviews": [{"id": r["id"], "name": r["name"], "rating": r["rating"],
                               "text": r["text"], "created_at": r["created_at"]} for r in rows]}
 
 
@@ -3976,6 +4371,590 @@ def handle_admin_issue_resolve(headers=None, issue_id=""):
     return 200, {"ok": True}
 
 
+# ---------- Admin dashboard: promo coupons / products / stock / AHM7 ----------
+# Sab handlers (status, dict) return karte hain; admin wale pehle
+# _admin_session_user se Bearer admin session check karte hain (401 bina
+# token, 403 non-admin token). Public wale rate-limited hain.
+
+# POST /api/coupon/validate rate limit: 30 requests / 60s per IP.
+_COUPON_RL = {}
+_COUPON_RL_LOCK = threading.Lock()
+
+def _coupon_rate_limited(ip):
+    now = time.time()
+    ip = ip or "unknown"
+    with _COUPON_RL_LOCK:
+        if len(_COUPON_RL) > 2000:
+            _COUPON_RL.clear()
+        start, count = _COUPON_RL.get(ip, (now, 0))
+        if now - start >= 60:
+            start, count = now, 0
+        count += 1
+        _COUPON_RL[ip] = (start, count)
+        return count > 30
+
+# GET /api/products rate limit: 60 requests / 60s per IP.
+_PRODUCTS_RL = {}
+_PRODUCTS_RL_LOCK = threading.Lock()
+
+def _products_rate_limited(ip):
+    now = time.time()
+    ip = ip or "unknown"
+    with _PRODUCTS_RL_LOCK:
+        if len(_PRODUCTS_RL) > 2000:
+            _PRODUCTS_RL.clear()
+        start, count = _PRODUCTS_RL.get(ip, (now, 0))
+        if now - start >= 60:
+            start, count = now, 0
+        count += 1
+        _PRODUCTS_RL[ip] = (start, count)
+        return count > 60
+
+def handle_admin_coupons(headers=None):
+    """GET /api/admin/coupons — Bearer admin token. Sab promo codes,
+    created_at DESC."""
+    u, err = _admin_session_user(headers or {})
+    if err:
+        return err
+    c = db()
+    rows = c.execute("SELECT * FROM promo_codes ORDER BY created_at DESC, code ASC").fetchall()
+    c.close()
+    return 200, {"ok": True, "coupons": [_promo_dict(r) for r in rows]}
+
+def handle_admin_coupon_create(data, headers=None):
+    """POST /api/admin/coupons {code, pct_off, max_uses?, expires_at?,
+    min_order_pkr?, first_order_only?} — Bearer admin token.
+    201 + coupon; duplicate code -> 400 coupon_exists; bad input ->
+    400 coupon_invalid (+ field)."""
+    u, err = _admin_session_user(headers or {})
+    if err:
+        return err
+    data = data or {}
+    code = str(data.get("code") or "").strip().upper()
+    if not _PROMO_CODE_RE.match(code):
+        return 400, {"ok": False, "error": "coupon_invalid", "field": "code"}
+    pct = _as_int(data.get("pct_off"))
+    if pct is None or pct < 1 or pct > 100:
+        return 400, {"ok": False, "error": "coupon_invalid", "field": "pct_off"}
+    max_uses = data.get("max_uses")
+    if max_uses is not None:
+        max_uses = _as_int(max_uses)
+        if max_uses is None or max_uses < 1:
+            return 400, {"ok": False, "error": "coupon_invalid", "field": "max_uses"}
+    expires_at = None
+    if data.get("expires_at") is not None:
+        expires_at = _normalize_expires_at(data.get("expires_at"))
+        if expires_at is None:
+            return 400, {"ok": False, "error": "coupon_invalid", "field": "expires_at"}
+        if expires_at <= datetime.now().strftime("%Y-%m-%d %H:%M"):
+            return 400, {"ok": False, "error": "coupon_invalid", "field": "expires_at"}
+    min_order = _as_int(data.get("min_order_pkr", 0))
+    if min_order is None or min_order < 0:
+        return 400, {"ok": False, "error": "coupon_invalid", "field": "min_order_pkr"}
+    fo = data.get("first_order_only", 0)
+    if isinstance(fo, bool):
+        fo = 1 if fo else 0
+    elif fo not in (0, 1):
+        return 400, {"ok": False, "error": "coupon_invalid", "field": "first_order_only"}
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    c = db()
+    if c.execute("SELECT 1 FROM promo_codes WHERE code=?", (code,)).fetchone():
+        c.close()
+        return 400, {"ok": False, "error": "coupon_exists"}
+    try:
+        c.execute("INSERT INTO promo_codes(code, pct_off, max_uses, used_count, expires_at, "
+                  "min_order_pkr, first_order_only, active, created_at) "
+                  "VALUES(?,?,?,?,?,?,?,?,?)",
+                  (code, pct, max_uses, 0, expires_at, min_order, fo, 1, now))
+    except sqlite3.IntegrityError:
+        c.close()
+        return 400, {"ok": False, "error": "coupon_exists"}
+    c.commit()
+    row = c.execute("SELECT * FROM promo_codes WHERE code=?", (code,)).fetchone()
+    c.close()
+    return 201, {"ok": True, "coupon": _promo_dict(row)}
+
+def handle_admin_coupon_toggle(headers=None, code=""):
+    """POST /api/admin/coupons/:code/toggle — active flip karo.
+    Unknown code -> 404."""
+    u, err = _admin_session_user(headers or {})
+    if err:
+        return err
+    code = (code or "").strip().upper()
+    c = db()
+    r = c.execute("SELECT active FROM promo_codes WHERE code=?", (code,)).fetchone()
+    if not r:
+        c.close()
+        return 404, {"ok": False, "error": "coupon nahi mila"}
+    new = 0 if r["active"] else 1
+    c.execute("UPDATE promo_codes SET active=? WHERE code=?", (new, code))
+    c.commit(); c.close()
+    return 200, {"ok": True, "code": code, "active": new}
+
+def handle_admin_coupon_delete(data, headers=None, code=""):
+    """DELETE /api/admin/coupons/:code — Bearer admin token.
+    used_count>0 ho aur body me {force:true} na ho to 400 coupon_has_uses;
+    force pe delete + us ki promo_uses rows bhi delete. Unknown -> 404."""
+    u, err = _admin_session_user(headers or {})
+    if err:
+        return err
+    code = (code or "").strip().upper()
+    force = bool((data or {}).get("force")) if isinstance(data, dict) else False
+    c = db()
+    r = c.execute("SELECT used_count FROM promo_codes WHERE code=?", (code,)).fetchone()
+    if not r:
+        c.close()
+        return 404, {"ok": False, "error": "coupon nahi mila"}
+    if (r["used_count"] or 0) > 0 and not force:
+        c.close()
+        return 400, {"ok": False, "error": "coupon_has_uses"}
+    c.execute("DELETE FROM promo_uses WHERE code=?", (code,))
+    c.execute("DELETE FROM promo_codes WHERE code=?", (code,))
+    c.commit(); c.close()
+    return 200, {"ok": True, "deleted": True}
+
+def handle_admin_coupon_uses(headers=None, code=""):
+    """GET /api/admin/coupons/:code/uses — newest first, limit 100.
+    Unknown code -> 404."""
+    u, err = _admin_session_user(headers or {})
+    if err:
+        return err
+    code = (code or "").strip().upper()
+    c = db()
+    if not c.execute("SELECT 1 FROM promo_codes WHERE code=?", (code,)).fetchone():
+        c.close()
+        return 404, {"ok": False, "error": "coupon nahi mila"}
+    rows = c.execute("SELECT order_code, buyer_name, buyer_email, used_at FROM promo_uses "
+                     "WHERE code=? ORDER BY id DESC LIMIT 100", (code,)).fetchall()
+    c.close()
+    return 200, {"ok": True, "code": code,
+                 "uses": [{"order_code": r["order_code"], "buyer_name": r["buyer_name"],
+                           "buyer_email": r["buyer_email"], "used_at": r["used_at"]} for r in rows]}
+
+def handle_coupon_validate(data, client_ip=""):
+    """POST /api/coupon/validate {code, amount_pkr, is_first_order} —
+    public, no auth, 30/min per IP. 200 {ok, pct, discount} ya 400
+    {ok:false, error:<validate_promo wala code>}."""
+    if _coupon_rate_limited(client_ip):
+        return 429, {"ok": False, "error": "too many requests — thodi der me dobara try karein"}
+    data = data or {}
+    code = str(data.get("code") or "").strip()
+    amount = _as_int(data.get("amount_pkr"))
+    if not code or amount is None or amount < 0:
+        return 400, {"ok": False, "error": "coupon_invalid"}
+    is_first = bool(data.get("is_first_order"))
+    ok, pct, discount, err = validate_promo(code, amount, is_first)
+    if not ok:
+        return 400, {"ok": False, "error": err}
+    return 200, {"ok": True, "pct": pct, "discount": discount}
+
+def handle_admin_products(headers=None):
+    """GET /api/admin/products — Bearer admin token. Har product: local
+    stock (available accounts), sold (_sold_count), AHM7 mapping join
+    (ahm7_mapped / ahm7_product_id / cost / margin = price_pkr - cost).
+    Order by id."""
+    u, err = _admin_session_user(headers or {})
+    if err:
+        return err
+    c = db()
+    rows = c.execute("SELECT * FROM products ORDER BY id").fetchall()
+    counts = {r["product_id"]: r["n"] for r in c.execute(
+        "SELECT product_id, COUNT(*) n FROM accounts WHERE status='available' "
+        "GROUP BY product_id").fetchall()}
+    mapping = load_ahm7_mapping()
+    out = []
+    for p in rows:
+        m = mapping.get(p["name"] or "")
+        cost = m.get("cost_pkr") if m else None
+        out.append({"id": p["id"], "name": p["name"], "price_pkr": p["price_pkr"],
+                    "price_usdt": p["price_usdt"], "kind": p["kind"],
+                    "category": p["category"], "active": p["active"],
+                    "description": p["description"], "terms": p["terms"],
+                    "admin_edited": bool(p["admin_edited"]),
+                    "local_stock": counts.get(p["id"], 0),
+                    "sold": _sold_count(c, p["id"]),
+                    "ahm7_mapped": bool(m and m.get("ahm7_product_id")),
+                    "ahm7_product_id": (m.get("ahm7_product_id") if m else None),
+                    "ahm7_price_pkr": cost,
+                    "margin_pkr": (p["price_pkr"] - cost) if cost is not None else None})
+    c.close()
+    return 200, {"ok": True, "products": out}
+
+def handle_admin_product_create(data, headers=None):
+    """POST /api/admin/products {name, price_pkr, kind, category,
+    description?, terms?, ahm7_product_id?} — Bearer admin token.
+    201 {ok, id}. price_usdt seed/sync wale derivation se (round(pkr/280,2)).
+    ahm7_product_id mile to ahm7-mapping.json me bhi entry likho (cost
+    unknown -> null, purani cost ho to mehfooz rehti hai)."""
+    u, err = _admin_session_user(headers or {})
+    if err:
+        return err
+    data = data or {}
+    name = str(data.get("name") or "").strip()
+    if not name or len(name) > 120:
+        return 400, {"ok": False, "error": "product_invalid", "field": "name"}
+    price = _as_int(data.get("price_pkr"))
+    if price is None or price <= 0:
+        return 400, {"ok": False, "error": "product_invalid", "field": "price_pkr"}
+    kind = str(data.get("kind") or "").strip().lower()
+    if kind not in ("mail", "account"):
+        return 400, {"ok": False, "error": "product_invalid", "field": "kind"}
+    category = str(data.get("category") or "").strip()
+    if not category or len(category) > 60:
+        return 400, {"ok": False, "error": "product_invalid", "field": "category"}
+    description = data.get("description") or ""
+    terms = data.get("terms") or ""
+    if not isinstance(description, str) or not isinstance(terms, str) \
+            or len(description) > 2000 or len(terms) > 2000:
+        return 400, {"ok": False, "error": "product_invalid", "field": "description"}
+    ahm7_pid = str(data.get("ahm7_product_id") or "").strip() or None
+    c = db()
+    if c.execute("SELECT id FROM products WHERE LOWER(name)=LOWER(?)", (name,)).fetchone():
+        c.close()
+        return 400, {"ok": False, "error": "product_exists"}
+    cur = c.execute("INSERT INTO products(name,description,price_pkr,price_usdt,active,kind,category,terms,admin_edited) "
+                    "VALUES(?,?,?,?,1,?,?,?,1)",
+                    (name, description, price, _price_usdt(price), kind, category, terms))
+    pid = cur.lastrowid
+    c.commit(); c.close()
+    if ahm7_pid:
+        mapping = dict(load_ahm7_mapping())
+        old = mapping.get(name) or {}
+        mapping[name] = {"ahm7_product_id": ahm7_pid, "ahm7_name": name,
+                         "cost_pkr": old.get("cost_pkr"),
+                         "site_price_pkr": price}
+        if not _save_ahm7_mapping(mapping):
+            log.warning("Product %s bana, lekin ahm7-mapping.json save fail", pid)
+    return 201, {"ok": True, "id": pid}
+
+def _admin_product_row(c, pid):
+    try:
+        pid = int(pid)
+    except Exception:
+        return None
+    return c.execute("SELECT * FROM products WHERE id=?", (pid,)).fetchone()
+
+def handle_admin_product_price(data, headers=None, pid=0):
+    """POST /api/admin/products/:id/price {price_pkr} — price + price_usdt
+    dono update hote hain, aur admin_edited=1 lag jata hai (CSV sync is
+    price ko phir overwrite nahi karega — price lock). Aage ki checkouts
+    nayi price charge karengi; pehle se bani unpaid orders untouched.
+    Unknown id -> 404."""
+    u, err = _admin_session_user(headers or {})
+    if err:
+        return err
+    price = _as_int((data or {}).get("price_pkr"))
+    if price is None or price <= 0:
+        return 400, {"ok": False, "error": "product_invalid", "field": "price_pkr"}
+    c = db()
+    p = _admin_product_row(c, pid)
+    if not p:
+        c.close()
+        return 404, {"ok": False, "error": "product nahi mila"}
+    c.execute("UPDATE products SET price_pkr=?, price_usdt=?, admin_edited=1 WHERE id=?",
+              (price, _price_usdt(price), p["id"]))
+    c.commit(); c.close()
+    return 200, {"ok": True, "price_pkr": price}
+
+def handle_admin_product_toggle(headers=None, pid=0):
+    """POST /api/admin/products/:id/toggle — active 1/0 flip. Unknown -> 404."""
+    u, err = _admin_session_user(headers or {})
+    if err:
+        return err
+    c = db()
+    p = _admin_product_row(c, pid)
+    if not p:
+        c.close()
+        return 404, {"ok": False, "error": "product nahi mila"}
+    new = 0 if p["active"] else 1
+    c.execute("UPDATE products SET active=? WHERE id=?", (new, p["id"]))
+    c.commit(); c.close()
+    return 200, {"ok": True, "active": new}
+
+def handle_admin_product_delete(headers=None, pid=0):
+    """DELETE /api/admin/products/:id — Bearer admin token. Koi order
+    reference kare to 400 product_has_orders; available stock ho to 400
+    product_has_stock. Sold accounts/orders ko haath nahi lagata.
+    Unknown -> 404."""
+    u, err = _admin_session_user(headers or {})
+    if err:
+        return err
+    c = db()
+    p = _admin_product_row(c, pid)
+    if not p:
+        c.close()
+        return 404, {"ok": False, "error": "product nahi mila"}
+    pid = p["id"]
+    has_order = False
+    for r in c.execute("SELECT product_id, items_json FROM orders").fetchall():
+        if r["product_id"] == pid:
+            has_order = True
+            break
+        try:
+            items = json.loads(r["items_json"] or "[]")
+        except Exception:
+            continue
+        if isinstance(items, list) and any(
+                isinstance(it, dict) and it.get("pid") == pid for it in items):
+            has_order = True
+            break
+    if has_order:
+        c.close()
+        return 400, {"ok": False, "error": "product_has_orders"}
+    avail = c.execute("SELECT COUNT(*) n FROM accounts WHERE product_id=? AND status='available'",
+                      (pid,)).fetchone()["n"]
+    if avail:
+        c.close()
+        return 400, {"ok": False, "error": "product_has_stock"}
+    c.execute("DELETE FROM products WHERE id=?", (pid,))
+    c.commit(); c.close()
+    return 200, {"ok": True, "deleted": True}
+
+def handle_admin_product_details(data, headers=None, pid=0):
+    """POST /api/admin/products/:id/details {description?, terms?} —
+    dono optional strings (<=2000 chars). Sirf di hui fields update hoti
+    hain. Unknown -> 404."""
+    u, err = _admin_session_user(headers or {})
+    if err:
+        return err
+    data = data or {}
+    c = db()
+    p = _admin_product_row(c, pid)
+    if not p:
+        c.close()
+        return 404, {"ok": False, "error": "product nahi mila"}
+    updates = {}
+    for field in ("description", "terms"):
+        if field in data and data.get(field) is not None:
+            v = data.get(field)
+            if not isinstance(v, str) or len(v) > 2000:
+                c.close()
+                return 400, {"ok": False, "error": "product_invalid", "field": field}
+            updates[field] = v
+    for field, v in updates.items():
+        c.execute(f"UPDATE products SET {field}=? WHERE id=?", (v, p["id"]))
+    if "description" in updates:
+        # Description bhi CSV sync ka hissa hai — admin ki change ko lock karo.
+        c.execute("UPDATE products SET admin_edited=1 WHERE id=?", (p["id"],))
+    c.commit(); c.close()
+    return 200, {"ok": True}
+
+def handle_admin_stock_add(data, headers=None, pid=0):
+    """POST /api/admin/products/:id/stock/add {lines:[...]} — Bearer admin.
+    Har line TG /addstock wali parsing se (_parse_stock_line); blank lines
+    khamoshi se skip, malformed -> skipped [{line, reason:
+    'format_ghalat_hai'}]. Accounts status='available' insert hote hain
+    (mail-kind ki teesri segment extra me jati hai). Ek stock_events row
+    (action 'add'). Unknown product -> 404; khaali lines list -> 400."""
+    u, err = _admin_session_user(headers or {})
+    if err:
+        return err
+    data = data or {}
+    lines = data.get("lines")
+    if not isinstance(lines, list) or not lines:
+        return 400, {"ok": False, "error": "lines chahiye"}
+    c = db()
+    p = _admin_product_row(c, pid)
+    if not p:
+        c.close()
+        return 404, {"ok": False, "error": "product nahi mila"}
+    pid = p["id"]
+    added = 0
+    skipped = []
+    for raw in lines:
+        line = str(raw or "").strip()
+        if not line:
+            continue
+        parsed = _parse_stock_line(line)
+        if not parsed:
+            skipped.append({"line": line, "reason": "format_ghalat_hai"})
+            continue
+        login, pwd, extra = parsed
+        c.execute("INSERT INTO accounts(product_id,login,password,extra) VALUES(?,?,?,?)",
+                  (pid, login, pwd, extra))
+        added += 1
+    by_admin = ""
+    try:
+        by_admin = (u["email"] or u["name"] or "") if u else ""
+    except Exception:
+        by_admin = ""
+    c.execute("INSERT INTO stock_events(product_id, action, count, by_admin, at) "
+              "VALUES(?,?,?,?,?)",
+              (pid, "add", added, by_admin, datetime.now().strftime("%Y-%m-%d %H:%M")))
+    c.commit(); c.close()
+    return 200, {"ok": True, "added": added, "skipped": skipped}
+
+def handle_admin_stock_remove(data, headers=None, pid=0):
+    """POST /api/admin/products/:id/stock/remove {count} — Bearer admin.
+    Sirf COUNT sab se purani (lowest id) status='available' rows delete
+    hoti hain — sold rows ko kabhi haath nahi lagata. count > available
+    ho to 400 stock_kam_hai (+ available). Ek stock_events row
+    (action 'remove'). Unknown -> 404."""
+    u, err = _admin_session_user(headers or {})
+    if err:
+        return err
+    count = _as_int((data or {}).get("count"))
+    if count is None or count < 1:
+        return 400, {"ok": False, "error": "count ghalat hai"}
+    c = db()
+    p = _admin_product_row(c, pid)
+    if not p:
+        c.close()
+        return 404, {"ok": False, "error": "product nahi mila"}
+    pid = p["id"]
+    avail = c.execute("SELECT COUNT(*) n FROM accounts WHERE product_id=? AND status='available'",
+                      (pid,)).fetchone()["n"]
+    if count > avail:
+        c.close()
+        return 400, {"ok": False, "error": "stock_kam_hai", "available": avail}
+    ids = [r["id"] for r in c.execute(
+        "SELECT id FROM accounts WHERE product_id=? AND status='available' "
+        "ORDER BY id LIMIT ?", (pid, count)).fetchall()]
+    for aid in ids:
+        c.execute("DELETE FROM accounts WHERE id=?", (aid,))
+    by_admin = ""
+    try:
+        by_admin = (u["email"] or u["name"] or "") if u else ""
+    except Exception:
+        by_admin = ""
+    c.execute("INSERT INTO stock_events(product_id, action, count, by_admin, at) "
+              "VALUES(?,?,?,?,?)",
+              (pid, "remove", len(ids), by_admin, datetime.now().strftime("%Y-%m-%d %H:%M")))
+    c.commit(); c.close()
+    return 200, {"ok": True, "removed": len(ids)}
+
+def handle_admin_stock_events(headers=None, query=None):
+    """GET /api/admin/stock-events?product_id=&limit=50 — Bearer admin.
+    Newest first; limit clamp 1–200, default 50."""
+    u, err = _admin_session_user(headers or {})
+    if err:
+        return err
+    query = query or {}
+    try:
+        limit = int((query.get("limit") or ["50"])[0])
+    except Exception:
+        limit = 50
+    limit = max(1, min(200, limit))
+    pid_filter = None
+    try:
+        raw = (query.get("product_id") or [""])[0]
+        if raw not in (None, ""):
+            pid_filter = int(raw)
+    except Exception:
+        pid_filter = None
+    c = db()
+    if pid_filter is not None:
+        rows = c.execute(
+            "SELECT se.id, se.product_id, se.action, se.count, se.by_admin, se.at, "
+            "p.name AS product_name FROM stock_events se LEFT JOIN products p "
+            "ON p.id = se.product_id WHERE se.product_id=? ORDER BY se.id DESC LIMIT ?",
+            (pid_filter, limit)).fetchall()
+    else:
+        rows = c.execute(
+            "SELECT se.id, se.product_id, se.action, se.count, se.by_admin, se.at, "
+            "p.name AS product_name FROM stock_events se LEFT JOIN products p "
+            "ON p.id = se.product_id ORDER BY se.id DESC LIMIT ?",
+            (limit,)).fetchall()
+    c.close()
+    return 200, {"ok": True, "events": [
+        {"id": r["id"], "product_id": r["product_id"],
+         "product_name": r["product_name"] or "", "action": r["action"],
+         "count": r["count"], "by_admin": r["by_admin"], "at": r["at"]} for r in rows]}
+
+def handle_products_public(client_ip=""):
+    """GET /api/products — public catalogue, no auth, 60/min per IP.
+    Active + inactive dono listed (site inactive chhupata hai).
+    sold via _sold_count."""
+    if _products_rate_limited(client_ip):
+        return 429, {"ok": False, "error": "too many requests — thodi der me dobara try karein"}
+    c = db()
+    rows = c.execute("SELECT * FROM products ORDER BY id").fetchall()
+    out = []
+    for p in rows:
+        out.append({"id": p["id"], "name": p["name"], "price_pkr": p["price_pkr"],
+                    "active": p["active"], "kind": p["kind"],
+                    "category": p["category"], "sold": _sold_count(c, p["id"])})
+    c.close()
+    return 200, {"ok": True, "products": out}
+
+def handle_admin_ahm7_products(headers=None):
+    """GET /api/admin/ahm7/products — Bearer admin token. Live AHM7 OLD
+    host GET /v1/products (X-Api-Key, timeout 30s) — kabhi fake/cache
+    data nahi. price_pkr = discountedPrices.pkr (fallback prices.pkr);
+    site join ahm7-mapping.json se (ahm7_product_id); margin =
+    site_price_pkr - price_pkr. Key missing -> 503 ahm7_key_missing;
+    AHM7 non-200/timeout/JSON error -> 502 ahm7_error (+ detail)."""
+    u, err = _admin_session_user(headers or {})
+    if err:
+        return err
+    _st, d, aerr = _ahm7_get("/v1/products")
+    if aerr == "ahm7_key_missing":
+        return 503, {"ok": False, "error": "ahm7_key_missing"}
+    if aerr or d is None:
+        return 502, {"ok": False, "error": "ahm7_error", "detail": (aerr or "AHM7 error")[:200]}
+    items = d.get("products")
+    if not isinstance(items, list):
+        return 502, {"ok": False, "error": "ahm7_error",
+                     "detail": "AHM7 products list nahi mili"}
+    mapping_all = load_ahm7_mapping()
+    rev = {}
+    for name, m in mapping_all.items():
+        aid = (m or {}).get("ahm7_product_id")
+        if aid:
+            rev[aid] = (name, m)
+    c = db()
+    prods_by_name = {r["name"]: r for r in c.execute("SELECT * FROM products").fetchall()}
+    c.close()
+    out = []
+    for p in items:
+        if not isinstance(p, dict):
+            continue
+        aid = p.get("id")
+        dp = p.get("discountedPrices") or {}
+        pr = p.get("prices") or {}
+        price = None
+        try:
+            raw_price = dp.get("pkr") if dp.get("pkr") is not None else pr.get("pkr")
+            price = int(round(float(raw_price))) if raw_price is not None else None
+        except Exception:
+            price = None
+        stock = p.get("stock", p.get("inStock"))
+        site_id = None
+        site_price = None
+        margin = None
+        hit = rev.get(aid)
+        if hit:
+            name, m = hit
+            sp = prods_by_name.get(name)
+            if sp is not None:
+                site_id = sp["id"]
+                site_price = _site_price_pkr(sp, m)
+                margin = (site_price - price) if (site_price is not None and price is not None) else None
+        out.append({"ahm7_id": aid, "name": p.get("name"), "price_pkr": price,
+                    "stock": stock, "site_id": site_id,
+                    "site_price_pkr": site_price, "margin_pkr": margin})
+    return 200, {"ok": True, "products": out,
+                 "fetched_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+
+def handle_admin_ahm7_balance(headers=None):
+    """GET /api/admin/ahm7/balance — Bearer admin token. Live AHM7 OLD
+    host GET /v1/wallet (X-Api-Key) — balances object pass-through.
+    Key missing -> 503 ahm7_key_missing; AHM7 error -> 502 ahm7_error."""
+    u, err = _admin_session_user(headers or {})
+    if err:
+        return err
+    _st, d, aerr = _ahm7_get("/v1/wallet")
+    if aerr == "ahm7_key_missing":
+        return 503, {"ok": False, "error": "ahm7_key_missing"}
+    if aerr or d is None:
+        return 502, {"ok": False, "error": "ahm7_error", "detail": (aerr or "AHM7 error")[:200]}
+    bal = d.get("balances") if isinstance(d.get("balances"), dict) else None
+    if bal is None:
+        bal = {k: d.get(k) for k in ("crypto", "pkr", "inr") if k in d}
+        if not bal:
+            bal = d
+    return 200, {"ok": True, "balances": bal}
+
 def ahm7_place_order(product_id, customer_ref, quantity=1):
     """AHM7 POST /v1/orders (currency pkr, Idempotency-Key = customer_ref —
     retry kabhi double-buy nahi karta). quantity: usi product ki kitni
@@ -4198,11 +5177,27 @@ def handle_web_checkout(data, headers=None):
         labels.append(f"{prod['name']} x{ln['qty']}" if ln["qty"] > 1 else prod["name"])
     if total <= 0:
         return 400, {"ok": False, "error": "total price set nahi hai"}
+    # --- Global promo (optional): discount total se kat-ta hai, Zurvapay
+    # initiate DISCOUNTED total pe hota hai. Web ki koi identity nahi, is
+    # liye first_order_only codes yahan hamesha coupon_first_only dete
+    # hain (validate_promo me is_first_order=False). Invalid code -> 400,
+    # order banta hi nahi — failed payment kabhi use consume nahi karta
+    # (use sirf IPN paid transition pe record hota hai).
+    coupon_code = ""
+    discount = 0
+    raw_coupon = str(data.get("coupon") or "").strip()
+    if raw_coupon:
+        ok, _pct, disc, err = validate_promo(raw_coupon, total, False)
+        if not ok:
+            return 400, {"ok": False, "error": err}
+        coupon_code = raw_coupon.upper()
+        discount = disc
+        total -= disc
     code = gen_order_code()
     token = _gen_delivery_token()
     oid = create_order(0, contact, [{"pid": ln["pid"], "qty": ln["qty"]} for ln in lines],
                        "zurvapay", f"Rs {total} via Zurvapay (web)", "zurvapay",
-                       total, code, "", 0, channel="web")
+                       total, code, coupon_code, discount, channel="web")
     success_base = str(data.get("success_base") or "").strip().rstrip("/")
     if success_base not in ("https://retailshop.pages.dev", "https://retail-shop.online"):
         success_base = "https://retailshop.pages.dev"
@@ -5244,6 +6239,30 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if awaiting == "coupon":
         code = (update.message.text or "").strip()
+        norm = code.upper()
+        # Global promo pehle: subtotal + first-order status se validate karo.
+        _lines = buy_lines(context)
+        _subtotal = sum(l["line_pkr"] for l in _lines)
+        _c = db()
+        _done = _c.execute("SELECT COUNT(*) n FROM orders WHERE user_id=? AND status='delivered'",
+                           (user.id,)).fetchone()["n"]
+        _c.close()
+        _ok, _pct, _disc, _err = validate_promo(norm, _subtotal, _done == 0)
+        if _ok:
+            context.user_data["buy_coupon_code"] = norm
+            context.user_data.pop("awaiting", None)
+            await update.message.reply_text(
+                t(user.id, "coupon_applied", code=norm, pct=_pct),
+                reply_markup=None)
+            # summary dobara bhejdo (message handler se edit nahi ho sakta)
+            await update.message.reply_text(summary_text(user.id, context), reply_markup=summary_kb(user.id, context))
+            return
+        if _err != "coupon_not_found":
+            # Global code hai lekin apply nahi ho sakta — asal wajah batao.
+            await update.message.reply_text(f"❌ {_PROMO_ERR_TEXT.get(_err, 'Coupon apply nahi ho saka.')}")
+            context.user_data.pop("awaiting", None)
+            return
+        # Global table me nahi — FIRST-ORDER fallback (purana behaviour).
         ok, reason = coupon_valid(user.id, code)
         if not ok:
             await update.message.reply_text(f"❌ {reason}")
@@ -5443,7 +6462,7 @@ async def setprice_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     c = db(); p = c.execute("SELECT * FROM products WHERE id=?", (pid,)).fetchone()
     if not p:
         c.close(); await update.message.reply_text("Ye ID nahi mili."); return
-    c.execute("UPDATE products SET price_pkr=?, price_usdt=? WHERE id=?", (pkr, usdt, pid)); c.commit(); c.close()
+    c.execute("UPDATE products SET price_pkr=?, price_usdt=?, admin_edited=1 WHERE id=?", (pkr, usdt, pid)); c.commit(); c.close()
     tag = " — ab ye 🆓 FREE hai, buyer ko bina payment account milega." if pkr == 0 and usdt == 0 else ""
     await update.message.reply_text(f"✅ {p['name']} ki price ab Rs {pkr} / ${usdt}.{tag}")
 
@@ -5543,23 +6562,12 @@ async def stock_lines(update: Update, context: ContextTypes.DEFAULT_TYPE):
     added = 0
     c = db()
     for line in lines:
-        extra = ""
-        if "|" in line:
-            parts = [x.strip() for x in line.split("|")]
-            if len(parts) >= 3:
-                # Mail-type: code | email | mailbox_url
-                extra, login, pwd = parts[0], parts[1], "|".join(parts[2:])
-            else:
-                login, pwd = parts[0], parts[1] if len(parts) > 1 else ""
-        elif "," in line:
-            login, pwd = [x.strip() for x in line.split(",", 1)]
-        else:
-            parts = line.split()
-            if len(parts) < 2: continue
-            login, pwd = parts[0], parts[1]
-        if login and pwd:
-            c.execute("INSERT INTO accounts(product_id,login,password,extra) VALUES(?,?,?,?)", (pid, login, pwd, extra))
-            added += 1
+        parsed = _parse_stock_line(line)
+        if not parsed:
+            continue
+        login, pwd, extra = parsed
+        c.execute("INSERT INTO accounts(product_id,login,password,extra) VALUES(?,?,?,?)", (pid, login, pwd, extra))
+        added += 1
     c.commit(); c.close()
     context.user_data.clear()
     await update.message.reply_text(f"✅ {added} accounts add ho gaye! Total stock ab: {stock_count(pid)}")
