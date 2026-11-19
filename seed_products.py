@@ -17,32 +17,32 @@ DB_PATH = "shop.db"
 
 # (name, description, price_pkr, price_usdt)
 PRODUCTS = [
-    ("Amazon Prime 6 Months", "Limited Deal - was PKR 850", 799, 2.85),
+    ("Amazon Prime 6 Months", "Limited Deal - was PKR 850", 768, 2.74),
     ("Udemy Personal Plan 1M", "Limited Deal - was PKR 669", 662, 2.36),
-    ("Capcut Pro 1 Month", "Premium Service", 626, 2.24),
-    ("HMA Vpn Monthly", "Premium Service", 286, 1.02),
-    ("Microsoft 365 Plus 1 Year", "Premium Service", 601, 2.15),
-    ("Muse Ai 1B Credits", "Premium Service", 173, 0.62),
-    ("Windows 10/11 Pro", "Premium Service", 376, 1.34),
+    ("Capcut Pro 1 Month", "Premium Service", 621, 2.22),
+    ("HMA Vpn Monthly", "Premium Service", 283, 1.01),
+    ("Microsoft 365 Plus 1 Year", "Premium Service", 581, 2.08),
+    ("Muse Ai 1B Credits", "Premium Service", 123, 0.44),
+    ("Windows 10/11 Pro", "Premium Service", 367, 1.31),
     ("Muse Ai 31B Token (NW)", "Premium Service", 634, 2.26),
     ("Capcut Pro 7D 500 credits", "CapCut Pro — 7 days, 500 credits", 214, 0.76),
     ("500$ API CLAUDE 30D (FW)", "Claude API — $500 credits, 30 days", 2770, 9.89),
     ("100$ API Claude 30D (FW)", "Claude API — $100 credits, 30 days", 861, 3.08),
-    ("Adobe Express 12M", "Adobe Express Premium — 12 months", 269, 0.96),
-    ("Gemini Plus 6m Links (No Card Required)", "Gemini Plus — 6 months, redeem link, no card needed", 479, 1.71),
+    ("Adobe Express 12M", "Adobe Express Premium — 12 months", 261, 0.93),
+    ("Gemini Plus 6m Links (No Card Required)", "Gemini Plus — 6 months, redeem link, no card needed", 366, 1.31),
     ("MUSE AI 1B TOKEN (W2D)", "Muse AI — 1 Billion tokens account", 261, 0.93),
-    ("Outlook IMAP", "Outlook mail account (IMAP)", 138, 0.49),
+    ("Outlook IMAP", "Outlook mail account (IMAP)", 58, 0.21),
     ("Hotmail Mail Accounts", "Hotmail mail account", 135, 0.48),
-    ("Owl Proxy 200 Mb", "Owl Proxy — 200 MB data", 159, 0.57),
+    ("Owl Proxy 200 Mb", "Owl Proxy — 200 MB data", 109, 0.39),
     ("iLovePdf Premium 1 Yr", "iLovePDF Premium — 1 year", 552, 1.97),
     ("Chatgpt Plus 1M (25DW)", "ChatGPT Plus — 1 month", 2649, 9.46),
     ("Coursera Plus 7 Days Trial", "Coursera Plus — 7 days trial", 311, 1.11),
     ("Bolt .new Pro 1 Month", "Bolt.new Pro — 1 month", 1003, 3.58),
-    ("3 in 1 VIP Group", "3 in 1 VIP group access", 13099, 46.78),
+    ("3 in 1 VIP Group", "3 in 1 VIP group access", 7700, 27.5),
     ("Canva Edu 3 Years Invite On Client Mail", "Invite on client mail", 385, 1.38),
     ("CrunchyRoll 1 Year Mega Fan Profile (FW)", "Crunchyroll Mega Fan — 1 year", 699, 2.5),
     ("Hostinger Unlimited Plan 12 Months (FW)", "Hostinger Unlimited — 12 months", 5650, 20.18),
-    ("Muse Ai Token On Client Account", "Muse AI token — added to your own account", 181, 0.65),
+    ("Muse Ai Token On Client Account", "Muse AI token — added to your own account", 131, 0.47),
     ("Capcut Pro 6 Months", "CapCut Pro — 6 months", 3184, 11.37),
     ("Figma Professional", "Figma Professional — design tool", 1102, 3.94),
     ("Gemini Plus 12m Links", "Gemini Plus — 12 months, redeem link", 461, 1.65),
@@ -59,8 +59,6 @@ PRODUCTS = [
     ("MUSE AI 31B Stable", "Muse AI 31B tokens — stable", 630, 2.25),
     ("Nord VPN 3M", "NordVPN — 3 months", 822, 2.94),
     ("Surfshark 2 Month Account (FW)", "Surfshark VPN — 2 months", 1107, 3.95),
-    # NOTE: "Canva Admin Panel 3Year (2MW)" screenshot me cut off tha, price nazar nahi aayi
-    # is liye is list me nahi hai. Price batao to add kar dunga.
 ]
 
 def main():

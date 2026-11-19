@@ -514,16 +514,32 @@ def init_db():
         _sync_products_from_csv(c)
     except Exception:
         log.exception("products.csv sync failed (skipping)")
-    # Owner-ordered price fix (19 Nov 2026): Muse Ai 1B Credits = 173
-    # (AHM7 cost 73 + Rs 100 margin). CSV sync admin_edited rows ko skip
-    # karta hai aur ye row pehle Rs 20 par admin-edited thi — is liye
-    # price yahan seedhi set karo aur lock hata do taake CSV aage se
-    # is row ko bhi sync kar sake.
+    # Owner-ordered tiered price fix (19 Nov 2026): Junaid's tiered profit
+    # rule — AHM7 cost >= 100 -> +Rs 100; cost 50-99 -> +Rs 50;
+    # cost < 50 -> +Rs 20. Applies to the 12 products whose tiered price
+    # differs from the current DB price. CSV sync skips admin_edited rows,
+    # so set the price here directly and clear the lock, making the CSV
+    # authoritative for these rows afterwards.
     try:
-        c.execute("UPDATE products SET price_pkr=173, price_usdt=0.62, admin_edited=0 "
-                  "WHERE name='Muse Ai 1B Credits'")
+        _TIERED_FIX = [
+            ("Amazon Prime 6 Months", 768, 2.74),
+            ("Capcut Pro 1 Month", 621, 2.22),
+            ("HMA Vpn Monthly", 283, 1.01),
+            ("Microsoft 365 Plus 1 Year", 581, 2.08),
+            ("Muse Ai 1B Credits", 123, 0.44),
+            ("Windows 10/11 Pro", 367, 1.31),
+            ("Adobe Express 12M", 261, 0.93),
+            ("Gemini Plus 6m Links (No Card Required)", 366, 1.31),
+            ("Outlook IMAP", 58, 0.21),
+            ("Owl Proxy 200 Mb", 109, 0.39),
+            ("3 in 1 VIP Group", 7700, 27.50),
+            ("Muse Ai Token On Client Account", 131, 0.47),
+        ]
+        for _nm, _pkr, _usd in _TIERED_FIX:
+            c.execute("UPDATE products SET price_pkr=?, price_usdt=?, admin_edited=0 "
+                      "WHERE name=?", (_pkr, _usd, _nm))
     except Exception:
-        log.exception("Muse price fix failed (skipping)")
+        log.exception("tiered price fix failed (skipping)")
     # Dummy sold counts seed karo (sirf jahan sold_display NULL hai).
     try:
         _seed_sold_display(c)
