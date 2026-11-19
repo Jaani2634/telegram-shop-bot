@@ -206,6 +206,25 @@ def _sync_products_from_csv(c):
     if added or updated:
         log.info("products.csv sync: %d added, %d updated", added, updated)
 
+def _seed_sold_display(c):
+    """Dummy 'sold' counts (owner request, 19 Nov 2026). Only fills rows
+    where sold_display IS NULL — never overwrites an existing value.
+    Two pinned values (Muse Ai 1B Credits = 115, Gemini Plus 6m = 58);
+    the rest are deterministic (md5 of the product name) in 15..150, so
+    they stay stable across restarts and are never re-randomized."""
+    import hashlib
+    pinned = {"Muse Ai 1B Credits": 115,
+              "Gemini Plus 6m Links (No Card Required)": 58}
+    for row in c.execute("SELECT id, name FROM products WHERE sold_display IS NULL").fetchall():
+        name = row["name"]
+        if name in pinned:
+            val = pinned[name]
+        else:
+            val = 15 + (int.from_bytes(hashlib.md5(name.encode("utf-8")).digest()[:4], "big") % 136)
+        c.execute("UPDATE products SET sold_display=? WHERE id=?", (val, row["id"]))
+        log.info("sold_display: %s = %d", name, val)
+
+
 def init_db():
     c = db()
     c.executescript("""
@@ -426,7 +445,8 @@ def init_db():
     for col, ddl in (("kind", "TEXT DEFAULT 'account'"), ("category", "TEXT DEFAULT ''"),
                      ("bulk", "TEXT DEFAULT ''"), ("terms", "TEXT DEFAULT ''"),
                      ("unlimited", "INTEGER DEFAULT 0"),
-                     ("admin_edited", "INTEGER DEFAULT 0")):
+                     ("admin_edited", "INTEGER DEFAULT 0"),
+                     ("sold_display", "INTEGER DEFAULT NULL")):
         _add_col(c, "products", col, ddl)
     _add_col(c, "accounts", "extra", "TEXT DEFAULT ''")
     for col, ddl in (("code", "TEXT DEFAULT ''"), ("items_json", "TEXT DEFAULT ''"),
@@ -494,6 +514,21 @@ def init_db():
         _sync_products_from_csv(c)
     except Exception:
         log.exception("products.csv sync failed (skipping)")
+    # Owner-ordered price fix (19 Nov 2026): Muse Ai 1B Credits = 173
+    # (AHM7 cost 73 + Rs 100 margin). CSV sync admin_edited rows ko skip
+    # karta hai aur ye row pehle Rs 20 par admin-edited thi — is liye
+    # price yahan seedhi set karo aur lock hata do taake CSV aage se
+    # is row ko bhi sync kar sake.
+    try:
+        c.execute("UPDATE products SET price_pkr=173, price_usdt=0.62, admin_edited=0 "
+                  "WHERE name='Muse Ai 1B Credits'")
+    except Exception:
+        log.exception("Muse price fix failed (skipping)")
+    # Dummy sold counts seed karo (sirf jahan sold_display NULL hai).
+    try:
+        _seed_sold_display(c)
+    except Exception:
+        log.exception("sold_display seed failed (skipping)")
     c.commit(); c.close()
 
 # Products from Junaid's screenshots (11 Nov 2026). USDT at 280 PKR.
@@ -3060,9 +3095,16 @@ def handle_delete_review(data, headers=None):
 
 
 def _sold_count(c, product_id):
-    """Real sold count: paid/delivered/pending-fulfillment orders jin me ye
-    product ho (single product_id ya cart items_json). Har order ek dafa
-    gina jata hai, chahe qty zyada ho."""
+    """Sold count: agar product ki sold_display set hai (dummy count,
+    owner request 19 Nov 2026) to wahi return karo; warna real sold count
+    (paid/delivered/pending-fulfillment orders jin me ye product ho).
+    Har order ek dafa gina jata hai, chahe qty zyada ho."""
+    try:
+        row = c.execute("SELECT sold_display FROM products WHERE id=?", (product_id,)).fetchone()
+    except Exception:
+        row = None
+    if row is not None and row["sold_display"] is not None:
+        return int(row["sold_display"])
     sold = 0
     try:
         rows = c.execute(

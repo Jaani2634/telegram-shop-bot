@@ -9,7 +9,7 @@ IMPORTANT: Ye sirf PRODUCTS + PRICE add/update karta hai.
 STOCK 0 hai — accounts tumhe /addstock se add karne honge.
 USDT rate: 1 USDT = 280 PKR (approx, Nov 2026).
 Pricing rule: har product par Rs. 100 izaafa; jo price AHM7 cost se kam thi,
-wo AHM7 cost + Rs. 100 par set hai. Muse Ai 1B Credits = 171 (Junaid).
+wo AHM7 cost + Rs. 100 par set hai. Muse Ai 1B Credits = 173 (Junaid).
 """
 import sqlite3
 
@@ -22,7 +22,7 @@ PRODUCTS = [
     ("Capcut Pro 1 Month", "Premium Service", 626, 2.24),
     ("HMA Vpn Monthly", "Premium Service", 286, 1.02),
     ("Microsoft 365 Plus 1 Year", "Premium Service", 601, 2.15),
-    ("Muse Ai 1B Credits", "Premium Service", 171, 0.61),
+    ("Muse Ai 1B Credits", "Premium Service", 173, 0.62),
     ("Windows 10/11 Pro", "Premium Service", 376, 1.34),
     ("Muse Ai 31B Token (NW)", "Premium Service", 634, 2.26),
     ("Capcut Pro 7D 500 credits", "CapCut Pro — 7 days, 500 credits", 214, 0.76),
