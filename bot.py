@@ -6469,13 +6469,14 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def orders_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id): return
-    c = db(); rows = c.execute("SELECT * FROM orders WHERE status='pending' AND channel != 'web' ORDER BY id DESC LIMIT 10").fetchall(); c.close()
+    c = db(); rows = c.execute("SELECT * FROM orders WHERE status='pending' ORDER BY id DESC LIMIT 10").fetchall(); c.close()
     if not rows:
         await update.message.reply_text("Koi pending order nahi."); return
     for o in rows:
         c = db(); p = c.execute("SELECT name FROM products WHERE id=?", (o["product_id"],)).fetchone(); c.close()
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Approve", callback_data=f"approve_{o['id']}"), InlineKeyboardButton("❌ Reject", callback_data=f"reject_{o['id']}")]])
-        await update.message.reply_text(f"Order #{o['id']} ({o['code'] or ''})\nProduct: {p['name']}\nQty: {o['qty']}\nBuyer: @{o['username'] or o['user_id']}\nPayment: {o['payment_method']} — {o['amount_text']}\nProof: {o['proof']}", reply_markup=kb)
+        chan = (o["channel"] or "telegram")
+        await update.message.reply_text(f"Order #{o['id']} ({o['code'] or ''}) [{chan}]\nProduct: {p['name']}\nQty: {o['qty']}\nBuyer: @{o['username'] or o['user_id']}\nPayment: {o['payment_method']} — {o['amount_text']}\nProof: {o['proof']}", reply_markup=kb)
 
 async def stock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id): return
