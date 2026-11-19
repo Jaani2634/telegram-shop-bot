@@ -6099,15 +6099,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_admin(uid):
             await q.answer("Sirf admin.", show_alert=True); return
         oid = int(data.split("_")[1])
-        c = db(); _o = c.execute("SELECT channel FROM orders WHERE id=?", (oid,)).fetchone(); c.close()
-        if _o:
-            try:
-                _ch = _o["channel"] or "telegram"
-            except Exception:
-                _ch = "telegram"
-            if _ch == "web":
-                await q.edit_message_text(f"⚠️ Order #{oid} web order hai — ye AHM7 fulfillment + order page se deliver hoti hai, yahan se approve nahi hoti.")
-                return
         ok = await deliver_order(context, oid)
         if ok:
             await q.edit_message_text(f"✅ Order #{oid} approved + delivered.")
