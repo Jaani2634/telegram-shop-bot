@@ -459,6 +459,7 @@ def init_db():
                      ("ahm7_note", "TEXT DEFAULT ''"),
                      ("delivery_token", "TEXT DEFAULT ''"),
                      ("web_contact", "TEXT DEFAULT ''"),
+                     ("web_user_id", "INTEGER DEFAULT 0"),
                      ("success_base", "TEXT DEFAULT ''"),
                      ("checkout_url", "TEXT DEFAULT ''")):
         _add_col(c, "orders", col, ddl)
@@ -540,6 +541,17 @@ def init_db():
                       "WHERE name=?", (_pkr, _usd, _nm))
     except Exception:
         log.exception("tiered price fix failed (skipping)")
+    # BLACK FRIDAY SALE UNHIDE (20 Nov 2026): Udemy Personal Plan 1M
+    # (id 2) aur Capcut Pro 1 Month (id 3) sale me hain lekin active=0
+    # ki wajah se website unhe chhupa rahi thi — sirf in dono ko wapas
+    # dikhao. Price, stock ya kisi aur product ke active flag ko haath
+    # nahi lagata (admin toggle endpoint bhi yahi karta hai, lekin live
+    # DB yahan se edit nahi ho sakti — restart pe chalne wali migration
+    # hi reliable rasta hai).
+    try:
+        c.execute("UPDATE products SET active=1 WHERE id IN (2,3)")
+    except Exception:
+        log.exception("Black Friday unhide failed (skipping)")
     # Dummy sold counts seed karo (sirf jahan sold_display NULL hai).
     try:
         _seed_sold_display(c)
@@ -951,7 +963,7 @@ def start_health_server():
                         ip = (self.headers.get("X-Forwarded-For") or "").split(",")[0].strip() if _web_auth(self.headers) else ""
                         if not ip:
                             ip = self.client_address[0] if self.client_address else ""
-                        status, out = handle_coupon_validate(data, ip)
+                        status, out = handle_coupon_validate(data, ip, self.headers)
                     elif self.path.startswith("/api/admin/coupons"):
                         # POST /api/admin/coupons (create)
                         # POST /api/admin/coupons/:code/toggle
@@ -2826,6 +2838,8 @@ def _zurva_handle_order_ipn(code, f):
             ch = "telegram"
         if ch == "web":
             # Web order — apne stock se NAHI, AHM7 reseller se fulfill karo.
+            # Payment confirm ho gayi — buyer ko push (best-effort).
+            _push_web_order_event(o, "paid")
             ok, fmsg = fulfill_web_order(o["id"])
             if ok:
                 return True, "delivered via AHM7"
@@ -2965,6 +2979,175 @@ def _web_auth(headers):
     except Exception:
         given = ""
     return bool(given) and hmac.compare_digest(given, WEB_API_SECRET)
+
+# ---------- Web buyer linking + push notifications (20 Nov 2026) ----------
+# Worker push endpoint — Worker pe POST /api/push/notify (sibling work).
+# Secret wahi WEB_API_SECRET hai jo _web_auth check karta hai (koi naya
+# secret nahi). Base env se override ho sakta hai (PUSH_WORKER_BASE).
+PUSH_WORKER_BASE = os.getenv("PUSH_WORKER_BASE", "https://retailshop-api.retailshop.workers.dev").rstrip("/")
+
+_PAID_WEB_ORDER_STATUSES = ("paid", "delivered", "zurva_processing")
+
+def _is_first_web_order(c, web_user_id=0, email=""):
+    """Web buyer ki pehli order hai ya nahi: koi purana web order status
+    paid/delivered/zurva_processing me ho to False. web_user_id set ho to
+    us se, warna email (web_contact) se check karo. Koi identity na ho
+    (guest, bina email) to True — promo kabhi galat block na ho.
+    c caller ki connection hai (commit caller karta hai)."""
+    try:
+        email = (email or "").strip()
+        if web_user_id:
+            row = c.execute(
+                "SELECT 1 FROM orders WHERE channel='web' AND web_user_id=? "
+                "AND status IN ('paid','delivered','zurva_processing') LIMIT 1",
+                (web_user_id,)).fetchone()
+        elif email:
+            row = c.execute(
+                "SELECT 1 FROM orders WHERE channel='web' AND web_contact=? "
+                "AND status IN ('paid','delivered','zurva_processing') LIMIT 1",
+                (email,)).fetchone()
+        else:
+            return True
+        return row is None
+    except Exception:
+        # Purani DB me web_user_id column na ho (migration se pehle) to
+        # fail-safe True — promo kabhi galat block na ho.
+        log.exception("is_first_web_order check fail")
+        return True
+
+def _web_buyer_email(o):
+    """Order row se buyer email — sirf jab web_contact me '@' ho."""
+    try:
+        em = (o["web_contact"] or "").strip()
+    except Exception:
+        em = ""
+    return em if "@" in em else ""
+
+def _web_order_url(o):
+    """Web order ka order-page URL (code + delivery token), ya ''."""
+    try:
+        base = (o["success_base"] or "").strip().rstrip("/")
+    except Exception:
+        base = ""
+    if base not in ("https://retailshop.pages.dev", "https://retail-shop.online"):
+        base = "https://retailshop.pages.dev"
+    try:
+        token = o["delivery_token"] or ""
+        code = o["code"] or ""
+    except Exception:
+        return ""
+    if not code or not token:
+        return ""
+    return f"{base}/order.html?code={code}&token={token}"
+
+def _push_notify(user_email, title, body, url, tag):
+    """Worker push endpoint pe best-effort POST — kabhi raise nahi karta,
+    kabhi block nahi karta (3s timeout). Endpoint abhi na bana ho, secret
+    na ho ya network down ho to khamoshi se log karke False (fail-safe)."""
+    if not WEB_API_SECRET:
+        return False
+    try:
+        r = requests.post(
+            f"{PUSH_WORKER_BASE}/api/push/notify",
+            headers={"X-Web-Secret": WEB_API_SECRET, "Content-Type": "application/json"},
+            json={"user": user_email, "title": title, "body": body,
+                  "url": url, "tag": tag},
+            timeout=3)
+        if r.status_code == 200:
+            return True
+        log.warning("Push notify fail (%s): HTTP %s", tag, r.status_code)
+        return False
+    except Exception as e:
+        log.warning("Push notify fail (%s): %s", tag, e)
+        return False
+
+def _push_web_order_event(o, kind):
+    """Web order event ki push notification — sirf jab buyer email maloom
+    ho (web_contact me '@'). kind: 'paid' | 'delivered' | 'issue'.
+    Non-web orders pe kuch nahi hota. Best-effort, kabhi raise nahi karta.
+    Tag har kind ka alag hai (payment/delivered/issue) taake Worker ki
+    dedup ek event ko dusre se na kha jaye."""
+    try:
+        ch = (o["channel"] or "telegram") if "channel" in o.keys() else "telegram"
+    except Exception:
+        ch = "telegram"
+    if ch != "web":
+        return False
+    email = _web_buyer_email(o)
+    if not email:
+        return False
+    code = o["code"] or ""
+    url = _web_order_url(o)
+    if kind == "paid":
+        return _push_notify(
+            email, f"Payment mil gayi — Order {code}",
+            f"Aapki payment mil gayi hai, Order {code} deliver ho raha hai. "
+            "Order page pe status dekh sakte hain.",
+            url, f"order-{code}")
+    if kind == "delivered":
+        return _push_notify(
+            email, f"Order deliver ho gaya — {code}",
+            f"Aapka order {code} deliver ho gaya hai! Credentials order page "
+            "pe dekh sakte hain.",
+            url, f"order-{code}-delivered")
+    return _push_notify(
+        email, f"Order {code} — thora waqt lagega",
+        f"Aapke order {code} me thori delay hai — supplier se delivery me "
+        "waqt lag raha hai. Koi issue ho to Support se rabta karein.",
+        url, f"order-{code}-issue")
+
+def _notify_buyer_order_email(oid):
+    """Web order ki buyer ko confirmation email — best-effort, kabhi raise
+    nahi karta. Ek dafa per order: sirf handle_web_checkout se (order
+    banne ke baad, background thread me) call hoti hai. Account email ho
+    to us pe (web_contact), warna contact email agar email jaisi lage.
+    Email down ho to checkout pe koi asar nahi (sirf log)."""
+    try:
+        c = db()
+        o = c.execute("SELECT * FROM orders WHERE id=?", (oid,)).fetchone()
+        if not o:
+            c.close()
+            return
+        try:
+            items = json.loads(o["items_json"] or "[]")
+        except Exception:
+            items = []
+        if not isinstance(items, list) or not items:
+            items = [{"pid": o["product_id"], "qty": o["qty"] or 1}]
+        lines = []
+        for it in items:
+            try:
+                pid = int((it or {}).get("pid") or (it or {}).get("product_id") or 0)
+                qty = int((it or {}).get("qty") or 1)
+            except Exception:
+                continue
+            p = c.execute("SELECT name FROM products WHERE id=?", (pid,)).fetchone() if pid else None
+            lines.append(f"{(p['name'] if p else f'Product #{pid}')} x{qty}")
+        email = _web_buyer_email(o)
+        code = o["code"] or f"#{oid}"
+        amount = o["amount_pkr"] or 0
+        url = _web_order_url(o)
+        c.close()
+        if not email or not _EMAIL_RE.match(email):
+            return
+        if not lines:
+            lines = ["(product nahi mila)"]
+        subject = f"Order {code} — Pheonix Retail Shop"
+        body = (
+            "Assalam-o-Alaikum,\n\n"
+            f"Aapka order {code} mil gaya hai — shukriya!\n\n"
+            f"Product: {'; '.join(lines)}\n"
+            f"Amount: Rs {amount}\n"
+            "Status: Payment pending — payment complete hote hi credentials "
+            "order page pe mil jayenge.\n\n"
+            f"Order page: {url}\n\n"
+            "Koi issue ho to Support se rabta karein.\n\n"
+            "— Pheonix Retail Shop"
+        )
+        ok = _send_email(email, subject, body)
+        log.info("Buyer order email %s %s: %s", code, "sent" if ok else "FAILED", email)
+    except Exception as e:
+        log.warning("Buyer order email failed (order %s): %s", oid, e)
 
 def _gen_delivery_token():
     """Website order ke liye random delivery token (32 hex chars = 128 bit).
@@ -4652,10 +4835,12 @@ def handle_admin_coupon_uses(headers=None, code=""):
                  "uses": [{"order_code": r["order_code"], "buyer_name": r["buyer_name"],
                            "buyer_email": r["buyer_email"], "used_at": r["used_at"]} for r in rows]}
 
-def handle_coupon_validate(data, client_ip=""):
+def handle_coupon_validate(data, client_ip="", headers=None):
     """POST /api/coupon/validate {code, amount_pkr, is_first_order} —
     public, no auth, 30/min per IP. 200 {ok, pct, discount} ya 400
-    {ok:false, error:<validate_promo wala code>}."""
+    {ok:false, error:<validate_promo wala code>}. Bearer session ho to
+    is_first_order us se derive hota hai (asal order history, web_user_id
+    ya email se) — body wali value sirf tab jab Bearer na ho."""
     if _coupon_rate_limited(client_ip):
         return 429, {"ok": False, "error": "too many requests — thodi der me dobara try karein"}
     data = data or {}
@@ -4664,6 +4849,18 @@ def handle_coupon_validate(data, client_ip=""):
     if not code or amount is None or amount < 0:
         return 400, {"ok": False, "error": "coupon_invalid"}
     is_first = bool(data.get("is_first_order"))
+    if headers is not None:
+        try:
+            _wu, _werr = _auth_session_user(headers)
+        except Exception:
+            _wu = None
+        if _wu is not None:
+            try:
+                _c = db()
+                is_first = _is_first_web_order(_c, int(_wu["id"]), (_wu["email"] or "").strip())
+                _c.close()
+            except Exception:
+                pass
     ok, pct, discount, err = validate_promo(code, amount, is_first)
     if not ok:
         return 400, {"ok": False, "error": err}
@@ -5119,7 +5316,11 @@ def _ahm7_mark_pending(order_id, note):
     c = db()
     c.execute("UPDATE orders SET status='ahm7_pending', ahm7_note=? WHERE id=?",
               (str(note)[:500], order_id))
+    o = c.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
     c.commit(); c.close()
+    if o is not None:
+        # Web buyer ko issue push (best-effort; non-web pe kuch nahi hota).
+        _push_web_order_event(o, "issue")
 
 def fulfill_web_order(order_id):
     """Paid web order -> AHM7 auto-buy -> credentials order row me save.
@@ -5177,6 +5378,7 @@ def fulfill_web_order(order_id):
     # Legacy single-order creds (pid tag nahi) — dobara buy nahi karna.
     if stored_id and stored_creds and len(norm) == 1 and not bought_pids:
         c = db(); c.execute("UPDATE orders SET status='delivered' WHERE id=?", (order_id,)); c.commit(); c.close()
+        _push_web_order_event(o, "delivered")
         return True, "already bought — credentials order page pe available (dobara buy nahi hua)"
     combined = list(stored_creds)
     ahm7_ids = [s for s in (stored_id.split(",") if stored_id else []) if s]
@@ -5227,12 +5429,14 @@ def fulfill_web_order(order_id):
                   (",".join(ahm7_ids), json.dumps(combined, ensure_ascii=False), note, order_id))
         c.commit(); c.close()
         _zurva_send(ADMIN_ID, f"⚠️ Web order {o['code']} paid-pending: {note}. Manual deliver karein ya retry karein.")
+        _push_web_order_event(o, "issue")
         return False, note
     c = db()
     c.execute("UPDATE orders SET ahm7_order_id=?, ahm7_credentials=?, ahm7_note=?, status='delivered' WHERE id=?",
               (",".join(ahm7_ids), json.dumps(combined, ensure_ascii=False),
                f"AHM7 {','.join(ahm7_ids)}", order_id))
     c.commit(); c.close()
+    _push_web_order_event(o, "delivered")
     return True, f"delivered via AHM7 {','.join(ahm7_ids)} — credentials order page pe available"
 
 def handle_web_checkout(data, headers=None):
@@ -5244,7 +5448,16 @@ def handle_web_checkout(data, headers=None):
     Do shapes: single {product_id} ya cart {items: [{product_id, qty}]}.
     Amount hamesha server-side mapping ki site price hoti hai — client jo
     bhejta hai us pe bharosa nahi (tamper-proof). contact optional hai
-    (email ya Telegram) — sirf manual follow-up ke liye, kabhi required nahi."""
+    (email ya Telegram) — sirf manual follow-up ke liye, kabhi required nahi.
+    Buyer account (20 Nov 2026): Authorization: Bearer <token> mile to
+    _auth_session_user se resolve karo — valid session ho to web_contact =
+    account email aur web_user_id = web user id order pe store hota hai;
+    Bearer na ho ya invalid ho to guest behaviour (contact jaisa hai
+    waisa, web_user_id=0) — guest checkout bot pe nahi tootta. Promo ki
+    first_order_only check ke liye is_first_order asal history se nikala
+    jata hai (_is_first_web_order: web_user_id ho to us se, warna email
+    se). Order banne ke baad buyer ko ek confirmation email bhi jati hai
+    (background thread, best-effort — checkout kabhi block nahi hoti)."""
     if not _web_auth(headers or {}):
         return 401, {"ok": False, "error": "unauthorized (WEB_API_SECRET ghalat ya set nahi)"}
     data = data or {}
@@ -5278,6 +5491,23 @@ def handle_web_checkout(data, headers=None):
             return 400, {"ok": False, "error": "product_id ghalat hai"}
         lines = [{"pid": product_id, "qty": 1}]
     contact = str(data.get("contact") or "").strip()[:120]
+    # --- Buyer account link karo (Bearer session, agar website ne bheja ho).
+    # Valid session ho to web_contact = account email aur web_user_id =
+    # web user id; Bearer na ho / invalid / expired ho to guest behaviour
+    # (contact jaisa hai waisa, web_user_id=0) — bot guest checkout nahi
+    # tootta (login enforce karna website ka kaam hai).
+    web_user_id = 0
+    try:
+        _wu, _werr = _auth_session_user(headers or {})
+    except Exception:
+        _wu = None
+    if _wu is not None:
+        try:
+            contact = (_wu["email"] or "").strip().lower() or contact
+            web_user_id = int(_wu["id"])
+        except Exception:
+            web_user_id = 0
+        log.info("Web checkout: buyer linked web_user_id=%s email=%s", web_user_id, contact)
     # --- Har line validate karo + total server-side nikalo.
     mapping_all = load_ahm7_mapping()
     total = 0
@@ -5299,16 +5529,20 @@ def handle_web_checkout(data, headers=None):
     if total <= 0:
         return 400, {"ok": False, "error": "total price set nahi hai"}
     # --- Global promo (optional): discount total se kat-ta hai, Zurvapay
-    # initiate DISCOUNTED total pe hota hai. Web ki koi identity nahi, is
-    # liye first_order_only codes yahan hamesha coupon_first_only dete
-    # hain (validate_promo me is_first_order=False). Invalid code -> 400,
-    # order banta hi nahi — failed payment kabhi use consume nahi karta
-    # (use sirf IPN paid transition pe record hota hai).
+    # initiate DISCOUNTED total pe hota hai. is_first_order asal history
+    # se nikala jata hai (web_user_id ho to us se, warna email se) —
+    # pehle hardcoded False tha, is liye first_order_only codes hamesha
+    # coupon_first_only dete the. Invalid code -> 400, order banta hi
+    # nahi — failed payment kabhi use consume nahi karta (use sirf IPN
+    # paid transition pe record hota hai).
     coupon_code = ""
     discount = 0
     raw_coupon = str(data.get("coupon") or "").strip()
     if raw_coupon:
-        ok, _pct, disc, err = validate_promo(raw_coupon, total, False)
+        _c2 = db()
+        is_first = _is_first_web_order(_c2, web_user_id, contact)
+        _c2.close()
+        ok, _pct, disc, err = validate_promo(raw_coupon, total, is_first)
         if not ok:
             return 400, {"ok": False, "error": err}
         coupon_code = raw_coupon.upper()
@@ -5323,9 +5557,16 @@ def handle_web_checkout(data, headers=None):
     if success_base not in ("https://retailshop.pages.dev", "https://retail-shop.online"):
         success_base = "https://retailshop.pages.dev"
     c = db()
-    c.execute("UPDATE orders SET delivery_token=?, web_contact=?, success_base=? WHERE id=?",
-              (token, contact, success_base, oid))
+    c.execute("UPDATE orders SET delivery_token=?, web_contact=?, web_user_id=?, success_base=? WHERE id=?",
+              (token, contact, web_user_id, success_base, oid))
     c.commit(); c.close()
+    # Buyer ko confirmation email — background thread me (checkout kabhi
+    # slow/fail na ho). Ek dafa per order, yahin se — Zurvapay initiate
+    # ok ho ya fail, order to ban gaya hai.
+    try:
+        threading.Thread(target=_notify_buyer_order_email, args=(oid,), daemon=True).start()
+    except Exception as e:
+        log.warning("Buyer order email thread start failed (order %s): %s", oid, e)
     order_url = f"{success_base}/order.html?code={code}&token={token}"
     details = f"RetailShop order {code} — " + ", ".join(labels)
     # Zurvapay sirf approved domain (bot server) ki success/cancel URLs
