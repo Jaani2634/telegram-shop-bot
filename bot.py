@@ -110,6 +110,7 @@ AHM7_BASE_URL = os.getenv("AHM7_BASE_URL", "https://api.ahm7.tech/v1").rstrip("/
 # 503 deta hai (otp_not_configured). Keys kabhi code me nahi —
 # sirf env se (Botkeep .env me set karo).
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "raisjunaidnazeer@gmail.com").strip().lower()
+ADMIN_NOTIFY_EMAIL = os.getenv("ADMIN_NOTIFY_EMAIL", ADMIN_EMAIL).strip().lower()
 ADMIN_PHONE = os.getenv("ADMIN_PHONE", "+923706462990").strip()
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
@@ -1804,6 +1805,63 @@ def gen_order_code():
     c.close()
     return f"RS-{random.randint(100000, 999999)}"
 
+def _notify_new_order_email(oid):
+    """Naye order ki admin ko email — best-effort, kabhi raise nahi karta.
+    Sirf create_order se (ek dafa per order) call hoti hai, is liye
+    duplicate nahi hoti — retry/IPN create_order ko dobara nahi chalate.
+    Sender wahi _send_email hai (Resend, fail ho to Gmail SMTP)."""
+    try:
+        c = db()
+        o = c.execute("SELECT * FROM orders WHERE id=?", (oid,)).fetchone()
+        if not o:
+            c.close()
+            return
+        try:
+            items = json.loads(o["items_json"] or "[]")
+        except Exception:
+            items = []
+        if not isinstance(items, list) or not items:
+            items = [{"pid": o["product_id"], "qty": o["qty"] or 1}]
+        lines = []
+        for it in items:
+            try:
+                pid = int((it or {}).get("pid") or (it or {}).get("product_id") or 0)
+                qty = int((it or {}).get("qty") or 1)
+            except Exception:
+                continue
+            p = c.execute("SELECT name FROM products WHERE id=?", (pid,)).fetchone() if pid else None
+            lines.append(f"{(p['name'] if p else f'Product #{pid}')} x{qty}")
+        c.close()
+        if not lines:
+            lines = ["(product nahi mila)"]
+        code = o["code"] or f"#{oid}"
+        amount = o["amount_pkr"] or 0
+        channel = (o["channel"] or "telegram") or "telegram"
+        if channel == "web":
+            buyer = (o["username"] or "").strip() or "—"
+        else:
+            buyer = f"@{o['username']}" if (o["username"] or "").strip() else f"user {o['user_id']}"
+        first = lines[0]
+        subject = f"🛒 New Order {code} — {first} — Rs {amount}"
+        if len(lines) > 1:
+            subject = f"🛒 New Order {code} — {first} +{len(lines) - 1} more — Rs {amount}"
+        body = (
+            "New order — Pheonix Retail Shop\n\n"
+            f"Order: {code}\n"
+            f"Product: {'; '.join(lines)}\n"
+            f"Amount: Rs {amount}\n"
+            f"Payment: {o['payment_method'] or '—'}\n"
+            f"Buyer: {buyer}\n"
+            f"Channel: {channel}\n"
+            f"Time: {o['created_at'] or ''} PKT\n\n"
+            "Approve: Telegram bot /orders (ya website admin dashboard)."
+        )
+        ok = _send_email(ADMIN_NOTIFY_EMAIL, subject, body)
+        log.info("Admin new-order email %s %s: %s", code, "sent" if ok else "FAILED", ADMIN_NOTIFY_EMAIL)
+    except Exception as e:
+        log.warning("Admin new-order email failed (order %s): %s", oid, e)
+
+
 def create_order(uid, username, items, payment_method, amount_text, proof, amount_pkr, code, coupon_code, discount_pkr, channel="telegram"):
     """items: list of {pid, qty}. Returns order id.
     channel: 'telegram' ya 'whatsapp' ya 'web' (site checkout).
@@ -1820,6 +1878,12 @@ def create_order(uid, username, items, payment_method, amount_text, proof, amoun
          datetime.now().strftime("%Y-%m-%d %H:%M"), code, json.dumps(items), total_qty,
          discount_pkr, coupon_code or "", amount_pkr, channel))
     oid = cur.lastrowid; c.commit(); c.close()
+    # Admin ko naye order ki email — background thread me, taake order
+    # creation kabhi slow ya fail na ho (email down ho to bhi order banta hai).
+    try:
+        threading.Thread(target=_notify_new_order_email, args=(oid,), daemon=True).start()
+    except Exception as e:
+        log.warning("Admin new-order email thread start failed (order %s): %s", oid, e)
     return oid
 
 # ---------- Outbox (Telegram bot <-> WhatsApp bot message bus) ----------
