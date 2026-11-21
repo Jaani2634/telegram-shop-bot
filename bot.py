@@ -516,25 +516,26 @@ def init_db():
         _sync_products_from_csv(c)
     except Exception:
         log.exception("products.csv sync failed (skipping)")
-    # BLACK FRIDAY FLASH SALE (20 Nov 2026, 24h): sale prices = AHM7 store
-    # prices, ONLY where sale < tiered price. Restore tomorrow from
-    # friday-sale-restore.json (tiered prices) + products.csv.
-    # (Was: owner-ordered tiered price fix, 19 Nov 2026 — AHM7 cost >= 100
+    # FLASH SALE REVERT (21 Nov 2026, 11:30 PKT): sale ended — restore
+    # tiered prices from friday-sale-restore.json + products.csv.
+    # (Owner-ordered tiered price rule, 19 Nov 2026 — AHM7 cost >= 100
     # -> +Rs 100; cost 50-99 -> +Rs 50; cost < 50 -> +Rs 20.)
+    # Sale prices (20 Nov, 24h) were AHM7 store prices, ONLY where sale <
+    # tiered price; the revert restores exactly those rows.
     try:
         _TIERED_FIX = [
-            ("Amazon Prime 6 Months", 703, 2.51),
-            ("Capcut Pro 1 Month", 548, 1.96),
-            ("HMA Vpn Monthly", 192, 0.69),
-            ("Microsoft 365 Plus 1 Year", 506, 1.81),
-            ("Muse Ai 1B Credits", 76, 0.27),
-            ("Windows 10/11 Pro", 281, 1.0),
-            ("Adobe Express 12M", 169, 0.6),
-            ("Gemini Plus 6m Links (No Card Required)", 279, 1.0),
-            ("Outlook IMAP", 40, 0.14),
-            ("Owl Proxy 200 Mb", 62, 0.22),
-            ("3 in 1 VIP Group", 7700, 27.50),
-            ("Muse Ai Token On Client Account", 85, 0.3),
+            ("Amazon Prime 6 Months", 768, 2.74),
+            ("Capcut Pro 1 Month", 621, 2.22),
+            ("HMA Vpn Monthly", 283, 1.01),
+            ("Microsoft 365 Plus 1 Year", 581, 2.08),
+            ("Muse Ai 1B Credits", 123, 0.44),
+            ("Windows 10/11 Pro", 367, 1.31),
+            ("Adobe Express 12M", 261, 0.93),
+            ("Gemini Plus 6m Links (No Card Required)", 366, 1.31),
+            ("Outlook IMAP", 58, 0.21),
+            ("Owl Proxy 200 Mb", 109, 0.39),
+            ("3 in 1 VIP Group", 7700, 27.5),
+            ("Muse Ai Token On Client Account", 131, 0.47),
         ]
         for _nm, _pkr, _usd in _TIERED_FIX:
             c.execute("UPDATE products SET price_pkr=?, price_usdt=?, admin_edited=0 "
